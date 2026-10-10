@@ -647,7 +647,9 @@ fn refine_quant_field(
     quant_field: &mut ImageB,
     band_scratch: &mut [AcStrategyBandScratch],
 ) {
-    if quant_refinement_steps(context.params.distance) == 0 {
+    if quant_refinement_steps(context.params.distance) == 0
+        || std::env::var_os("JIXEL_AQ_NOREFINE").is_some()
+    {
         return;
     }
     {

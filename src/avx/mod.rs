@@ -29,6 +29,8 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
+mod aq_blur;
+mod aq_loop;
 mod cfl;
 mod color;
 mod dc_ops;
@@ -54,9 +56,10 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
+pub(crate) use aq_blur::{blur_horizontal_avx2, blur_vertical_avx2};
+pub(crate) use aq_loop::{downsample_rows_avx2, ssim_moments_avx2};
 pub(crate) use cfl::{
-    apply_cfl_avx2, cfl_closed_loop_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2,
-    cfl_regression_avx2,
+    apply_cfl_avx2, cfl_rd_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2, cfl_regression_avx2,
 };
 pub(crate) use color::color_matrix_shaper_avx2;
 pub(crate) use dc_ops::{adjust_b_dc_avx2, compensate_b_dc_avx2, reconstruct_dc_avx2};

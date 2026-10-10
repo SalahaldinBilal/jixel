@@ -169,7 +169,7 @@ pub(crate) fn gradient_region_stats_with_chroma_avx2(
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn avx_dequantized_level_f32(q: __m256) -> __m256 {
+pub(crate) fn avx_dequantized_level_f32(q: __m256) -> __m256 {
     let sign_mask = _mm256_set1_ps(-0.0);
     let absq = _mm256_andnot_ps(sign_mask, q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).

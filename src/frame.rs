@@ -167,7 +167,12 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     const K_QUANT_FIELD_TARGET: f32 = 10.0;
 
     let qdc = quant_dc(distance);
-    let scale = K_GLOBAL_SCALE_DENOM as f32 * K_AC_QUANT / (distance * K_QUANT_FIELD_TARGET);
+    // Temporary AQ ceiling study: finer integer lattice on request.
+    let target = std::env::var("JIXEL_AQ_TARGET")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(K_QUANT_FIELD_TARGET);
+    let scale = K_GLOBAL_SCALE_DENOM as f32 * K_AC_QUANT / (distance * target);
     // AC and DC are signaled independently. Capping the AC scale by qdc made
     // it freeze once quant_dc() reached its high-distance cap, producing a
     // rate/quality plateau followed by a cliff when the cap finally released.
@@ -197,6 +202,13 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
     let epf_pass0_scale = epf_pass0_scale(distance);
     if epf_pass0_scale.is_some() || dcepf_vlq_t(distance) >= 0.5 {
         epf_iters = 3;
+    }
+    // Temporary AQ loop study: force the EPF iteration count (0 = pre-filter picture).
+    if let Some(v) = std::env::var("JIXEL_EPF_ITERS")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        epf_iters = v.min(3);
     }
     let gab_enabled = false; // measured net-negative for rate-matched SSIMU2
 
@@ -3270,7 +3282,7 @@ fn encode_frame_core(
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
             let (dc_idx, gx, gy) = ac_tasks[t];
             let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let (p, local, source_b, stats) = process_ac_group(
+            let (p, local, source_b, stats, _) = process_ac_group(
                 ctx,
                 scratch,
                 opsin,
@@ -3289,6 +3301,7 @@ fn encode_frame_core(
                 &[],
                 want_order_stats,
                 qf_threshold,
+                false,
             );
             (dc_idx, gx, gy, p, local, source_b, stats)
         });
@@ -3432,6 +3445,7 @@ fn encode_frame_core(
                         &[],
                         false,
                         qf_threshold,
+                        false,
                     )
                     .0
                 });
@@ -3451,35 +3465,68 @@ fn encode_frame_core(
             );
             crate::entropy::FrozenTokenPrices::new(&provisional_code)
         };
+        // The closed loop's reference and verification encodes are pass 2
+        // itself (same RDOQ, prices and orders), so when it runs its final
+        // groups replace the refined pass.
+        let loop_groups = if ctx.speed.effort().aq_closed_loop
+            && ctx.coding.is_xyb()
+            && std::env::var("JIXEL_AQ_LOOP")
+                .map(|v| v != "0")
+                .unwrap_or(true)
+        {
+            run_quant_field_loop(
+                ctx,
+                scratch,
+                opsin,
+                &dim,
+                &distp,
+                &mut dc_datas,
+                &ac_tasks,
+                &group_coords,
+                num_passes,
+                coeff_shifts,
+                &coeff_orders,
+                &order_alternatives,
+                ytob_dc,
+                qf_threshold,
+                &prices,
+            )
+        } else {
+            None
+        };
         all_pending.clear();
         let dc_ref = &dc_datas;
-        let refined = ctx
-            .thread_pool
-            .steal_map(scratch, ac_tasks.len(), |t, scratch| {
-                let (dc_idx, gx, gy) = ac_tasks[t];
-                let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _, _) = process_ac_group(
-                    ctx,
-                    scratch,
-                    opsin,
-                    &dim,
-                    &distp,
-                    &dc_ref[dc_idx],
-                    num_passes,
-                    coeff_shifts,
-                    dc_gx,
-                    dc_gy,
-                    gx,
-                    gy,
-                    ytob_dc,
-                    Some(&prices),
-                    &coeff_orders,
-                    &order_alternatives,
-                    false,
-                    qf_threshold,
-                );
-                (dc_idx, gx, gy, p, local)
-            });
+        let refined = if let Some(groups) = loop_groups {
+            groups
+        } else {
+            ctx.thread_pool
+                .steal_map(scratch, ac_tasks.len(), |t, scratch| {
+                    let (dc_idx, gx, gy) = ac_tasks[t];
+                    let (dc_gx, dc_gy) = group_coords[dc_idx];
+                    let (p, local, _, _, _) = process_ac_group(
+                        ctx,
+                        scratch,
+                        opsin,
+                        &dim,
+                        &distp,
+                        &dc_ref[dc_idx],
+                        num_passes,
+                        coeff_shifts,
+                        dc_gx,
+                        dc_gy,
+                        gx,
+                        gy,
+                        ytob_dc,
+                        Some(&prices),
+                        &coeff_orders,
+                        &order_alternatives,
+                        false,
+                        qf_threshold,
+                        false,
+                    );
+                    (dc_idx, gx, gy, p, local)
+                })
+        };
         for (dc_idx, gx, gy, p, local) in refined {
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
             all_pending.push(p);
@@ -4447,9 +4494,586 @@ fn encode_order_arm(
 /// in ExtraSlow's final refine pass. `group_idx` is the raster group index
 /// (0..num_groups); the section for (pass, group) is
 /// `2 + num_dc_groups + pass*num_groups + group_idx`.
+/// `process_ac_group` output: tokens, the group's quantized DC, the unrounded
+/// source DC and order statistics when collected, and the luma reconstruction
+/// capture (plane + per-block token starts) when requested.
+type ProcessedAcGroup = (
+    PendingAcGroup,
+    Image3S,
+    Option<crate::group::SourceDc>,
+    Option<crate::coeff_order::OrderStats>,
+    Option<(crate::image::Plane<f32>, Vec<(u16, u16, u32)>)>,
+);
+
+/// One coded AC group of the refined pass: DC-group index, group position,
+/// tokens and quantized DC.
+type RefinedAcGroup = (usize, usize, usize, PendingAcGroup, Image3S);
+
+#[derive(Clone)]
 pub(crate) struct PendingAcGroup {
     pub(crate) group_idx: usize,
     pub(crate) tokens: Vec<Vec<Token>>,
+}
+
+/// Closed-loop quant-field refinement (ExtraSlow). Every group is re-quantized
+/// the way pass 2 codes it (custom scan orders, RDOQ at the frozen token
+/// prices), priced with those prices and reconstructed in luma (source plus
+/// the inverse-transformed Y quantization error, the rerank's model). The
+/// whole field moved one step coarser and one step finer gives the global
+/// exchange rate (MS-SSIM deficit per percent of bits) and, per 32px tile,
+/// the marginal deficit and bit change of each direction. Tiles whose
+/// marginal return beats the global rate move; the joint move is verified and
+/// kept only if `-(1 - MS-SSIM) - slope * log rate` improves.
+#[allow(clippy::too_many_arguments)]
+fn run_quant_field_loop(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    opsin: &Image3F,
+    dim: &ImageDim,
+    distp: &DistanceParams,
+    dc_datas: &mut [DcGroupData],
+    ac_tasks: &[(usize, usize, usize)],
+    group_coords: &[(usize, usize)],
+    num_passes: usize,
+    coeff_shifts: &[u32],
+    coeff_orders: &crate::coeff_order::CoeffOrders,
+    order_alternatives: &[crate::coeff_order::CoeffOrders],
+    ytob_dc: i32,
+    qf_threshold: u32,
+    prices: &crate::entropy::FrozenTokenPrices,
+) -> Option<Vec<RefinedAcGroup>> {
+    use crate::aq_loop::msssim_deficit_and_map;
+    /// Marginals and slope come from plain quantization; the ratio of deficit
+    /// to bits is what the trellis preserves, at a third of the cost.
+    const SHIFT_RDOQ: bool = false;
+    const TILE_BLOCKS: usize = 4;
+    const MAX_ITERS: usize = 1;
+    const MAX_MOVE_FRACTION: f32 = 0.3;
+    const MAX_ABS_MOVE: i8 = 2;
+    const MIN_FIELD: u8 = 1;
+    let log = std::env::var_os("JIXEL_AQ_LOOP_LOG").is_some();
+
+    let (w, h) = (dim.xsize, dim.ysize);
+    let (xb, yb) = (w.div_ceil(K_BLOCK_DIM), h.div_ceil(K_BLOCK_DIM));
+    if xb < TILE_BLOCKS || yb < TILE_BLOCKS {
+        return None;
+    }
+    let source = opsin.plane(1);
+    let metric = |recon: &crate::image::Plane<f32>| msssim_deficit_and_map(source, recon);
+    let blocks_per_dc = K_DC_GROUP_DIM / K_BLOCK_DIM;
+
+    let locate = |bx: usize, by: usize| -> (usize, usize, usize) {
+        let dc_gx = bx * K_BLOCK_DIM / K_DC_GROUP_DIM;
+        let dc_gy = by * K_BLOCK_DIM / K_DC_GROUP_DIM;
+        let dc_idx = group_coords
+            .iter()
+            .position(|&c| c == (dc_gx, dc_gy))
+            .expect("dc group of block");
+        (
+            dc_idx,
+            bx - dc_gx * blocks_per_dc,
+            by - dc_gy * blocks_per_dc,
+        )
+    };
+    let mut task_of_block = vec![usize::MAX; xb * yb];
+    for by in 0..yb {
+        for bx in 0..xb {
+            let (dc_idx, lbx, lby) = locate(bx, by);
+            let (gx, gy) = (lbx / K_GROUP_DIM_IN_BLOCKS, lby / K_GROUP_DIM_IN_BLOCKS);
+            task_of_block[by * xb + bx] = ac_tasks
+                .iter()
+                .position(|&t| t == (dc_idx, gx, gy))
+                .expect("ac task of block");
+        }
+    }
+
+    #[derive(Clone)]
+    struct Eval {
+        recon: crate::image::Plane<f32>,
+        pending: Vec<Option<PendingAcGroup>>,
+        quant_dc: Vec<Option<Image3S>>,
+        starts: Vec<Vec<(u16, u16, u32)>>,
+    }
+    // Re-quantize, price and reconstruct the given AC groups under the fields.
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate(
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        opsin: &Image3F,
+        dim: &ImageDim,
+        distp: &DistanceParams,
+        dc_datas: &[DcGroupData],
+        ac_tasks: &[(usize, usize, usize)],
+        group_coords: &[(usize, usize)],
+        num_passes: usize,
+        coeff_shifts: &[u32],
+        coeff_orders: &crate::coeff_order::CoeffOrders,
+        order_alternatives: &[crate::coeff_order::CoeffOrders],
+        ytob_dc: i32,
+        qf_threshold: u32,
+        prices: Option<&crate::entropy::FrozenTokenPrices>,
+        tasks: &[usize],
+        eval: &mut Eval,
+    ) {
+        let results = ctx
+            .thread_pool
+            .steal_map(scratch, tasks.len(), |i, scratch| {
+                let t = tasks[i];
+                let (dc_idx, gx, gy) = ac_tasks[t];
+                let (dc_gx, dc_gy) = group_coords[dc_idx];
+                let (p, local, _, _, capture) = process_ac_group(
+                    ctx,
+                    scratch,
+                    opsin,
+                    dim,
+                    distp,
+                    &dc_datas[dc_idx],
+                    num_passes,
+                    coeff_shifts,
+                    dc_gx,
+                    dc_gy,
+                    gx,
+                    gy,
+                    ytob_dc,
+                    prices,
+                    coeff_orders,
+                    order_alternatives,
+                    false,
+                    qf_threshold,
+                    true,
+                );
+                let (plane, starts) = capture.expect("recon capture");
+                (t, p, local, starts, plane, (dc_gx, dc_gy, gx, gy))
+            });
+        for (t, p, local, starts, plane, (dc_gx, dc_gy, gx, gy)) in results {
+            eval.pending[t] = Some(p);
+            eval.quant_dc[t] = Some(local);
+            eval.starts[t] = starts;
+            let x0 = dc_gx * K_DC_GROUP_DIM + gx * K_GROUP_DIM;
+            let y0 = dc_gy * K_DC_GROUP_DIM + gy * K_GROUP_DIM;
+            for y in 0..plane.ysize() {
+                let src = &plane.row(y)[..plane.xsize()];
+                eval.recon.row_mut(y0 + y)[x0..x0 + src.len()].copy_from_slice(src);
+            }
+        }
+    }
+    let new_eval = || Eval {
+        recon: crate::image::Plane::<f32>::new(w, h),
+        pending: vec![None; ac_tasks.len()],
+        quant_dc: vec![None; ac_tasks.len()],
+        starts: vec![Vec::new(); ac_tasks.len()],
+    };
+    let frame_bits = |e: &Eval| {
+        prices.adaptive_bits(
+            e.pending
+                .iter()
+                .map(|p| p.as_ref().map_or(&[][..], |p| p.tokens[0].as_slice())),
+        )
+    };
+    // Frozen-price bits of every first block, indexed by frame block.
+    let block_bits = |e: &Eval| -> Vec<f32> {
+        let mut out = vec![0f32; xb * yb];
+        for (t, starts) in e.starts.iter().enumerate() {
+            let (dc_gx, dc_gy) = group_coords[ac_tasks[t].0];
+            let toks: &[Token] = e.pending[t]
+                .as_ref()
+                .map_or(&[], |p| p.tokens[0].as_slice());
+            for (i, &(lbx, lby, start)) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).map_or(toks.len(), |s| s.2 as usize);
+                let bits: f32 = toks[start as usize..end]
+                    .iter()
+                    .map(|&k| prices.token_bits(k))
+                    .sum();
+                let bx = dc_gx * blocks_per_dc + lbx as usize;
+                let by = dc_gy * blocks_per_dc + lby as usize;
+                out[by * xb + bx] += bits;
+            }
+        }
+        out
+    };
+
+    let (tiles_x, tiles_y) = (xb.div_ceil(TILE_BLOCKS), yb.div_ceil(TILE_BLOCKS));
+    let n_tiles = tiles_x * tiles_y;
+    let tile_of_block = |bx: usize, by: usize| (by / TILE_BLOCKS) * tiles_x + bx / TILE_BLOCKS;
+    let tile_blocks = |t: usize| -> Vec<(usize, usize)> {
+        let (tx, ty) = (t % tiles_x, t / tiles_x);
+        let mut v = Vec::new();
+        for by in ty * TILE_BLOCKS..((ty + 1) * TILE_BLOCKS).min(yb) {
+            for bx in tx * TILE_BLOCKS..((tx + 1) * TILE_BLOCKS).min(xb) {
+                v.push((bx, by));
+            }
+        }
+        v
+    };
+    // Sum a per-pixel map over each tile.
+    let tile_sums = |map: &[f32]| -> Vec<f64> {
+        let mut out = vec![0f64; n_tiles];
+        let tile_px = TILE_BLOCKS * K_BLOCK_DIM;
+        for y in 0..h {
+            let ty = y / tile_px;
+            let row = &map[y * w..(y + 1) * w];
+            for (x, &v) in row.iter().enumerate() {
+                out[ty * tiles_x + x / tile_px] += v as f64;
+            }
+        }
+        out
+    };
+    let tile_bits = |blk: &[f32]| -> Vec<f32> {
+        let mut out = vec![0f32; n_tiles];
+        for by in 0..yb {
+            for bx in 0..xb {
+                out[tile_of_block(bx, by)] += blk[by * xb + bx];
+            }
+        }
+        out
+    };
+    /// Fields a move overwrote, for an exact restore (the clamp at the bounds
+    /// makes the inverse step inexact).
+    struct Saved(Vec<(usize, usize, usize, u8)>);
+    // Apply `moves` (tile, step) to the fields; returns the touched AC tasks
+    // and the previous values.
+    let apply = |dc_datas: &mut [DcGroupData], moves: &[(usize, i8)]| -> (Vec<usize>, Saved) {
+        let mut tasks = Vec::new();
+        let mut saved = Vec::new();
+        for &(t, step) in moves {
+            for (bx, by) in tile_blocks(t) {
+                let (dc_idx, lbx, lby) = locate(bx, by);
+                let v = &mut dc_datas[dc_idx].raw_quant_field.row_mut(lby)[lbx];
+                saved.push((dc_idx, lbx, lby, *v));
+                *v = (*v as i16 + step as i16).clamp(MIN_FIELD as i16, 255) as u8;
+                let task = task_of_block[by * xb + bx];
+                if !tasks.contains(&task) {
+                    tasks.push(task);
+                }
+            }
+        }
+        (tasks, Saved(saved))
+    };
+    let restore = |dc_datas: &mut [DcGroupData], saved: Saved| {
+        for (dc_idx, lbx, lby, v) in saved.0 {
+            dc_datas[dc_idx].raw_quant_field.row_mut(lby)[lbx] = v;
+        }
+    };
+    let all_tasks: Vec<usize> = (0..ac_tasks.len()).collect();
+    let all_moves = |step: i8| -> Vec<(usize, i8)> { (0..n_tiles).map(|t| (t, step)).collect() };
+
+    let field_sum = |dc_datas: &[DcGroupData]| -> u64 {
+        dc_datas
+            .iter()
+            .flat_map(|d| {
+                (0..d.raw_quant_field.ysize()).flat_map(move |y| d.raw_quant_field.row(y).iter())
+            })
+            .map(|&v| u64::from(v))
+            .sum()
+    };
+    let sum_before = field_sum(dc_datas);
+    let t_start = std::time::Instant::now();
+    let mut cur = new_eval();
+    evaluate(
+        ctx,
+        scratch,
+        opsin,
+        dim,
+        distp,
+        dc_datas,
+        ac_tasks,
+        group_coords,
+        num_passes,
+        coeff_shifts,
+        coeff_orders,
+        order_alternatives,
+        ytob_dc,
+        qf_threshold,
+        Some(prices),
+        &all_tasks,
+        &mut cur,
+    );
+    let t_eval = t_start.elapsed();
+    let ref_bits = frame_bits(&cur);
+    let t_bits = t_start.elapsed() - t_eval;
+    let finish = |e: Eval| -> Option<Vec<RefinedAcGroup>> {
+        Some(
+            e.pending
+                .into_iter()
+                .zip(e.quant_dc)
+                .enumerate()
+                .map(|(t, (p, q))| {
+                    let (dc_idx, gx, gy) = ac_tasks[t];
+                    (
+                        dc_idx,
+                        gx,
+                        gy,
+                        p.expect("pending group"),
+                        q.expect("group dc"),
+                    )
+                })
+                .collect(),
+        )
+    };
+    if ref_bits <= 0.0 {
+        return finish(cur);
+    }
+    let rate_term = |bits: f32| 100.0 * (bits / ref_bits).ln();
+    let pixels = (w * h) as f64;
+    let mut cur_bits = ref_bits;
+    let t0 = std::time::Instant::now();
+    let (mut cur_d, mut cur_map) = metric(&cur.recon);
+    let t_metric = t0.elapsed();
+    let mut moved = vec![0i8; n_tiles];
+    if log {
+        eprintln!(
+            "AQ_LOOP ref bits={ref_bits:.0} deficit={cur_d:.6} | eval {:.1} ms, bits {:.1} ms, metric {:.1} ms",
+            t_eval.as_secs_f64() * 1e3,
+            t_bits.as_secs_f64() * 1e3,
+            t_metric.as_secs_f64() * 1e3
+        );
+    }
+
+    for iter in 0..MAX_ITERS {
+        // Marginals and exchange rate from a plain-quantization triple: the
+        // current field, the whole field one step finer, and every other
+        // group one step coarser (half an evaluation; the ratio of two
+        // half-frame deltas is unbiased). The one-sided finer chord
+        // undervalues the tangent of a convex curve, so the two chords are
+        // averaged.
+        let plain = if SHIFT_RDOQ {
+            cur.clone()
+        } else {
+            let mut e = new_eval();
+            evaluate(
+                ctx,
+                scratch,
+                opsin,
+                dim,
+                distp,
+                dc_datas,
+                ac_tasks,
+                group_coords,
+                num_passes,
+                coeff_shifts,
+                coeff_orders,
+                &[],
+                ytob_dc,
+                qf_threshold,
+                None,
+                &all_tasks,
+                &mut e,
+            );
+            e
+        };
+        let r_p = rate_term(frame_bits(&plain));
+        let (d_p, map_p) = if SHIFT_RDOQ {
+            (cur_d, cur_map.clone())
+        } else {
+            metric(&plain.recon)
+        };
+        let shift_prices = SHIFT_RDOQ.then_some(prices);
+        let (_, saved) = apply(dc_datas, &all_moves(1));
+        let mut fine = new_eval();
+        evaluate(
+            ctx,
+            scratch,
+            opsin,
+            dim,
+            distp,
+            dc_datas,
+            ac_tasks,
+            group_coords,
+            num_passes,
+            coeff_shifts,
+            coeff_orders,
+            &[],
+            ytob_dc,
+            qf_threshold,
+            shift_prices,
+            &all_tasks,
+            &mut fine,
+        );
+        restore(dc_datas, saved);
+        let r_f = rate_term(frame_bits(&fine));
+        let (d_f, fine_map) = metric(&fine.recon);
+        if r_f - r_p < 1e-3 {
+            break;
+        }
+        let half_tasks: Vec<usize> = (0..ac_tasks.len()).step_by(2).collect();
+        let half_moves: Vec<(usize, i8)> = (0..n_tiles)
+            .filter(|&t| {
+                let (bx, by) = tile_blocks(t)[0];
+                half_tasks.contains(&task_of_block[by * xb + bx])
+            })
+            .map(|t| (t, -1))
+            .collect();
+        let (_, saved) = apply(dc_datas, &half_moves);
+        let mut coarse = plain.clone();
+        evaluate(
+            ctx,
+            scratch,
+            opsin,
+            dim,
+            distp,
+            dc_datas,
+            ac_tasks,
+            group_coords,
+            num_passes,
+            coeff_shifts,
+            coeff_orders,
+            &[],
+            ytob_dc,
+            qf_threshold,
+            shift_prices,
+            &half_tasks,
+            &mut coarse,
+        );
+        restore(dc_datas, saved);
+        let r_c = rate_term(frame_bits(&coarse));
+        let (d_c, _) = metric(&coarse.recon);
+        if log {
+            eprintln!(
+                "AQ_LOOP it{iter} plain: bits {r_p:+.2}% deficit {d_p:.6} | +1: {r_f:+.2}% {d_f:.6} | half -1: {r_c:+.2}% {d_c:.6}"
+            );
+        }
+        let s_fine = (d_p - d_f) / (r_f - r_p);
+        let s_coarse = if r_p - r_c > 1e-3 {
+            (d_c - d_p) / (r_p - r_c)
+        } else {
+            s_fine
+        };
+        let slope = 0.5 * (s_fine + s_coarse);
+        if !(slope.is_finite() && slope > 0.0) {
+            break;
+        }
+        let map_f = tile_sums(&fine_map);
+        let bits_f = tile_bits(&block_bits(&fine));
+        let map_0 = tile_sums(&map_p);
+        let bits_0 = tile_bits(&block_bits(&plain));
+        // Per tile: deficit gain (frame units) minus slope times rate cost (%).
+        // Only finer moves: coarsening smooth tiles is a blind spot of mean
+        // MS-SSIM that SSIMULACRA2 punishes, and edge-difference terms did not
+        // close it.
+        let mut moves: Vec<(f32, usize, i8)> = Vec::new();
+        for t in 0..n_tiles {
+            let gain = ((map_0[t] - map_f[t]) / pixels) as f32;
+            let rate = 100.0 * (bits_f[t] - bits_0[t]) / ref_bits;
+            let net = gain - slope * rate;
+            if net > 1e-7 && moved[t] < MAX_ABS_MOVE {
+                moves.push((net, t, 1));
+            }
+        }
+        moves.sort_by(|a, b| b.0.total_cmp(&a.0));
+        moves.truncate(((MAX_MOVE_FRACTION * n_tiles as f32) as usize).max(1));
+        if log {
+            eprintln!(
+                "AQ_LOOP it{iter} slope={slope:.7}/% candidates={} predicted net={:.6}",
+                moves.len(),
+                moves.iter().map(|m| m.0).sum::<f32>()
+            );
+        }
+        if moves.is_empty() {
+            break;
+        }
+        let j_cur = -cur_d - slope * rate_term(cur_bits);
+        let mut accepted = false;
+        let mut set: Vec<(usize, i8)> = moves.iter().map(|m| (m.1, m.2)).collect();
+        for _attempt in 0..3 {
+            let (tasks, saved) = apply(dc_datas, &set);
+            let mut cand = cur.clone();
+            evaluate(
+                ctx,
+                scratch,
+                opsin,
+                dim,
+                distp,
+                dc_datas,
+                ac_tasks,
+                group_coords,
+                num_passes,
+                coeff_shifts,
+                coeff_orders,
+                order_alternatives,
+                ytob_dc,
+                qf_threshold,
+                Some(prices),
+                &tasks,
+                &mut cand,
+            );
+            let bits = frame_bits(&cand);
+            let (d, map) = metric(&cand.recon);
+            let j = -d - slope * rate_term(bits);
+            if log {
+                eprintln!(
+                    "AQ_LOOP it{iter} verify {} moves: bits {:+.2}% deficit {d:.6} J {j:.6} vs {j_cur:.6}",
+                    set.len(),
+                    rate_term(bits)
+                );
+            }
+            if j > j_cur + 1e-7 {
+                for &(t, step) in &set {
+                    moved[t] += step;
+                }
+                cur = cand;
+                cur_bits = bits;
+                cur_d = d;
+                cur_map = map;
+                accepted = true;
+                break;
+            }
+            restore(dc_datas, saved);
+            if set.len() < 4 {
+                break;
+            }
+            set.truncate(set.len() / 2);
+        }
+        if !accepted {
+            break;
+        }
+    }
+    if log {
+        eprintln!(
+            "AQ_LOOP done: bits {:+.2}% deficit {cur_d:.6}, tiles moved {}, field sum {sum_before} -> {}",
+            rate_term(cur_bits),
+            moved.iter().filter(|&&m| m != 0).count(),
+            field_sum(dc_datas)
+        );
+    }
+    finish(cur)
+}
+
+/// Temporary AQ ceiling study: `JIXEL_AQ_DUMP=prefix` writes this DC group's
+/// quant field (`prefix.{stage}.{bx0}.{by0}`, "W H" header then rows) at the
+/// "pre" (after AQ) and "post" (final) stages; `JIXEL_AQ_GRID=path` replaces
+/// the field at "pre" from a frame-wide grid in the same format.
+fn aq_grid_study_hook(field: &mut crate::image::ImageB, x0: usize, y0: usize, stage: &str) {
+    let (bx0, by0) = (x0 / K_BLOCK_DIM, y0 / K_BLOCK_DIM);
+    if let Some(prefix) = std::env::var_os("JIXEL_AQ_DUMP") {
+        let mut out = format!("{} {}\n", field.xsize(), field.ysize());
+        for y in 0..field.ysize() {
+            let row: Vec<String> = field.row(y).iter().map(|v| v.to_string()).collect();
+            out.push_str(&row.join(" "));
+            out.push('\n');
+        }
+        let path = format!("{}.{stage}.{bx0}.{by0}", prefix.to_string_lossy());
+        std::fs::write(path, out).expect("aq dump");
+    }
+    if stage != "pre" {
+        return;
+    }
+    if let Ok(path) = std::env::var("JIXEL_AQ_GRID") {
+        let text = std::fs::read_to_string(&path).expect("aq grid");
+        let mut lines = text.lines();
+        let mut header = lines.next().expect("aq grid header").split_whitespace();
+        let w: usize = header.next().unwrap().parse().unwrap();
+        let h: usize = header.next().unwrap().parse().unwrap();
+        let rows: Vec<Vec<u8>> = lines
+            .take(h)
+            .map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect())
+            .collect();
+        for y in 0..field.ysize() {
+            let src = &rows[(by0 + y).min(h - 1)];
+            for (x, v) in field.row_mut(y).iter_mut().enumerate() {
+                *v = src[(bx0 + x).min(w - 1)].max(1);
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4486,6 +5110,12 @@ fn setup_dc_group(
         distp.distance,
         1.0 / distp.scale,
     );
+    aq_grid_study_hook(
+        &mut dc_data.raw_quant_field,
+        dc_group_x0,
+        dc_group_y0,
+        "pre",
+    );
 
     if ctx.speed.effort().chroma_policy && (ctx.x_heavy() || ctx.b_heavy()) {
         crate::adaptive_quant::apply_chroma_hf_protection(
@@ -4512,6 +5142,7 @@ fn setup_dc_group(
         &mut dc_data.ytox_map,
         &mut dc_data.ytob_map,
         distp.distance,
+        distp.x_qm_scale,
     );
     let mut fine_rollbacks = Vec::new();
     let mut fine_fallbacks = Vec::new();
@@ -4627,6 +5258,12 @@ fn setup_dc_group(
             // Else leave ordinary fine blocks on the incumbent they replaced.
         }
     }
+    aq_grid_study_hook(
+        &mut dc_data.raw_quant_field,
+        dc_group_x0,
+        dc_group_y0,
+        "post",
+    );
     Ok((dc_data, dc_group_xsize_groups, dc_group_ysize_groups))
 }
 
@@ -4815,12 +5452,8 @@ fn process_ac_group(
     alternative_orders: &[crate::coeff_order::CoeffOrders],
     collect_order_stats: bool,
     qf_threshold: u32,
-) -> (
-    PendingAcGroup,
-    Image3S,
-    Option<crate::group::SourceDc>,
-    Option<crate::coeff_order::OrderStats>,
-) {
+    capture_recon: bool,
+) -> ProcessedAcGroup {
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
     let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
     let group_x0 = image_gx * K_GROUP_DIM;
@@ -4848,6 +5481,12 @@ fn process_ac_group(
         .map(|_| Vec::with_capacity(K_GROUP_DIM_IN_BLOCKS * K_GROUP_DIM_IN_BLOCKS * 4))
         .collect();
     let mut order_stats = collect_order_stats.then(crate::coeff_order::OrderStats::new);
+    let mut recon = capture_recon.then(|| {
+        (
+            crate::image::Plane::<f32>::new(group_xsize, group_ysize),
+            Vec::new(),
+        )
+    });
 
     for ty in 0..group_ysize_tiles {
         let stripe_x0 = group_x0;
@@ -4888,6 +5527,9 @@ fn process_ac_group(
             order_stats.as_mut(),
             false,
             qf_threshold,
+            recon
+                .as_mut()
+                .map(|(plane, starts)| (plane, ty * K_TILE_DIM, starts)),
             &mut tokens,
         );
     }
@@ -4900,6 +5542,7 @@ fn process_ac_group(
         local_quant_dc,
         source_dc,
         order_stats,
+        recon,
     )
 }
 
@@ -5169,6 +5812,7 @@ mod tests {
                             None,
                             true,
                             10,
+                            None,
                             &mut tokens,
                         );
                         (distortion, quant_dc, source_dc, nzeros, tokens)

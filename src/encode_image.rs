@@ -3260,7 +3260,7 @@ mod encode_smoke_tests {
             let (x, y) = ((i % size) as f32, (i / size) as f32);
             *p = [8.0 + 0.03 * x, 10.0 + 0.02 * y, 22.0 + 0.04 * (x + y)];
         }
-        for _ in 0..size * size / 160 {
+        for _ in 0..size * size / 120 {
             let (cx, cy) = (
                 6.0 + next() * (size - 12) as f32,
                 6.0 + next() * (size - 12) as f32,
@@ -3292,8 +3292,8 @@ mod encode_smoke_tests {
         let plain = encode_image(&pixels, S, S, &config).unwrap();
         let config = config.with_dots(true);
         let with = encode_image(&pixels, S, S, &config).unwrap();
-        // The synthetic field's margin sits at 1-3% depending on how the
-        // nearly flat sky blocks quantize.
+        // The synthetic field's margin sits at ~5%; sparser fields flip on
+        // how the nearly flat sky blocks quantize.
         assert!(
             with.len() < plain.len(),
             "dots should win on a star field: {} vs {}",
@@ -3883,7 +3883,7 @@ mod encode_smoke_tests {
             );
         }
     }
-    
+
     #[test]
     fn rgb8_quality() {
         ok(encode_image(

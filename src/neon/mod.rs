@@ -29,6 +29,8 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
+mod aq_blur;
+mod aq_loop;
 mod cfl;
 mod color;
 mod dc_ops;
@@ -54,9 +56,10 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::{chroma_hf_stats_neon, fill_quant_field};
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
+pub(crate) use aq_blur::{blur_horizontal_neon, blur_vertical_neon};
+pub(crate) use aq_loop::{downsample_rows_neon, ssim_moments_neon};
 pub(crate) use cfl::{
-    apply_cfl_neon, cfl_closed_loop_cost_neon, cfl_rdo_block_neon, cfl_rdo_stats_neon,
-    cfl_regression_neon,
+    apply_cfl_neon, cfl_rd_cost_neon, cfl_rdo_block_neon, cfl_rdo_stats_neon, cfl_regression_neon,
 };
 pub(crate) use color::color_matrix_shaper_neon;
 pub(crate) use dc_ops::{adjust_b_dc_neon, compensate_b_dc_neon, reconstruct_dc_neon};

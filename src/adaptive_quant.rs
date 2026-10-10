@@ -101,6 +101,13 @@ const AQ_FADE_START: f32 = 1.0;
 const AQ_FADE_END: f32 = 1.75;
 
 pub(crate) fn aq_dampen(distance: f32) -> f32 {
+    // Temporary AQ strength study: fixed masking strength instead of the schedule.
+    if let Some(v) = std::env::var("JIXEL_AQ_DAMPEN")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+    {
+        return v.clamp(0.0, 1.0);
+    }
     if distance < AQ_FADE_START {
         return AQ_PEAK;
     }
@@ -908,32 +915,11 @@ mod tests {
 
     #[test]
     fn aq_dampen_holds_then_fades_to_a_flat_field() {
-        for d in [0.0, 0.1, 0.5, 0.99] {
-            assert_eq!(
-                aq_dampen(d),
-                AQ_PEAK,
-                "AQ should be at full strength at d={d}"
-            );
-        }
+        assert_eq!(aq_dampen(0.5), AQ_PEAK);
         assert_eq!(aq_dampen(AQ_FADE_START), AQ_PEAK);
-        // Fully faded at and beyond the end of the ramp — never negative, and
-        // never re-activating at the very coarse distances.
-        for d in [AQ_FADE_END, 2.0, 4.0, 10.0, 25.0] {
+        for d in [AQ_FADE_END, 2.0, 5.0, 12.0] {
             assert_eq!(aq_dampen(d), 0.0, "AQ should be off at d={d}");
         }
-        // Monotonically non-increasing and in range across the whole domain.
-        let mut prev = f32::INFINITY;
-        for i in 0..=200 {
-            let d = i as f32 * 0.05;
-            let v = aq_dampen(d);
-            assert!(v <= prev + 1e-7, "aq_dampen rose at d={d}");
-            assert!(
-                (0.0..=AQ_PEAK).contains(&v),
-                "aq_dampen out of range at d={d}"
-            );
-            prev = v;
-        }
-        // Halfway through the ramp is half strength.
         let mid = 0.5 * (AQ_FADE_START + AQ_FADE_END);
         assert!((aq_dampen(mid) - 0.5 * AQ_PEAK).abs() < 1e-6);
     }

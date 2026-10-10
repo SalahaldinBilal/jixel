@@ -50,7 +50,7 @@ use std::sync::OnceLock;
 const RDOQ_MAX_STRIDE: usize = 2 * (256 + 1);
 
 #[inline]
-fn rdoq_channel_weights(coding: crate::CodingTransform) -> [f32; 3] {
+pub(crate) fn rdoq_channel_weights(coding: crate::CodingTransform) -> [f32; 3] {
     // The YCbCr weights improve rendered RD for both RGB and CMYK input.
     // RGB and adaptive XYB regress slightly with their reconstruction weights,
     // so keep the trellis's existing calibration for those transforms.
@@ -219,7 +219,7 @@ fn rdoq_distortion_weight(window_index: usize, window_len: usize, distance: f32)
 }
 
 #[inline]
-fn rdoq_lambda(qf_ratio: f32) -> f32 {
+pub(crate) fn rdoq_lambda(qf_ratio: f32) -> f32 {
     const BASE: f32 = 1.5;
     crate::ac_strategy::RD_LAMBDA * 0.25 * BASE * qf_ratio.clamp(0.5, 2.0)
 }
@@ -1204,7 +1204,7 @@ const CHROMA_RDOQ_WEIGHT_D1: f32 = 4.0;
 
 /// Chroma trellis distortion-weight multiplier at `distance`.
 #[inline]
-fn chroma_rdoq_weight(distance: f32) -> f32 {
+pub(crate) fn chroma_rdoq_weight(distance: f32) -> f32 {
     let t = ((distance - CHROMA_RDOQ_WEIGHT_D0) / (CHROMA_RDOQ_WEIGHT_D1 - CHROMA_RDOQ_WEIGHT_D0))
         .clamp(0.0, 1.0);
     CHROMA_RDOQ_WEIGHT_HQ + t * (1.0 - CHROMA_RDOQ_WEIGHT_HQ)
@@ -1274,6 +1274,15 @@ fn quantize_roundtrip_y_block(
     }
 }
 
+/// Luma reconstruction capture for the closed-loop quant field: the
+/// group-local plane, the pixel row offset of the current stripe in it, and
+/// the pass-0 token index at which each coded block starts.
+pub(crate) type ReconCapture<'a> = (
+    &'a mut crate::image::Plane<f32>,
+    usize,
+    &'a mut Vec<(u16, u16, u32)>,
+);
+
 pub(crate) struct AcGroupScratch {
     coeffs: HeapMatrix<f32, 3, 4096>,
     quantized: HeapMatrix<i32, 3, 4096>,
@@ -1285,6 +1294,9 @@ pub(crate) struct AcGroupScratch {
     gather: Box<[f32; 4096]>,
     /// Distinct source colors, reused across RDOQ blocks and groups.
     few_color_keys: Vec<u64>,
+    /// Y coefficient error and its pixel-domain image for the recon capture.
+    recon_err: Box<[f32; 4096]>,
+    recon_pix: Box<[f32; 4096]>,
 }
 
 impl Default for AcGroupScratch {
@@ -1298,6 +1310,8 @@ impl Default for AcGroupScratch {
             rdoq_costs: HeapMatrix::new(f32::INFINITY),
             gather: heap_array(0.0),
             few_color_keys: Vec::new(),
+            recon_err: heap_array(0.0),
+            recon_pix: heap_array(0.0),
         }
     }
 }
@@ -1338,6 +1352,7 @@ pub(crate) fn write_ac_group(
     mut order_stats: Option<&mut crate::coeff_order::OrderStats>,
     measure_chroma_distortion: bool,
     qf_threshold: u32,
+    mut recon_y: Option<ReconCapture<'_>>,
     out: &mut [Vec<Token>],
 ) -> f32 {
     let (out, alternative_out) = out.split_at_mut(coeff_shifts.len());
@@ -1376,6 +1391,8 @@ pub(crate) fn write_ac_group(
         rdoq_costs,
         gather,
         few_color_keys,
+        recon_err,
+        recon_pix,
     } = scratch;
 
     for by in 0..ysize_blocks {
@@ -1388,6 +1405,9 @@ pub(crate) fn write_ac_group(
             // Skip non-first blocks of multi-block transforms.
             if !dc_data.ac_strategy.is_first_block(global_bx, global_by) {
                 continue;
+            }
+            if let Some((_, _, starts)) = recon_y.as_mut() {
+                starts.push((global_bx as u16, global_by as u16, out[0].len() as u32));
             }
 
             let raw_strategy = dc_data.ac_strategy.raw_strategy(global_bx, global_by);
@@ -1646,7 +1666,7 @@ pub(crate) fn write_ac_group(
                 }
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
-            if rdoq_prices.is_some() {
+            if rdoq_prices.is_some() || recon_y.is_some() {
                 source_y[..size].copy_from_slice(&coeffs[1][..size]);
             }
             quantize_roundtrip_y_block(
@@ -1696,6 +1716,49 @@ pub(crate) fn write_ac_group(
                     .zip(quantized[1][..size].iter().zip(qm_y[..size].iter()))
                 {
                     *out = dequantized_level(q) * dq * inv_qac;
+                }
+            }
+
+            // ---- Luma reconstruction capture (closed-loop quant field) ----
+            // Source plus the inverse-transformed Y quantization error, the
+            // rerank's reconstruction model; the cx*cy lowest frequencies ride
+            // on the DC path and are excluded.
+            if let Some((recon, y_off, _)) = recon_y.as_mut() {
+                let y_off = *y_off;
+                for ((e, &q), &src) in recon_err[..size]
+                    .iter_mut()
+                    .zip(&coeffs[1][..size])
+                    .zip(&source_y[..size])
+                {
+                    *e = q - src;
+                }
+                let wc = cx * 8;
+                for row in recon_err[..cy * wc].chunks_exact_mut(wc) {
+                    row[..cx].fill(0.0);
+                }
+                crate::inflated_cost::reconstruct_error(
+                    ctx.idct,
+                    raw_strategy,
+                    &recon_err[..size],
+                    &mut recon_pix[..size],
+                );
+                let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
+                let (px0, py0) = (opsin_origin.0 + bx * 8, opsin_origin.1 + by * 8);
+                let plane = opsin.plane(1);
+                for y in 0..ph {
+                    let (sy, ly) = (py0 + y, y_off + by * 8 + y);
+                    if sy >= plane.ysize() || ly >= recon.ysize() {
+                        break;
+                    }
+                    let src_row = plane.row(sy);
+                    let dst_row = recon.row_mut(ly);
+                    for x in 0..pw {
+                        let (sx, lx) = (px0 + x, bx * 8 + x);
+                        if sx >= src_row.len() || lx >= dst_row.len() {
+                            break;
+                        }
+                        dst_row[lx] = src_row[sx] + recon_pix[y * pw + x];
+                    }
                 }
             }
 

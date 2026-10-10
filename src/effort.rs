@@ -97,6 +97,8 @@ effort_gates! {
     /// Chroma content analysis and every policy it drives: saturated/pair-B/x-heavy
     /// tables, point chroma, chroma HF protection, pixel-chromacity B steps.
     chroma_policy,
+    /// Closed-loop quant-field refinement on the reconstructed luma (MS-SSIM).
+    aq_closed_loop,
     cfl_rdo,
     chroma_deadzone,
     yellow_opsin,
@@ -210,6 +212,7 @@ const MEDIUM: Effort = Effort {
 };
 
 const SLOW: Effort = Effort {
+    aq_closed_loop: false,
     coeff_order_entropy_race: false,
     dc_cfl_weighted: false,
     large_transform_rdoq: false,

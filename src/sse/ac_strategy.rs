@@ -34,7 +34,7 @@ use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn hsum(v: __m128) -> f32 {
+pub(crate) fn hsum(v: __m128) -> f32 {
     let shuf = _mm_movehdup_ps(v); // [1,1,3,3]
     let sums = _mm_add_ps(v, shuf);
     let shuf2 = _mm_movehl_ps(shuf, sums);
@@ -158,7 +158,7 @@ pub(crate) fn gradient_region_stats_with_chroma_sse41(
 /// bounds-validated against `width*height`.
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn sse_dequantized_level_f32(q: __m128) -> __m128 {
+pub(super) fn sse_dequantized_level_f32(q: __m128) -> __m128 {
     let sign_mask = _mm_set1_ps(-0.0);
     let absq = _mm_andnot_ps(sign_mask, q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
@@ -514,7 +514,7 @@ fn hmax_u32(v: __m128i) -> u32 {
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
-fn sse_log2p1_f32(x: __m128) -> __m128 {
+pub(super) fn sse_log2p1_f32(x: __m128) -> __m128 {
     // y = 1 + x
     let y = _mm_add_ps(x, _mm_set1_ps(1.0));
 

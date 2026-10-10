@@ -30,76 +30,54 @@
 use std::arch::aarch64::*;
 
 #[target_feature(enable = "neon")]
-pub(crate) fn cfl_closed_loop_cost_neon(
-    m: &[f32],
-    s: &[f32],
-    factor: f32,
-    thresholds: &[f32; 63],
-) -> [f32; 2] {
+pub(crate) fn cfl_rd_cost_neon(m: &[f32], s: &[f32], factor: f32, weight: f32, lambda: f32) -> f32 {
+    use crate::color_correlation::{CFL_MAGNITUDE_BITS, CFL_NONZERO_BITS};
     let len = m.len().min(s.len());
-    let scalar_factor = factor;
-    let factor = vdupq_n_f32(factor);
+    let factor_v = vdupq_n_f32(factor);
+    let weight_v = vdupq_n_f32(weight);
     let zero = vdupq_n_f32(0.0);
     let one = vdupq_n_f32(1.0);
-    let weight = vdupq_n_f32(0.15);
-    let mut distortion = 0.0f32;
-    let mut coeff_bits = 0.0f32;
-    let mut dist_acc = zero;
-    let mut bits_acc = zero;
+    let nonzero_bits = vdupq_n_f32(lambda * CFL_NONZERO_BITS);
+    let magnitude_bits = vdupq_n_f32(lambda * CFL_MAGNITUDE_BITS);
+    let mut acc = zero;
     let (m_chunks, m_tail) = m[..len].as_chunks::<4>();
     let (s_chunks, s_tail) = s[..len].as_chunks::<4>();
-
-    for (chunk_index, (m, s)) in m_chunks.iter().zip(s_chunks).enumerate() {
+    for (m, s) in m_chunks.iter().zip(s_chunks) {
         let mv = unsafe { vld1q_f32(m.as_ptr()) };
         let sv = unsafe { vld1q_f32(s.as_ptr()) };
-        let residual = vsubq_f32(sv, vmulq_f32(factor, mv));
-        let abs_residual = vabsq_f32(residual);
-        let phase = (chunk_index * 4) % 63;
-        let threshold = if phase + 4 <= 63 {
-            unsafe { vld1q_f32(thresholds.as_ptr().add(phase)) }
-        } else {
-            let wrapped = [
-                thresholds[phase],
-                thresholds[(phase + 1) % 63],
-                thresholds[(phase + 2) % 63],
-                thresholds[(phase + 3) % 63],
-            ];
-            unsafe { vld1q_f32(wrapped.as_ptr()) }
-        };
-        let active = vcgeq_f32(abs_residual, threshold);
-        let level = vbslq_f32(active, vrndaq_f32(residual), zero);
-        let reconstructed = super::ac_strategy::neon_dequantized_level_f32(level);
-        let quant_error = vabsq_f32(vsubq_f32(residual, reconstructed));
-        let dist = vaddq_f32(quant_error, vmulq_f32(weight, abs_residual));
-        let abs_level = vabsq_f32(level);
-        let nonzero = vcgtq_f32(abs_level, zero);
-        let bits = vbslq_f32(
-            nonzero,
-            vaddq_f32(one, super::ac_strategy::neon_log2p1_f32(abs_level)),
-            zero,
+        let residual = vsubq_f32(sv, vmulq_f32(factor_v, mv));
+        let zero_cost = vmulq_f32(vmulq_f32(weight_v, residual), residual);
+        let level = vrndaq_f32(residual);
+        let coded_err = vsubq_f32(
+            residual,
+            super::ac_strategy::neon_dequantized_level_f32(level),
         );
-        dist_acc = vaddq_f32(dist_acc, dist);
-        bits_acc = vaddq_f32(bits_acc, bits);
+        let abs_level = vabsq_f32(level);
+        // log2(|level|) = log2(1 + (|level| - 1)); only read where level != 0.
+        let log2_level =
+            super::ac_strategy::neon_log2p1_f32(vmaxq_f32(vsubq_f32(abs_level, one), zero));
+        let bits = vfmaq_f32(nonzero_bits, magnitude_bits, log2_level);
+        let coded = vaddq_f32(vmulq_f32(vmulq_f32(weight_v, coded_err), coded_err), bits);
+        let nonzero = vcgtq_f32(abs_level, zero);
+        let best = vminq_f32(zero_cost, vbslq_f32(nonzero, coded, zero_cost));
+        acc = vaddq_f32(acc, best);
     }
-
-    distortion += vaddvq_f32(dist_acc);
-    coeff_bits += vaddvq_f32(bits_acc);
-
-    let tail_start = m_chunks.len() * 4;
-    for (offset, (&mv, &sv)) in m_tail.iter().zip(s_tail).enumerate() {
-        let residual = sv - scalar_factor * mv;
-        let level = if residual.abs() >= thresholds[(tail_start + offset) % 63] {
-            residual.round()
-        } else {
-            0.0
-        };
-        let quant_error = residual - crate::group::dequantized_level_f32(level);
-        distortion += quant_error.abs() + 0.15 * residual.abs();
+    let mut cost = vaddvq_f32(acc);
+    for (&mv, &sv) in m_tail.iter().zip(s_tail) {
+        let residual = sv - factor * mv;
+        let mut best = weight * residual * residual;
+        let level = residual.round();
         if level != 0.0 {
-            coeff_bits += 1.0 + crate::adaptive_quant::dirty_log2p1f(level.abs());
+            let coded_err = residual - crate::group::dequantized_level_f32(level);
+            let coded = weight * coded_err * coded_err
+                + lambda
+                    * (CFL_NONZERO_BITS
+                        + CFL_MAGNITUDE_BITS * crate::adaptive_quant::dirty_log2f(level.abs()));
+            best = best.min(coded);
         }
+        cost += best;
     }
-    [distortion, coeff_bits]
+    cost
 }
 
 #[target_feature(enable = "neon")]

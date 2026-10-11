@@ -1283,6 +1283,112 @@ pub(crate) type ReconCapture<'a> = (
     &'a mut Vec<(u16, u16, u32)>,
 );
 
+/// Per-block memo of one AC group for the closed-loop quant field: a block's
+/// quantized coefficients, DC levels and reconstruction are a function of its
+/// field value and of the nonzero-count contexts predicted from its
+/// neighbours, so a re-encode after a one-tile change recomputes only the
+/// blocks whose key changed and tokenizes the rest from the memo.
+pub(crate) struct AcBlockCache {
+    xsize_blocks: usize,
+    /// Per channel and first block: the key its stored channel was computed
+    /// under. Y: field value and Y nonzero context; X/B: field value, own and
+    /// Y contexts (CfL reads the dequantized Y) and the channel's qm scale.
+    keys: [Vec<u32>; 3],
+    quantized: [Vec<i32>; 3],
+    dc: Image3S,
+    /// Unquantized DC per cell and channel (the chroma saturation test reads it).
+    dc_f: [Vec<f32>; 3],
+    recon: Image3F,
+    /// Token streams per block and channel (single-pass frames): one arena per
+    /// output stream, `spans[(block * 3 + c) * streams + s]` = (start, len),
+    /// and the shifted nonzero count stored in the context map per channel.
+    tokens: Vec<Vec<Token>>,
+    spans: Vec<(u32, u32)>,
+    nz_shift: Vec<[u8; 3]>,
+    /// Evaluation counter and, per block cell, the evaluation that last
+    /// recomputed it: an evaluation synced at `s` needs the cells with
+    /// `cell_gen > s`.
+    pub(crate) epoch: u32,
+    cell_gen: Vec<u32>,
+}
+
+impl AcBlockCache {
+    pub(crate) fn new(
+        xsize_blocks: usize,
+        ysize_blocks: usize,
+        xsize: usize,
+        ysize: usize,
+    ) -> Self {
+        let n = xsize_blocks * ysize_blocks;
+        Self {
+            xsize_blocks,
+            keys: std::array::from_fn(|_| vec![u32::MAX; n]),
+            quantized: std::array::from_fn(|_| vec![0; n * 64]),
+            dc: Image3S::new(xsize_blocks, ysize_blocks),
+            dc_f: std::array::from_fn(|_| vec![0.0; n]),
+            recon: Image3F::new(xsize, ysize),
+            tokens: Vec::new(),
+            spans: Vec::new(),
+            nz_shift: vec![[0; 3]; n],
+            epoch: 0,
+            cell_gen: vec![0; n],
+        }
+    }
+
+    /// The memo's reconstruction of the group; the capture target of every
+    /// evaluation that uses the memo.
+    pub(crate) fn recon_mut(&mut self) -> &mut Image3F {
+        &mut self.recon
+    }
+
+    /// Copy into `dst` (offset `x0`, `y0`) the cells recomputed after
+    /// evaluation `synced` whose pixels differ from it; returns their pixel
+    /// bounding box in `dst` coordinates. Cells recomputed to the values
+    /// `dst` already holds (a rejected move re-encoded back) are skipped, so
+    /// the box covers the change itself and not every cell touched since.
+    pub(crate) fn sync_into(
+        &self,
+        synced: u32,
+        dst: &mut Image3F,
+        x0: usize,
+        y0: usize,
+    ) -> Option<(usize, usize, usize, usize)> {
+        let (mut rx0, mut ry0, mut rx1, mut ry1) = (usize::MAX, usize::MAX, 0usize, 0usize);
+        let (w, h) = (self.recon.xsize(), self.recon.ysize());
+        for (i, &g) in self.cell_gen.iter().enumerate() {
+            if g <= synced {
+                continue;
+            }
+            let (bx, by) = (i % self.xsize_blocks, i / self.xsize_blocks);
+            let (cx0, cy0) = (bx * 8, by * 8);
+            let (cx1, cy1) = ((cx0 + 8).min(w), (cy0 + 8).min(h));
+            if cx0 >= cx1 || cy0 >= cy1 {
+                continue;
+            }
+            let differs = (0..3).any(|c| {
+                (cy0..cy1).any(|y| {
+                    self.recon.plane_row(c, y)[cx0..cx1]
+                        != dst.plane_row(c, y0 + y)[x0 + cx0..x0 + cx1]
+                })
+            });
+            if !differs {
+                continue;
+            }
+            for c in 0..3 {
+                for y in cy0..cy1 {
+                    dst.plane_row_mut(c, y0 + y)[x0 + cx0..x0 + cx1]
+                        .copy_from_slice(&self.recon.plane_row(c, y)[cx0..cx1]);
+                }
+            }
+            rx0 = rx0.min(x0 + cx0);
+            ry0 = ry0.min(y0 + cy0);
+            rx1 = rx1.max(x0 + cx1);
+            ry1 = ry1.max(y0 + cy1);
+        }
+        (rx1 > 0).then_some((rx0, ry0, rx1, ry1))
+    }
+}
+
 pub(crate) struct AcGroupScratch {
     coeffs: HeapMatrix<f32, 3, 4096>,
     quantized: HeapMatrix<i32, 3, 4096>,
@@ -1353,6 +1459,7 @@ pub(crate) fn write_ac_group(
     measure_chroma_distortion: bool,
     qf_threshold: u32,
     mut recon_y: Option<ReconCapture<'_>>,
+    mut memo: Option<&mut AcBlockCache>,
     out: &mut [Vec<Token>],
 ) -> f32 {
     let (out, alternative_out) = out.split_at_mut(coeff_shifts.len());
@@ -1423,222 +1530,307 @@ pub(crate) fn write_ac_group(
             let size = cx * cy * 64;
             let quant_ac = dc_data.raw_quant_field.row(global_by)[global_bx] as i32;
 
-            // ---- Forward DCT for all 3 channels ----
-            let footprint = Footprint::of_strategy(
-                opsin,
-                opsin_origin.0 + bx * 8,
-                opsin_origin.1 + by * 8,
-                raw_strategy,
-            );
-            debug_assert_eq!((footprint.width, footprint.height), (cov_x * 8, cov_y * 8));
-            // Padding is never shown, so RDOQ charges coefficient error by
-            // the footprint's visible area.
-            let visible = footprint.visible_fraction();
-            let restore_penalty = if rdoq_prices.is_some() {
-                let x0 = opsin_origin.0 + bx * 8;
-                let y0 = opsin_origin.1 + by * 8;
-                let x1 = (x0 + cov_x * 8).min(opsin.xsize());
-                let y1 = (y0 + cov_y * 8).min(opsin.ysize());
-                let limit = RESTORE_FEW_COLORS_PER_BLOCK * cov_x * cov_y;
-                if few_colors(opsin, x0, y0, x1, y1, limit, few_color_keys) {
-                    RESTORE_FEW_COLORS_PENALTY
+            // ---- Block memo ----
+            // Per channel: a block's channel is a function of the field value,
+            // the nonzero contexts predicted from its neighbours, Y's context
+            // for the CfL residuals and the channel's qm scale.
+            let lby = global_by - qorigin_y;
+            let predicted_ctx: [u8; 3] = std::array::from_fn(|c| {
+                let nzero_map = &num_nzeros[0];
+                let row_top = (nz_by != 0).then(|| nzero_map.plane_row(c, nz_by - 1));
+                predict_from_top_and_left(row_top, nzero_map.plane_row(c, nz_by), bx, 32)
+            });
+            let memo_keys: [u32; 3] = [
+                quant_ac as u32
+                    | u32::from(predicted_ctx[0]) << 8
+                    | u32::from(predicted_ctx[1]) << 16
+                    | x_qm_scale << 24,
+                quant_ac as u32 | u32::from(predicted_ctx[1]) << 8,
+                quant_ac as u32
+                    | u32::from(predicted_ctx[2]) << 8
+                    | u32::from(predicted_ctx[1]) << 16
+                    | ctx.b_qm_scale() << 24,
+            ];
+            let bi = lby * memo.as_deref().map_or(0, |m| m.xsize_blocks) + bx;
+            // Token streams are memoized for single-pass frames (the key
+            // carries the first pass's contexts) and never while tallying
+            // orders. The capture image is the memo's own reconstruction, so
+            // a hit copies no pixels.
+            let streams = out.len() + alternative_out.len();
+            let token_memo = coeff_shifts.len() == 1 && order_stats.is_none();
+            let tokens_cached = token_memo
+                && memo
+                    .as_deref()
+                    .is_some_and(|m| m.spans.len() == m.keys[0].len() * streams * 3);
+            let hit: [bool; 3] = std::array::from_fn(|c| {
+                memo.as_deref()
+                    .is_some_and(|m| m.keys[c][bi] == memo_keys[c])
+            });
+            debug_assert!(memo.is_none() || (!measure_chroma_distortion && source_dc.is_none()));
+            // A hit channel's levels (unless its tokens are cached too) and DC.
+            if let Some(m) = memo.as_deref() {
+                for c in 0..3 {
+                    if !hit[c] {
+                        continue;
+                    }
+                    for j in 0..cov_y {
+                        if !tokens_cached {
+                            for i in 0..cov_x {
+                                let slot = ((lby + j) * m.xsize_blocks + bx + i) * 64;
+                                let k = (j * cov_x + i) * 64;
+                                quantized[c][k..k + 64]
+                                    .copy_from_slice(&m.quantized[c][slot..slot + 64]);
+                            }
+                        }
+                        let src = &m.dc.plane_row(c, lby + j)[bx..bx + cov_x];
+                        quant_dc.plane_row_mut(c, lby + j)[bx..bx + cov_x].copy_from_slice(src);
+                    }
+                }
+            }
+            let memo_hit = hit.iter().all(|&h| h);
+            if !memo_hit {
+                // ---- Forward DCT for all 3 channels ----
+                let footprint = Footprint::of_strategy(
+                    opsin,
+                    opsin_origin.0 + bx * 8,
+                    opsin_origin.1 + by * 8,
+                    raw_strategy,
+                );
+                debug_assert_eq!((footprint.width, footprint.height), (cov_x * 8, cov_y * 8));
+                // Padding is never shown, so RDOQ charges coefficient error by
+                // the footprint's visible area.
+                let visible = footprint.visible_fraction();
+                let restore_penalty = if rdoq_prices.is_some() {
+                    let x0 = opsin_origin.0 + bx * 8;
+                    let y0 = opsin_origin.1 + by * 8;
+                    let x1 = (x0 + cov_x * 8).min(opsin.xsize());
+                    let y1 = (y0 + cov_y * 8).min(opsin.ysize());
+                    let limit = RESTORE_FEW_COLORS_PER_BLOCK * cov_x * cov_y;
+                    if few_colors(opsin, x0, y0, x1, y1, limit, few_color_keys) {
+                        RESTORE_FEW_COLORS_PENALTY
+                    } else {
+                        1.0
+                    }
                 } else {
                     1.0
+                };
+                for c in 0..3 {
+                    if hit[c] {
+                        continue;
+                    }
+                    let (input, stride) = footprint.pixels(opsin.plane(c), &mut gather[..]);
+                    match raw_strategy {
+                        STRATEGY_DCT => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.dct8x8)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_IDENTITY => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.identity8x8)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT2X2 => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.dct2x2_8x8)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT16X8 => {
+                            let dst: &mut [f32; 128] = coeffs[c].first_chunk_mut::<128>().unwrap();
+                            (ctx.dct16x8)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT8X16 => {
+                            let dst: &mut [f32; 128] = coeffs[c].first_chunk_mut::<128>().unwrap();
+                            (ctx.dct8x16)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT16X16 => {
+                            let dst: &mut [f32; 256] = coeffs[c].first_chunk_mut::<256>().unwrap();
+                            (ctx.dct16x16)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT32X32 => {
+                            let dst: &mut [f32; 1024] =
+                                coeffs[c].first_chunk_mut::<1024>().unwrap();
+                            (ctx.dct32x32)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT64X64 => {
+                            let dst: &mut [f32; 4096] =
+                                coeffs[c].first_chunk_mut::<4096>().unwrap();
+                            (ctx.dct64x64)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT64X32 => {
+                            let dst: &mut [f32; 2048] =
+                                coeffs[c].first_chunk_mut::<2048>().unwrap();
+                            (ctx.dct64x32)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT32X64 => {
+                            let dst: &mut [f32; 2048] =
+                                coeffs[c].first_chunk_mut::<2048>().unwrap();
+                            (ctx.dct32x64)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT4X4 => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.dct4x4)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT4X8 => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.dct4x8)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT8X4 => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.dct8x4)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT32X16 => {
+                            let dst: &mut [f32; 512] = coeffs[c].first_chunk_mut::<512>().unwrap();
+                            (ctx.dct32x16)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT16X32 => {
+                            let dst: &mut [f32; 512] = coeffs[c].first_chunk_mut::<512>().unwrap();
+                            (ctx.dct16x32)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_AFV0 => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.afv0)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_AFV1 => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.afv1)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_AFV2 => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.afv2)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_AFV3 => {
+                            let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
+                            (ctx.afv3)(DctInput::new(input, stride), dst);
+                        }
+                        _ => unreachable!("invalid raw strategy {}", raw_strategy),
+                    }
                 }
-            } else {
-                1.0
-            };
-            for c in 0..3 {
-                let (input, stride) = footprint.pixels(opsin.plane(c), &mut gather[..]);
+
+                // For DCT8, DC = coeffs[0]. For multi-block, use DCFromLowestFrequencies.
+                // dc_vals[c] holds up to 4 DC values (DCT16X16 = 2×2 covered blocks);
+                // indexing is didx = iy * cov_x + ix.
+                let mut dc_vals = [[0.0f32; 64]; 3];
                 match raw_strategy {
-                    STRATEGY_DCT => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.dct8x8)(DctInput::new(input, stride), dst);
-                    }
-                    STRATEGY_IDENTITY => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.identity8x8)(DctInput::new(input, stride), dst);
-                    }
-                    STRATEGY_DCT2X2 => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.dct2x2_8x8)(DctInput::new(input, stride), dst);
+                    STRATEGY_DCT
+                    | STRATEGY_IDENTITY
+                    | STRATEGY_DCT2X2
+                    | STRATEGY_DCT4X4
+                    | STRATEGY_DCT4X8
+                    | STRATEGY_DCT8X4
+                    | STRATEGY_AFV0..=STRATEGY_AFV3 => {
+                        for c in 0..3 {
+                            dc_vals[c][0] = coeffs[c][0];
+                        }
                     }
                     STRATEGY_DCT16X8 => {
-                        let dst: &mut [f32; 128] = coeffs[c].first_chunk_mut::<128>().unwrap();
-                        (ctx.dct16x8)(DctInput::new(input, stride), dst);
+                        for c in 0..3 {
+                            let cb: &[f32; 128] = coeffs[c].first_chunk::<128>().unwrap();
+                            dc_from_dct16x8(cb, dc_vals[c].first_chunk_mut::<2>().unwrap());
+                        }
                     }
                     STRATEGY_DCT8X16 => {
-                        let dst: &mut [f32; 128] = coeffs[c].first_chunk_mut::<128>().unwrap();
-                        (ctx.dct8x16)(DctInput::new(input, stride), dst);
+                        for c in 0..3 {
+                            let cb: &[f32; 128] = coeffs[c].first_chunk::<128>().unwrap();
+                            dc_from_dct8x16(cb, dc_vals[c].first_chunk_mut::<2>().unwrap());
+                        }
                     }
                     STRATEGY_DCT16X16 => {
-                        let dst: &mut [f32; 256] = coeffs[c].first_chunk_mut::<256>().unwrap();
-                        (ctx.dct16x16)(DctInput::new(input, stride), dst);
+                        // dc_from_dct16x16 returns 4 DC values in [TL, TR, BL, BR]
+                        // order, matching the [iy=0,1][ix=0,1] grid the caller uses
+                        // (didx = iy * 2 + ix).
+                        for c in 0..3 {
+                            let cb: &[f32; 256] = coeffs[c].first_chunk::<256>().unwrap();
+                            dc_from_dct16x16(cb, dc_vals[c].first_chunk_mut::<4>().unwrap());
+                        }
                     }
                     STRATEGY_DCT32X32 => {
-                        let dst: &mut [f32; 1024] = coeffs[c].first_chunk_mut::<1024>().unwrap();
-                        (ctx.dct32x32)(DctInput::new(input, stride), dst);
+                        // dc_from_dct32x32 returns 16 DC values in the 4×4 grid the
+                        // caller uses (didx = iy * 4 + ix).
+                        for c in 0..3 {
+                            let cb: &[f32; 1024] = coeffs[c].first_chunk::<1024>().unwrap();
+                            (ctx.dc_from_dct32x32)(cb, dc_vals[c].first_chunk_mut::<16>().unwrap());
+                        }
                     }
                     STRATEGY_DCT64X64 => {
-                        let dst: &mut [f32; 4096] = coeffs[c].first_chunk_mut::<4096>().unwrap();
-                        (ctx.dct64x64)(DctInput::new(input, stride), dst);
+                        for c in 0..3 {
+                            let cb: &[f32; 4096] = coeffs[c].first_chunk::<4096>().unwrap();
+                            (ctx.dc_from_dct64x64)(cb, &mut dc_vals[c]);
+                        }
                     }
                     STRATEGY_DCT64X32 => {
-                        let dst: &mut [f32; 2048] = coeffs[c].first_chunk_mut::<2048>().unwrap();
-                        (ctx.dct64x32)(DctInput::new(input, stride), dst);
+                        for c in 0..3 {
+                            let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
+                            (ctx.dc_from_dct64x32)(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
+                        }
                     }
                     STRATEGY_DCT32X64 => {
-                        let dst: &mut [f32; 2048] = coeffs[c].first_chunk_mut::<2048>().unwrap();
-                        (ctx.dct32x64)(DctInput::new(input, stride), dst);
-                    }
-                    STRATEGY_DCT4X4 => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.dct4x4)(DctInput::new(input, stride), dst);
-                    }
-                    STRATEGY_DCT4X8 => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.dct4x8)(DctInput::new(input, stride), dst);
-                    }
-                    STRATEGY_DCT8X4 => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.dct8x4)(DctInput::new(input, stride), dst);
+                        for c in 0..3 {
+                            let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
+                            (ctx.dc_from_dct32x64)(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
+                        }
                     }
                     STRATEGY_DCT32X16 => {
-                        let dst: &mut [f32; 512] = coeffs[c].first_chunk_mut::<512>().unwrap();
-                        (ctx.dct32x16)(DctInput::new(input, stride), dst);
+                        // 8 DC values in a 4-row × 2-col grid (didx = iy*2 + ix),
+                        // matching cov_x=2, cov_y=4.
+                        for c in 0..3 {
+                            let cb: &[f32; 512] = coeffs[c].first_chunk::<512>().unwrap();
+                            (ctx.dc_from_dct32x16)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
+                        }
                     }
                     STRATEGY_DCT16X32 => {
-                        let dst: &mut [f32; 512] = coeffs[c].first_chunk_mut::<512>().unwrap();
-                        (ctx.dct16x32)(DctInput::new(input, stride), dst);
+                        // 8 DC values in a 2-row × 4-col grid (didx = iy*4 + ix),
+                        // matching cov_x=4, cov_y=2.
+                        for c in 0..3 {
+                            let cb: &[f32; 512] = coeffs[c].first_chunk::<512>().unwrap();
+                            (ctx.dc_from_dct16x32)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
+                        }
                     }
-                    STRATEGY_AFV0 => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.afv0)(DctInput::new(input, stride), dst);
-                    }
-                    STRATEGY_AFV1 => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.afv1)(DctInput::new(input, stride), dst);
-                    }
-                    STRATEGY_AFV2 => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.afv2)(DctInput::new(input, stride), dst);
-                    }
-                    STRATEGY_AFV3 => {
-                        let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
-                        (ctx.afv3)(DctInput::new(input, stride), dst);
-                    }
-                    _ => unreachable!("invalid raw strategy {}", raw_strategy),
+                    _ => unreachable!(),
                 }
-            }
 
-            // For DCT8, DC = coeffs[0]. For multi-block, use DCFromLowestFrequencies.
-            // dc_vals[c] holds up to 4 DC values (DCT16X16 = 2×2 covered blocks);
-            // indexing is didx = iy * cov_x + ix.
-            let mut dc_vals = [[0.0f32; 64]; 3];
-            match raw_strategy {
-                STRATEGY_DCT
-                | STRATEGY_IDENTITY
-                | STRATEGY_DCT2X2
-                | STRATEGY_DCT4X4
-                | STRATEGY_DCT4X8
-                | STRATEGY_DCT8X4
-                | STRATEGY_AFV0..=STRATEGY_AFV3 => {
+                // Hit channels: the DC values the skipped transform would have given.
+                if let Some(m) = memo.as_deref() {
                     for c in 0..3 {
-                        dc_vals[c][0] = coeffs[c][0];
+                        if hit[c] {
+                            for iy in 0..cov_y {
+                                let row = (lby + iy) * m.xsize_blocks;
+                                dc_vals[c][iy * cov_x..(iy + 1) * cov_x]
+                                    .copy_from_slice(&m.dc_f[c][row + bx..row + bx + cov_x]);
+                            }
+                        }
                     }
                 }
-                STRATEGY_DCT16X8 => {
-                    for c in 0..3 {
-                        let cb: &[f32; 128] = coeffs[c].first_chunk::<128>().unwrap();
-                        dc_from_dct16x8(cb, dc_vals[c].first_chunk_mut::<2>().unwrap());
+                // DC for storage (per covered block, using pre-swap cov_x/cov_y).
+                let covered_dc = cov_x * cov_y;
+                let mut y_dc_q = [0i16; 64];
+                if let Some(m) = memo.as_deref().filter(|_| hit[1]) {
+                    for iy in 0..cov_y {
+                        y_dc_q[iy * cov_x..(iy + 1) * cov_x]
+                            .copy_from_slice(&m.dc.plane_row(1, lby + iy)[bx..bx + cov_x]);
+                    }
+                } else {
+                    (ctx.quantize_dc)(
+                        &dc_vals[1][..covered_dc],
+                        inv_factor[1],
+                        &mut y_dc_q[..covered_dc],
+                    );
+                }
+                if let Some(source) = source_dc.as_mut() {
+                    for iy in 0..cov_y {
+                        let bx = global_bx - qorigin_x;
+                        source.y.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
+                            .copy_from_slice(&dc_vals[1][iy * cov_x..(iy + 1) * cov_x]);
                     }
                 }
-                STRATEGY_DCT8X16 => {
-                    for c in 0..3 {
-                        let cb: &[f32; 128] = coeffs[c].first_chunk::<128>().unwrap();
-                        dc_from_dct8x16(cb, dc_vals[c].first_chunk_mut::<2>().unwrap());
-                    }
-                }
-                STRATEGY_DCT16X16 => {
-                    // dc_from_dct16x16 returns 4 DC values in [TL, TR, BL, BR]
-                    // order, matching the [iy=0,1][ix=0,1] grid the caller uses
-                    // (didx = iy * 2 + ix).
-                    for c in 0..3 {
-                        let cb: &[f32; 256] = coeffs[c].first_chunk::<256>().unwrap();
-                        dc_from_dct16x16(cb, dc_vals[c].first_chunk_mut::<4>().unwrap());
-                    }
-                }
-                STRATEGY_DCT32X32 => {
-                    // dc_from_dct32x32 returns 16 DC values in the 4×4 grid the
-                    // caller uses (didx = iy * 4 + ix).
-                    for c in 0..3 {
-                        let cb: &[f32; 1024] = coeffs[c].first_chunk::<1024>().unwrap();
-                        (ctx.dc_from_dct32x32)(cb, dc_vals[c].first_chunk_mut::<16>().unwrap());
-                    }
-                }
-                STRATEGY_DCT64X64 => {
-                    for c in 0..3 {
-                        let cb: &[f32; 4096] = coeffs[c].first_chunk::<4096>().unwrap();
-                        (ctx.dc_from_dct64x64)(cb, &mut dc_vals[c]);
-                    }
-                }
-                STRATEGY_DCT64X32 => {
-                    for c in 0..3 {
-                        let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
-                        (ctx.dc_from_dct64x32)(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
-                    }
-                }
-                STRATEGY_DCT32X64 => {
-                    for c in 0..3 {
-                        let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
-                        (ctx.dc_from_dct32x64)(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
-                    }
-                }
-                STRATEGY_DCT32X16 => {
-                    // 8 DC values in a 4-row × 2-col grid (didx = iy*2 + ix),
-                    // matching cov_x=2, cov_y=4.
-                    for c in 0..3 {
-                        let cb: &[f32; 512] = coeffs[c].first_chunk::<512>().unwrap();
-                        (ctx.dc_from_dct32x16)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
-                    }
-                }
-                STRATEGY_DCT16X32 => {
-                    // 8 DC values in a 2-row × 4-col grid (didx = iy*4 + ix),
-                    // matching cov_x=4, cov_y=2.
-                    for c in 0..3 {
-                        let cb: &[f32; 512] = coeffs[c].first_chunk::<512>().unwrap();
-                        (ctx.dc_from_dct16x32)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
-                    }
-                }
-                _ => unreachable!(),
-            }
-
-            // DC for storage (per covered block, using pre-swap cov_x/cov_y).
-            let covered_dc = cov_x * cov_y;
-            let mut y_dc_q = [0i16; 64];
-            (ctx.quantize_dc)(
-                &dc_vals[1][..covered_dc],
-                inv_factor[1],
-                &mut y_dc_q[..covered_dc],
-            );
-            if let Some(source) = source_dc.as_mut() {
                 for iy in 0..cov_y {
-                    let bx = global_bx - qorigin_x;
-                    source.y.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
-                        .copy_from_slice(&dc_vals[1][iy * cov_x..(iy + 1) * cov_x]);
+                    let lbx = global_bx - qorigin_x;
+                    let quant_target = &mut quant_dc.plane_row_mut(1, global_by - qorigin_y + iy)
+                        [lbx..lbx + cov_x];
+                    let row_start = iy * cov_x;
+                    quant_target.copy_from_slice(&y_dc_q[row_start..row_start + cov_x]);
                 }
-            }
-            for iy in 0..cov_y {
-                let lbx = global_bx - qorigin_x;
-                let quant_target =
-                    &mut quant_dc.plane_row_mut(1, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
-                let row_start = iy * cov_x;
-                quant_target.copy_from_slice(&y_dc_q[row_start..row_start + cov_x]);
-            }
-            // Quantize Y AC with roundtrip (modifies coeffs[1] to dequantized).
-            // Matrix selection: DCT8 uses 8×8 weights, DCT16X8/8X16 share the
-            // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
-            let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
+                // Quantize Y AC with roundtrip (modifies coeffs[1] to dequantized).
+                // Matrix selection: DCT8 uses 8×8 weights, DCT16X8/8X16 share the
+                // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
+                let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
                 STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
                 STRATEGY_IDENTITY => (
                     &matrices.inv_matrix_identity(1)[..],
@@ -1666,452 +1858,99 @@ pub(crate) fn write_ac_group(
                 }
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
-            if rdoq_prices.is_some() || recon_y.is_some() {
-                source_y[..size].copy_from_slice(&coeffs[1][..size]);
-            }
-            quantize_roundtrip_y_block(
-                ctx,
-                inv_qm_y,
-                qm_y,
-                scale,
-                quant_ac,
-                distance,
-                cx,
-                cy,
-                &mut coeffs[1][..size],
-                &mut quantized[1][..size],
-            );
-            if let Some(prices) = rdoq_prices {
-                let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
-                let nzero_map = &num_nzeros[0];
-                let row_top = (nz_by != 0).then(|| nzero_map.plane_row(1, nz_by - 1));
-                let predicted =
-                    predict_from_top_and_left(row_top, nzero_map.plane_row(1, nz_by), bx, 32);
-                rdoq_block(
-                    rdoq_channel_weights(ctx.coding)[1],
-                    ctx.speed.effort().large_transform_rdoq,
-                    prices,
-                    coeff_orders.scan_for(strategy_code, 1),
-                    &source_y[..size],
-                    inv_qm_y,
-                    quantize_ac_q_scaled(quant_ac, scale, 1.0),
-                    &mut quantized[1][..size],
-                    raw_strategy,
-                    strategy_code,
-                    1,
-                    predicted,
-                    cx,
-                    cy,
-                    distance,
-                    quant_ac as u32 > qf_threshold,
-                    quant_ac as f32 / qf_threshold.max(1) as f32,
-                    visible,
-                    restore_penalty,
-                    rdoq_choices,
-                    rdoq_costs,
-                );
-                let inv_qac = 1.0 / (scale * quant_ac as f32);
-                for (out, (&q, &dq)) in coeffs[1][..size]
-                    .iter_mut()
-                    .zip(quantized[1][..size].iter().zip(qm_y[..size].iter()))
-                {
-                    *out = dequantized_level(q) * dq * inv_qac;
-                }
-            }
-
-            // ---- Luma reconstruction capture (closed-loop quant field) ----
-            // Source plus the inverse-transformed Y quantization error, the
-            // rerank's reconstruction model; the cx*cy lowest frequencies ride
-            // on the DC path and are excluded.
-            if let Some((recon, y_off, _)) = recon_y.as_mut() {
-                let y_off = *y_off;
-                for ((e, &q), &src) in recon_err[..size]
-                    .iter_mut()
-                    .zip(&coeffs[1][..size])
-                    .zip(&source_y[..size])
-                {
-                    *e = q - src;
-                }
-                let wc = cx * 8;
-                for row in recon_err[..cy * wc].chunks_exact_mut(wc) {
-                    row[..cx].fill(0.0);
-                }
-                crate::inflated_cost::reconstruct_error(
-                    ctx.idct,
-                    raw_strategy,
-                    &recon_err[..size],
-                    &mut recon_pix[..size],
-                );
-                let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
-                let (px0, py0) = (opsin_origin.0 + bx * 8, opsin_origin.1 + by * 8);
-                let plane = opsin.plane(1);
-                let recon = recon.plane_mut(1);
-                for y in 0..ph {
-                    let (sy, ly) = (py0 + y, y_off + by * 8 + y);
-                    if sy >= plane.ysize() || ly >= recon.ysize() {
-                        break;
-                    }
-                    let src_row = plane.row(sy);
-                    let dst_row = recon.row_mut(ly);
-                    for x in 0..pw {
-                        let (sx, lx) = (px0 + x, bx * 8 + x);
-                        if sx >= src_row.len() || lx >= dst_row.len() {
-                            break;
+                if let Some(m) = memo.as_deref().filter(|_| hit[1]) {
+                    // The levels are skipped above when the tokens are cached too.
+                    for j in 0..cov_y {
+                        for i in 0..cov_x {
+                            let slot = ((lby + j) * m.xsize_blocks + bx + i) * 64;
+                            let k = (j * cov_x + i) * 64;
+                            quantized[1][k..k + 64]
+                                .copy_from_slice(&m.quantized[1][slot..slot + 64]);
                         }
-                        dst_row[lx] = src_row[sx] + recon_pix[y * pw + x];
+                    }
+                    let inv_qac = 1.0 / (scale * quant_ac as f32);
+                    for (out, (&q, &dq)) in coeffs[1][..size]
+                        .iter_mut()
+                        .zip(quantized[1][..size].iter().zip(qm_y[..size].iter()))
+                    {
+                        *out = dequantized_level(q) * dq * inv_qac;
+                    }
+                } else {
+                    if rdoq_prices.is_some() || recon_y.is_some() {
+                        source_y[..size].copy_from_slice(&coeffs[1][..size]);
+                    }
+                    quantize_roundtrip_y_block(
+                        ctx,
+                        inv_qm_y,
+                        qm_y,
+                        scale,
+                        quant_ac,
+                        distance,
+                        cx,
+                        cy,
+                        &mut coeffs[1][..size],
+                        &mut quantized[1][..size],
+                    );
+                    if let Some(prices) = rdoq_prices {
+                        let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
+                        let nzero_map = &num_nzeros[0];
+                        let row_top = (nz_by != 0).then(|| nzero_map.plane_row(1, nz_by - 1));
+                        let predicted = predict_from_top_and_left(
+                            row_top,
+                            nzero_map.plane_row(1, nz_by),
+                            bx,
+                            32,
+                        );
+                        rdoq_block(
+                            rdoq_channel_weights(ctx.coding)[1],
+                            ctx.speed.effort().large_transform_rdoq,
+                            prices,
+                            coeff_orders.scan_for(strategy_code, 1),
+                            &source_y[..size],
+                            inv_qm_y,
+                            quantize_ac_q_scaled(quant_ac, scale, 1.0),
+                            &mut quantized[1][..size],
+                            raw_strategy,
+                            strategy_code,
+                            1,
+                            predicted,
+                            cx,
+                            cy,
+                            distance,
+                            quant_ac as u32 > qf_threshold,
+                            quant_ac as f32 / qf_threshold.max(1) as f32,
+                            visible,
+                            restore_penalty,
+                            rdoq_choices,
+                            rdoq_costs,
+                        );
+                        let inv_qac = 1.0 / (scale * quant_ac as f32);
+                        for (out, (&q, &dq)) in coeffs[1][..size]
+                            .iter_mut()
+                            .zip(quantized[1][..size].iter().zip(qm_y[..size].iter()))
+                        {
+                            *out = dequantized_level(q) * dq * inv_qac;
+                        }
                     }
                 }
-            }
-
-            // ---- Per-tile CfL factors ----
-            let tx = global_bx / 8;
-            let ty = global_by / 8;
-            let cmap_x = dc_data.ytox_map.row(ty)[tx];
-            let cmap_b = dc_data.ytob_map.row(ty)[tx];
-            // y_to_x = 0 + cmap_x / 84;  y_to_b = 1 + cmap_b / 84.
-            let x_factor = crate::color_correlation::y_to_x_ratio(ctx.cfl_frame(), cmap_x);
-            let b_factor = crate::color_correlation::y_to_b_ratio(ctx.cfl_frame(), cmap_b);
-
-            // ---- Apply CfL: X -= x_factor·Y, B -= b_factor·Y on every coefficient ----
-            // The decoder reverses CfL in coefficient space (DequantLane) using the
-            // dequantized Y AC coefficients, whose cx*cy LLF positions are zero at
-            // that point — they are filled from the DC plane (LowestFrequenciesFromDC)
-            // only afterwards. So the encoder must subtract using a Y whose LLF
-            // positions are likewise zero; otherwise the AC-quantized LLF energy of Y
-            // gets folded into the B/X DC (via the DCFromLowestFrequencies extraction
-            // below) with no decoder-side counterpart, corrupting chroma by up to a
-            // full-scale per-block shift (worst on B, where b_factor ≈ 1).
-            {
-                let wc = cx * 8;
-                for row in coeffs[1][..cy * wc].chunks_exact_mut(wc) {
-                    row[..cx].fill(0.0);
-                }
-            }
-            {
-                let [c0, c1, c2] = &mut **coeffs;
-                (ctx.apply_cfl)(
-                    &mut c0[..size],
-                    &c1[..size],
-                    &mut c2[..size],
-                    [x_factor, 0.0, b_factor],
-                );
-            }
-            // ---- Extract post-CfL X and B DC ----
-            let mut x_dc_post = [0.0f32; 64];
-            let mut b_dc_post = [0.0f32; 64];
-            match raw_strategy {
-                STRATEGY_DCT
-                | STRATEGY_IDENTITY
-                | STRATEGY_DCT2X2
-                | STRATEGY_DCT4X4
-                | STRATEGY_DCT4X8
-                | STRATEGY_DCT8X4
-                | STRATEGY_AFV0..=STRATEGY_AFV3 => {
-                    x_dc_post[0] = coeffs[0][0];
-                    b_dc_post[0] = coeffs[2][0];
-                }
-                STRATEGY_DCT16X8 => {
-                    let xb: &[f32; 128] = coeffs[0].first_chunk::<128>().unwrap();
-                    let bb: &[f32; 128] = coeffs[2].first_chunk::<128>().unwrap();
-                    dc_from_dct16x8(xb, x_dc_post.first_chunk_mut::<2>().unwrap());
-                    dc_from_dct16x8(bb, b_dc_post.first_chunk_mut::<2>().unwrap());
-                }
-                STRATEGY_DCT8X16 => {
-                    let xb: &[f32; 128] = coeffs[0].first_chunk::<128>().unwrap();
-                    let bb: &[f32; 128] = coeffs[2].first_chunk::<128>().unwrap();
-                    dc_from_dct8x16(xb, x_dc_post.first_chunk_mut::<2>().unwrap());
-                    dc_from_dct8x16(bb, b_dc_post.first_chunk_mut::<2>().unwrap());
-                }
-                STRATEGY_DCT16X16 => {
-                    let xb: &[f32; 256] = coeffs[0].first_chunk::<256>().unwrap();
-                    let bb: &[f32; 256] = coeffs[2].first_chunk::<256>().unwrap();
-                    dc_from_dct16x16(xb, x_dc_post.first_chunk_mut::<4>().unwrap());
-                    dc_from_dct16x16(bb, b_dc_post.first_chunk_mut::<4>().unwrap());
-                }
-                STRATEGY_DCT32X32 => {
-                    let xb: &[f32; 1024] = coeffs[0].first_chunk::<1024>().unwrap();
-                    let bb: &[f32; 1024] = coeffs[2].first_chunk::<1024>().unwrap();
-                    (ctx.dc_from_dct32x32)(xb, x_dc_post.first_chunk_mut::<16>().unwrap());
-                    (ctx.dc_from_dct32x32)(bb, b_dc_post.first_chunk_mut::<16>().unwrap());
-                }
-                STRATEGY_DCT64X64 => {
-                    let xb: &[f32; 4096] = coeffs[0].first_chunk::<4096>().unwrap();
-                    let bb: &[f32; 4096] = coeffs[2].first_chunk::<4096>().unwrap();
-                    (ctx.dc_from_dct64x64)(xb, &mut x_dc_post);
-                    (ctx.dc_from_dct64x64)(bb, &mut b_dc_post);
-                }
-                STRATEGY_DCT64X32 => {
-                    let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
-                    let bb: &[f32; 2048] = coeffs[2].first_chunk::<2048>().unwrap();
-                    (ctx.dc_from_dct64x32)(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
-                    (ctx.dc_from_dct64x32)(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
-                }
-                STRATEGY_DCT32X64 => {
-                    let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
-                    let bb: &[f32; 2048] = coeffs[2].first_chunk::<2048>().unwrap();
-                    (ctx.dc_from_dct32x64)(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
-                    (ctx.dc_from_dct32x64)(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
-                }
-                STRATEGY_DCT32X16 => {
-                    let xb: &[f32; 512] = coeffs[0].first_chunk::<512>().unwrap();
-                    let bb: &[f32; 512] = coeffs[2].first_chunk::<512>().unwrap();
-                    (ctx.dc_from_dct32x16)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
-                    (ctx.dc_from_dct32x16)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
-                }
-                STRATEGY_DCT16X32 => {
-                    let xb: &[f32; 512] = coeffs[0].first_chunk::<512>().unwrap();
-                    let bb: &[f32; 512] = coeffs[2].first_chunk::<512>().unwrap();
-                    (ctx.dc_from_dct16x32)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
-                    (ctx.dc_from_dct16x32)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
-                }
-                _ => unreachable!(),
-            }
-
-            // ---- X channel: write post-CfL DC, quantize AC ----
-            let (dz_f, dz_dc_chroma) = if chroma_deadzone && covered_dc == 1 {
-                let (sat, chroma) =
-                    chroma_block_saturation([dc_vals[0][0], dc_vals[1][0], dc_vals[2][0]]);
-                (
-                    ((sat - CHROMA_DZ_SAT_START) / CHROMA_DZ_SAT_WIDTH).clamp(0.0, 1.0),
-                    chroma,
-                )
-            } else {
-                (0.0, 0.0)
-            };
-            let mut chroma_dc_q = [0i16; 64];
-            if cfl_factor_x != 0.0 {
-                (ctx.quantize_dc_cfl)(
-                    &x_dc_post[..covered_dc],
-                    &y_dc_q[..covered_dc],
-                    inv_factor[0],
-                    cfl_factor_x,
-                    &mut chroma_dc_q[..covered_dc],
-                );
-            } else {
-                (ctx.quantize_dc)(
-                    &x_dc_post[..covered_dc],
-                    inv_factor[0],
-                    &mut chroma_dc_q[..covered_dc],
-                );
-            }
-            for iy in 0..cov_y {
-                let lbx = global_bx - qorigin_x;
-                let quant_dc_row =
-                    &mut quant_dc.plane_row_mut(0, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
-                let row_start = iy * cov_x;
-                quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
-            }
-            let inv_qm_x: &[f32] = match raw_strategy {
-                STRATEGY_DCT => &matrices.inv_matrix(0)[..],
-                STRATEGY_IDENTITY => &matrices.inv_matrix_identity(0)[..],
-                STRATEGY_DCT2X2 => &matrices.inv_matrix_dct2x2(0)[..],
-                STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(0)[..],
-                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(0)[..],
-                STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(0)[..],
-                STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
-                STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(0)[..],
-                STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(0)[..],
-                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(0)[..],
-                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(0)[..],
-                _ => &matrices.inv_matrix_16x8(0)[..],
-            };
-            (ctx.quantize_block_ac)(
-                &coeffs[0][..size],
-                0,
-                inv_qm_x,
-                quant_ac,
-                scale,
-                x_qm_mul,
-                distance,
-                cx,
-                cy,
-                &mut quantized[0][..size],
-            );
-            chroma_deadzone_fixup(
-                0,
-                &coeffs[0][..size],
-                inv_qm_x,
-                quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
-                distance,
-                x_qm_mul,
-                dz_f,
-                dz_dc_chroma,
-                &mut quantized[0][..size],
-            );
-            // Chroma RDOQ (review §8): the trellis is channel-generic — the
-            // CfL residuals are the source, contexts/prices/orders are
-            // channel-specific, and unlike Y the input coefficients are not
-            // overwritten afterwards. Runs at every distance with the
-            // transform's calibrated weights and the distance-scheduled X/B
-            // multiplier (`chroma_rdoq_weight`).
-            if let Some(prices) = rdoq_prices {
-                let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
-                let nzero_map = &num_nzeros[0];
-                let row_top = (nz_by != 0).then(|| nzero_map.plane_row(0, nz_by - 1));
-                let predicted =
-                    predict_from_top_and_left(row_top, nzero_map.plane_row(0, nz_by), bx, 32);
-                rdoq_block(
-                    rdoq_channel_weights(ctx.coding)[0],
-                    ctx.speed.effort().large_transform_rdoq,
-                    prices,
-                    coeff_orders.scan_for(strategy_code, 0),
-                    &coeffs[0][..size],
-                    inv_qm_x,
-                    quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
-                    &mut quantized[0][..size],
-                    raw_strategy,
-                    strategy_code,
-                    0,
-                    predicted,
-                    cx,
-                    cy,
-                    distance,
-                    quant_ac as u32 > qf_threshold,
-                    quant_ac as f32 / qf_threshold.max(1) as f32,
-                    visible,
-                    restore_penalty,
-                    rdoq_choices,
-                    rdoq_costs,
-                );
-            }
-            let row_stride = cx * 8;
-
-            // Keep the fractional source for the DC predictor check. Y DC
-            // and these B lowest frequencies are unchanged by AC reranking.
-            if let Some(source) = source_dc.as_mut() {
-                for iy in 0..cov_y {
-                    let bx = global_bx - qorigin_x;
-                    source.b.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
-                        .copy_from_slice(&b_dc_post[iy * cov_x..(iy + 1) * cov_x]);
-                    source.x.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
-                        .copy_from_slice(&x_dc_post[iy * cov_x..(iy + 1) * cov_x]);
-                }
-            }
-            // ---- B channel: write CfL'd DC, quantize AC ----
-            (ctx.quantize_dc_cfl)(
-                &b_dc_post[..covered_dc],
-                &y_dc_q[..covered_dc],
-                inv_factor[2],
-                cfl_factor_b,
-                &mut chroma_dc_q[..covered_dc],
-            );
-            for iy in 0..cov_y {
-                let lbx = global_bx - qorigin_x;
-                let quant_dc_row =
-                    &mut quant_dc.plane_row_mut(2, global_by - qorigin_y + iy)[lbx..lbx + cov_x];
-                let row_start = iy * cov_x;
-                quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
-            }
-            let inv_qm_b: &[f32] = match raw_strategy {
-                STRATEGY_DCT => &matrices.inv_matrix(2)[..],
-                STRATEGY_IDENTITY => &matrices.inv_matrix_identity(2)[..],
-                STRATEGY_DCT2X2 => &matrices.inv_matrix_dct2x2(2)[..],
-                STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(2)[..],
-                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(2)[..],
-                STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(2)[..],
-                STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
-                STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(2)[..],
-                STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(2)[..],
-                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(2)[..],
-                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(2)[..],
-                _ => &matrices.inv_matrix_16x8(2)[..],
-            };
-            (ctx.quantize_block_ac)(
-                &coeffs[2][..size],
-                2,
-                inv_qm_b,
-                quant_ac,
-                scale,
-                ctx.b_qm_mul(),
-                distance,
-                cx,
-                cy,
-                &mut quantized[2][..size],
-            );
-            chroma_deadzone_fixup(
-                2,
-                &coeffs[2][..size],
-                inv_qm_b,
-                quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
-                distance,
-                ctx.b_qm_mul(),
-                dz_f,
-                dz_dc_chroma,
-                &mut quantized[2][..size],
-            );
-            if let Some(prices) = rdoq_prices {
-                let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
-                let nzero_map = &num_nzeros[0];
-                let row_top = (nz_by != 0).then(|| nzero_map.plane_row(2, nz_by - 1));
-                let predicted =
-                    predict_from_top_and_left(row_top, nzero_map.plane_row(2, nz_by), bx, 32);
-                rdoq_block(
-                    rdoq_channel_weights(ctx.coding)[2],
-                    ctx.speed.effort().large_transform_rdoq,
-                    prices,
-                    coeff_orders.scan_for(strategy_code, 2),
-                    &coeffs[2][..size],
-                    inv_qm_b,
-                    quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
-                    &mut quantized[2][..size],
-                    raw_strategy,
-                    strategy_code,
-                    2,
-                    predicted,
-                    cx,
-                    cy,
-                    distance,
-                    quant_ac as u32 > qf_threshold,
-                    quant_ac as f32 / qf_threshold.max(1) as f32,
-                    visible,
-                    restore_penalty,
-                    rdoq_choices,
-                    rdoq_costs,
-                );
-            }
-
-            if measure_chroma_distortion {
-                let q_scaled_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
-                for i in 0..size {
-                    let v = i / row_stride;
-                    let u = i % row_stride;
-                    if v < cy && u < cx {
-                        continue;
+                // ---- Luma reconstruction capture (closed-loop quant field) ----
+                // Source plus the inverse-transformed Y quantization error, the
+                // rerank's reconstruction model; the cx*cy lowest frequencies ride
+                // on the DC path and are excluded.
+                if !hit[1]
+                    && let Some((recon, y_off, _)) = recon_y.as_mut()
+                {
+                    let y_off = *y_off;
+                    for ((e, &q), &src) in recon_err[..size]
+                        .iter_mut()
+                        .zip(&coeffs[1][..size])
+                        .zip(&source_y[..size])
+                    {
+                        *e = q - src;
                     }
-                    let ideal = coeffs[0][i] * inv_qm_x[i] * q_scaled_x;
-                    let error = ideal - dequantized_level(quantized[0][i]);
-                    chroma_distortion += ctx.channel_weight(0) * error * error;
-                }
-            }
-            if measure_chroma_distortion {
-                let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
-                for i in 0..size {
-                    let v = i / row_stride;
-                    let u = i % row_stride;
-                    if v < cy && u < cx {
-                        continue;
-                    }
-                    let ideal = coeffs[2][i] * inv_qm_b[i] * q_scaled_b;
-                    let error = ideal - dequantized_level(quantized[2][i]);
-                    chroma_distortion =
-                        fmla(ctx.channel_weight(2), error * error, chroma_distortion);
-                }
-            }
-            // ---- Chroma reconstruction capture (closed-loop quant field) ----
-            // CfL was applied against the dequantized Y, so the decoder's chroma
-            // error is the residual's own quantization error.
-            if let Some((recon, y_off, _)) = recon_y.as_mut() {
-                let y_off = *y_off;
-                let q_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
-                let q_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
-                for (c, inv_qm, q_scaled) in [(0usize, inv_qm_x, q_x), (2, inv_qm_b, q_b)] {
-                    for i in 0..size {
-                        let (v, u) = (i / row_stride, i % row_stride);
-                        recon_err[i] = if v < cy && u < cx {
-                            0.0
-                        } else {
-                            dequantized_level(quantized[c][i]) / (inv_qm[i] * q_scaled) - coeffs[c][i]
-                        };
+                    let wc = cx * 8;
+                    for row in recon_err[..cy * wc].chunks_exact_mut(wc) {
+                        row[..cx].fill(0.0);
                     }
                     crate::inflated_cost::reconstruct_error(
                         ctx.idct,
@@ -2121,15 +1960,15 @@ pub(crate) fn write_ac_group(
                     );
                     let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
                     let (px0, py0) = (opsin_origin.0 + bx * 8, opsin_origin.1 + by * 8);
-                    let plane = opsin.plane(c);
-                    let dst = recon.plane_mut(c);
+                    let plane = opsin.plane(1);
+                    let recon = recon.plane_mut(1);
                     for y in 0..ph {
                         let (sy, ly) = (py0 + y, y_off + by * 8 + y);
-                        if sy >= plane.ysize() || ly >= dst.ysize() {
+                        if sy >= plane.ysize() || ly >= recon.ysize() {
                             break;
                         }
                         let src_row = plane.row(sy);
-                        let dst_row = dst.row_mut(ly);
+                        let dst_row = recon.row_mut(ly);
                         for x in 0..pw {
                             let (sx, lx) = (px0 + x, bx * 8 + x);
                             if sx >= src_row.len() || lx >= dst_row.len() {
@@ -2139,8 +1978,436 @@ pub(crate) fn write_ac_group(
                         }
                     }
                 }
+
+                // ---- Per-tile CfL factors ----
+                let tx = global_bx / 8;
+                let ty = global_by / 8;
+                let cmap_x = dc_data.ytox_map.row(ty)[tx];
+                let cmap_b = dc_data.ytob_map.row(ty)[tx];
+                // y_to_x = 0 + cmap_x / 84;  y_to_b = 1 + cmap_b / 84.
+                let x_factor = crate::color_correlation::y_to_x_ratio(ctx.cfl_frame(), cmap_x);
+                let b_factor = crate::color_correlation::y_to_b_ratio(ctx.cfl_frame(), cmap_b);
+
+                // ---- Apply CfL: X -= x_factor·Y, B -= b_factor·Y on every coefficient ----
+                // The decoder reverses CfL in coefficient space (DequantLane) using the
+                // dequantized Y AC coefficients, whose cx*cy LLF positions are zero at
+                // that point — they are filled from the DC plane (LowestFrequenciesFromDC)
+                // only afterwards. So the encoder must subtract using a Y whose LLF
+                // positions are likewise zero; otherwise the AC-quantized LLF energy of Y
+                // gets folded into the B/X DC (via the DCFromLowestFrequencies extraction
+                // below) with no decoder-side counterpart, corrupting chroma by up to a
+                // full-scale per-block shift (worst on B, where b_factor ≈ 1).
+                {
+                    let wc = cx * 8;
+                    for row in coeffs[1][..cy * wc].chunks_exact_mut(wc) {
+                        row[..cx].fill(0.0);
+                    }
+                }
+                {
+                    let [c0, c1, c2] = &mut **coeffs;
+                    (ctx.apply_cfl)(
+                        &mut c0[..size],
+                        &c1[..size],
+                        &mut c2[..size],
+                        [x_factor, 0.0, b_factor],
+                    );
+                }
+                // ---- Extract post-CfL X and B DC ----
+                let mut x_dc_post = [0.0f32; 64];
+                let mut b_dc_post = [0.0f32; 64];
+                match raw_strategy {
+                    STRATEGY_DCT
+                    | STRATEGY_IDENTITY
+                    | STRATEGY_DCT2X2
+                    | STRATEGY_DCT4X4
+                    | STRATEGY_DCT4X8
+                    | STRATEGY_DCT8X4
+                    | STRATEGY_AFV0..=STRATEGY_AFV3 => {
+                        x_dc_post[0] = coeffs[0][0];
+                        b_dc_post[0] = coeffs[2][0];
+                    }
+                    STRATEGY_DCT16X8 => {
+                        let xb: &[f32; 128] = coeffs[0].first_chunk::<128>().unwrap();
+                        let bb: &[f32; 128] = coeffs[2].first_chunk::<128>().unwrap();
+                        dc_from_dct16x8(xb, x_dc_post.first_chunk_mut::<2>().unwrap());
+                        dc_from_dct16x8(bb, b_dc_post.first_chunk_mut::<2>().unwrap());
+                    }
+                    STRATEGY_DCT8X16 => {
+                        let xb: &[f32; 128] = coeffs[0].first_chunk::<128>().unwrap();
+                        let bb: &[f32; 128] = coeffs[2].first_chunk::<128>().unwrap();
+                        dc_from_dct8x16(xb, x_dc_post.first_chunk_mut::<2>().unwrap());
+                        dc_from_dct8x16(bb, b_dc_post.first_chunk_mut::<2>().unwrap());
+                    }
+                    STRATEGY_DCT16X16 => {
+                        let xb: &[f32; 256] = coeffs[0].first_chunk::<256>().unwrap();
+                        let bb: &[f32; 256] = coeffs[2].first_chunk::<256>().unwrap();
+                        dc_from_dct16x16(xb, x_dc_post.first_chunk_mut::<4>().unwrap());
+                        dc_from_dct16x16(bb, b_dc_post.first_chunk_mut::<4>().unwrap());
+                    }
+                    STRATEGY_DCT32X32 => {
+                        let xb: &[f32; 1024] = coeffs[0].first_chunk::<1024>().unwrap();
+                        let bb: &[f32; 1024] = coeffs[2].first_chunk::<1024>().unwrap();
+                        (ctx.dc_from_dct32x32)(xb, x_dc_post.first_chunk_mut::<16>().unwrap());
+                        (ctx.dc_from_dct32x32)(bb, b_dc_post.first_chunk_mut::<16>().unwrap());
+                    }
+                    STRATEGY_DCT64X64 => {
+                        let xb: &[f32; 4096] = coeffs[0].first_chunk::<4096>().unwrap();
+                        let bb: &[f32; 4096] = coeffs[2].first_chunk::<4096>().unwrap();
+                        (ctx.dc_from_dct64x64)(xb, &mut x_dc_post);
+                        (ctx.dc_from_dct64x64)(bb, &mut b_dc_post);
+                    }
+                    STRATEGY_DCT64X32 => {
+                        let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
+                        let bb: &[f32; 2048] = coeffs[2].first_chunk::<2048>().unwrap();
+                        (ctx.dc_from_dct64x32)(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
+                        (ctx.dc_from_dct64x32)(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
+                    }
+                    STRATEGY_DCT32X64 => {
+                        let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
+                        let bb: &[f32; 2048] = coeffs[2].first_chunk::<2048>().unwrap();
+                        (ctx.dc_from_dct32x64)(xb, x_dc_post.first_chunk_mut::<32>().unwrap());
+                        (ctx.dc_from_dct32x64)(bb, b_dc_post.first_chunk_mut::<32>().unwrap());
+                    }
+                    STRATEGY_DCT32X16 => {
+                        let xb: &[f32; 512] = coeffs[0].first_chunk::<512>().unwrap();
+                        let bb: &[f32; 512] = coeffs[2].first_chunk::<512>().unwrap();
+                        (ctx.dc_from_dct32x16)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
+                        (ctx.dc_from_dct32x16)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
+                    }
+                    STRATEGY_DCT16X32 => {
+                        let xb: &[f32; 512] = coeffs[0].first_chunk::<512>().unwrap();
+                        let bb: &[f32; 512] = coeffs[2].first_chunk::<512>().unwrap();
+                        (ctx.dc_from_dct16x32)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
+                        (ctx.dc_from_dct16x32)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
+                    }
+                    _ => unreachable!(),
+                }
+
+                // ---- X channel: write post-CfL DC, quantize AC ----
+                let (dz_f, dz_dc_chroma) = if chroma_deadzone && covered_dc == 1 {
+                    let (sat, chroma) =
+                        chroma_block_saturation([dc_vals[0][0], dc_vals[1][0], dc_vals[2][0]]);
+                    (
+                        ((sat - CHROMA_DZ_SAT_START) / CHROMA_DZ_SAT_WIDTH).clamp(0.0, 1.0),
+                        chroma,
+                    )
+                } else {
+                    (0.0, 0.0)
+                };
+                let inv_qm_x: &[f32] = match raw_strategy {
+                    STRATEGY_DCT => &matrices.inv_matrix(0)[..],
+                    STRATEGY_IDENTITY => &matrices.inv_matrix_identity(0)[..],
+                    STRATEGY_DCT2X2 => &matrices.inv_matrix_dct2x2(0)[..],
+                    STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(0)[..],
+                    STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(0)[..],
+                    STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(0)[..],
+                    STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
+                    STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(0)[..],
+                    STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(0)[..],
+                    STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(0)[..],
+                    STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(0)[..],
+                    _ => &matrices.inv_matrix_16x8(0)[..],
+                };
+                let mut chroma_dc_q = [0i16; 64];
+                if !hit[0] {
+                    if cfl_factor_x != 0.0 {
+                        (ctx.quantize_dc_cfl)(
+                            &x_dc_post[..covered_dc],
+                            &y_dc_q[..covered_dc],
+                            inv_factor[0],
+                            cfl_factor_x,
+                            &mut chroma_dc_q[..covered_dc],
+                        );
+                    } else {
+                        (ctx.quantize_dc)(
+                            &x_dc_post[..covered_dc],
+                            inv_factor[0],
+                            &mut chroma_dc_q[..covered_dc],
+                        );
+                    }
+                    for iy in 0..cov_y {
+                        let lbx = global_bx - qorigin_x;
+                        let quant_dc_row = &mut quant_dc
+                            .plane_row_mut(0, global_by - qorigin_y + iy)
+                            [lbx..lbx + cov_x];
+                        let row_start = iy * cov_x;
+                        quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
+                    }
+                    (ctx.quantize_block_ac)(
+                        &coeffs[0][..size],
+                        0,
+                        inv_qm_x,
+                        quant_ac,
+                        scale,
+                        x_qm_mul,
+                        distance,
+                        cx,
+                        cy,
+                        &mut quantized[0][..size],
+                    );
+                    chroma_deadzone_fixup(
+                        0,
+                        &coeffs[0][..size],
+                        inv_qm_x,
+                        quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
+                        distance,
+                        x_qm_mul,
+                        dz_f,
+                        dz_dc_chroma,
+                        &mut quantized[0][..size],
+                    );
+                    // Chroma RDOQ (review §8): the trellis is channel-generic — the
+                    // CfL residuals are the source, contexts/prices/orders are
+                    // channel-specific, and unlike Y the input coefficients are not
+                    // overwritten afterwards. Runs at every distance with the
+                    // transform's calibrated weights and the distance-scheduled X/B
+                    // multiplier (`chroma_rdoq_weight`).
+                    if let Some(prices) = rdoq_prices {
+                        let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
+                        let nzero_map = &num_nzeros[0];
+                        let row_top = (nz_by != 0).then(|| nzero_map.plane_row(0, nz_by - 1));
+                        let predicted = predict_from_top_and_left(
+                            row_top,
+                            nzero_map.plane_row(0, nz_by),
+                            bx,
+                            32,
+                        );
+                        rdoq_block(
+                            rdoq_channel_weights(ctx.coding)[0],
+                            ctx.speed.effort().large_transform_rdoq,
+                            prices,
+                            coeff_orders.scan_for(strategy_code, 0),
+                            &coeffs[0][..size],
+                            inv_qm_x,
+                            quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
+                            &mut quantized[0][..size],
+                            raw_strategy,
+                            strategy_code,
+                            0,
+                            predicted,
+                            cx,
+                            cy,
+                            distance,
+                            quant_ac as u32 > qf_threshold,
+                            quant_ac as f32 / qf_threshold.max(1) as f32,
+                            visible,
+                            restore_penalty,
+                            rdoq_choices,
+                            rdoq_costs,
+                        );
+                    }
+                }
+                let row_stride = cx * 8;
+
+                // Keep the fractional source for the DC predictor check. Y DC
+                // and these B lowest frequencies are unchanged by AC reranking.
+                if let Some(source) = source_dc.as_mut() {
+                    for iy in 0..cov_y {
+                        let bx = global_bx - qorigin_x;
+                        source.b.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
+                            .copy_from_slice(&b_dc_post[iy * cov_x..(iy + 1) * cov_x]);
+                        source.x.row_mut(global_by - qorigin_y + iy)[bx..bx + cov_x]
+                            .copy_from_slice(&x_dc_post[iy * cov_x..(iy + 1) * cov_x]);
+                    }
+                }
+                // ---- B channel: write CfL'd DC, quantize AC ----
+                let inv_qm_b: &[f32] = match raw_strategy {
+                    STRATEGY_DCT => &matrices.inv_matrix(2)[..],
+                    STRATEGY_IDENTITY => &matrices.inv_matrix_identity(2)[..],
+                    STRATEGY_DCT2X2 => &matrices.inv_matrix_dct2x2(2)[..],
+                    STRATEGY_DCT4X4 => &matrices.inv_matrix_4x4(2)[..],
+                    STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &matrices.inv_matrix_4x8(2)[..],
+                    STRATEGY_AFV0..=STRATEGY_AFV3 => &matrices.inv_matrix_afv(2)[..],
+                    STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
+                    STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(2)[..],
+                    STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(2)[..],
+                    STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(2)[..],
+                    STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(2)[..],
+                    _ => &matrices.inv_matrix_16x8(2)[..],
+                };
+                if !hit[2] {
+                    (ctx.quantize_dc_cfl)(
+                        &b_dc_post[..covered_dc],
+                        &y_dc_q[..covered_dc],
+                        inv_factor[2],
+                        cfl_factor_b,
+                        &mut chroma_dc_q[..covered_dc],
+                    );
+                    for iy in 0..cov_y {
+                        let lbx = global_bx - qorigin_x;
+                        let quant_dc_row = &mut quant_dc
+                            .plane_row_mut(2, global_by - qorigin_y + iy)
+                            [lbx..lbx + cov_x];
+                        let row_start = iy * cov_x;
+                        quant_dc_row.copy_from_slice(&chroma_dc_q[row_start..row_start + cov_x]);
+                    }
+                    (ctx.quantize_block_ac)(
+                        &coeffs[2][..size],
+                        2,
+                        inv_qm_b,
+                        quant_ac,
+                        scale,
+                        ctx.b_qm_mul(),
+                        distance,
+                        cx,
+                        cy,
+                        &mut quantized[2][..size],
+                    );
+                    chroma_deadzone_fixup(
+                        2,
+                        &coeffs[2][..size],
+                        inv_qm_b,
+                        quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
+                        distance,
+                        ctx.b_qm_mul(),
+                        dz_f,
+                        dz_dc_chroma,
+                        &mut quantized[2][..size],
+                    );
+                    if let Some(prices) = rdoq_prices {
+                        let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
+                        let nzero_map = &num_nzeros[0];
+                        let row_top = (nz_by != 0).then(|| nzero_map.plane_row(2, nz_by - 1));
+                        let predicted = predict_from_top_and_left(
+                            row_top,
+                            nzero_map.plane_row(2, nz_by),
+                            bx,
+                            32,
+                        );
+                        rdoq_block(
+                            rdoq_channel_weights(ctx.coding)[2],
+                            ctx.speed.effort().large_transform_rdoq,
+                            prices,
+                            coeff_orders.scan_for(strategy_code, 2),
+                            &coeffs[2][..size],
+                            inv_qm_b,
+                            quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
+                            &mut quantized[2][..size],
+                            raw_strategy,
+                            strategy_code,
+                            2,
+                            predicted,
+                            cx,
+                            cy,
+                            distance,
+                            quant_ac as u32 > qf_threshold,
+                            quant_ac as f32 / qf_threshold.max(1) as f32,
+                            visible,
+                            restore_penalty,
+                            rdoq_choices,
+                            rdoq_costs,
+                        );
+                    }
+                }
+                if measure_chroma_distortion && !hit[0] {
+                    let q_scaled_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
+                    for i in 0..size {
+                        let v = i / row_stride;
+                        let u = i % row_stride;
+                        if v < cy && u < cx {
+                            continue;
+                        }
+                        let ideal = coeffs[0][i] * inv_qm_x[i] * q_scaled_x;
+                        let error = ideal - dequantized_level(quantized[0][i]);
+                        chroma_distortion += ctx.channel_weight(0) * error * error;
+                    }
+                }
+                if measure_chroma_distortion && !hit[2] {
+                    let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
+                    for i in 0..size {
+                        let v = i / row_stride;
+                        let u = i % row_stride;
+                        if v < cy && u < cx {
+                            continue;
+                        }
+                        let ideal = coeffs[2][i] * inv_qm_b[i] * q_scaled_b;
+                        let error = ideal - dequantized_level(quantized[2][i]);
+                        chroma_distortion =
+                            fmla(ctx.channel_weight(2), error * error, chroma_distortion);
+                    }
+                }
+                // ---- Chroma reconstruction capture (closed-loop quant field) ----
+                // CfL was applied against the dequantized Y, so the decoder's chroma
+                // error is the residual's own quantization error.
+                if let Some((recon, y_off, _)) = recon_y.as_mut() {
+                    let y_off = *y_off;
+                    let q_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
+                    let q_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
+                    for (c, inv_qm, q_scaled) in [(0usize, inv_qm_x, q_x), (2, inv_qm_b, q_b)] {
+                        if hit[c] {
+                            continue;
+                        }
+                        for i in 0..size {
+                            let (v, u) = (i / row_stride, i % row_stride);
+                            recon_err[i] = if v < cy && u < cx {
+                                0.0
+                            } else {
+                                dequantized_level(quantized[c][i]) / (inv_qm[i] * q_scaled)
+                                    - coeffs[c][i]
+                            };
+                        }
+                        crate::inflated_cost::reconstruct_error(
+                            ctx.idct,
+                            raw_strategy,
+                            &recon_err[..size],
+                            &mut recon_pix[..size],
+                        );
+                        let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
+                        let (px0, py0) = (opsin_origin.0 + bx * 8, opsin_origin.1 + by * 8);
+                        let plane = opsin.plane(c);
+                        let dst = recon.plane_mut(c);
+                        for y in 0..ph {
+                            let (sy, ly) = (py0 + y, y_off + by * 8 + y);
+                            if sy >= plane.ysize() || ly >= dst.ysize() {
+                                break;
+                            }
+                            let src_row = plane.row(sy);
+                            let dst_row = dst.row_mut(ly);
+                            for x in 0..pw {
+                                let (sx, lx) = (px0 + x, bx * 8 + x);
+                                if sx >= src_row.len() || lx >= dst_row.len() {
+                                    break;
+                                }
+                                dst_row[lx] = src_row[sx] + recon_pix[y * pw + x];
+                            }
+                        }
+                    }
+                }
+                if let Some(m) = memo.as_deref_mut() {
+                    let epoch = m.epoch;
+                    for j in 0..cov_y {
+                        let row = (lby + j) * m.xsize_blocks;
+                        m.cell_gen[row + bx..row + bx + cov_x].fill(epoch);
+                    }
+                    for c in 0..3 {
+                        if hit[c] {
+                            continue;
+                        }
+                        m.keys[c][bi] = memo_keys[c];
+                        for j in 0..cov_y {
+                            let row = (lby + j) * m.xsize_blocks;
+                            m.dc_f[c][row + bx..row + bx + cov_x]
+                                .copy_from_slice(&dc_vals[c][j * cov_x..(j + 1) * cov_x]);
+                            for i in 0..cov_x {
+                                let slot = (row + bx + i) * 64;
+                                let k = (j * cov_x + i) * 64;
+                                m.quantized[c][slot..slot + 64]
+                                    .copy_from_slice(&quantized[c][k..k + 64]);
+                            }
+                            let src = &quant_dc.plane_row(c, lby + j)[bx..bx + cov_x];
+                            m.dc.plane_row_mut(c, lby + j)[bx..bx + cov_x].copy_from_slice(src);
+                        }
+                    }
+                }
             }
             // ---- Tokenize in order Y, X, B ----
+            if let Some(m) = memo.as_deref_mut()
+                && token_memo
+                && m.spans.len() != m.keys[0].len() * streams * 3
+            {
+                m.spans = vec![(0, 0); m.keys[0].len() * streams * 3];
+                m.tokens = vec![Vec::new(); streams];
+            }
             let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
             let covered_blocks = cx * cy;
             // log2(covered_blocks): 0/1/2/4 for 1/2/4/16 covered blocks.
@@ -2154,8 +2421,33 @@ pub(crate) fn write_ac_group(
                 64 => 6,
                 _ => unreachable!("invalid covered_blocks {}", covered_blocks),
             };
-
             for &c in &[1usize, 0, 2] {
+                // A cached channel: copy its token streams and context cells.
+                if tokens_cached
+                    && hit[c]
+                    && let Some(m) = memo.as_deref_mut()
+                {
+                    for s in 0..streams {
+                        let (start, len) = m.spans[(bi * 3 + c) * streams + s];
+                        let (start, len) = (start as usize, len as usize);
+                        let dst = if s < out.len() {
+                            &mut out[s]
+                        } else {
+                            &mut alternative_out[s - out.len()]
+                        };
+                        dst.extend_from_slice(&m.tokens[s][start..start + len]);
+                    }
+                    for iy in 0..cov_y {
+                        num_nzeros[0].plane_row_mut(c, nz_by + iy)[bx..bx + cov_x]
+                            .fill(m.nz_shift[bi][c]);
+                    }
+                    continue;
+                }
+                let stream_starts: Vec<usize> = out
+                    .iter()
+                    .map(|o| o.len())
+                    .chain(alternative_out.iter().map(|o| o.len()))
+                    .collect();
                 let full_block = &quantized[c][..size];
 
                 for pass in 0..coeff_shifts.len() {
@@ -2191,6 +2483,11 @@ pub(crate) fn write_ac_group(
                     // to all covered cells in num_nzeros.
                     let shifted =
                         ((nzeros as usize + covered_blocks - 1) >> log2_covered_blocks) as u8;
+                    if pass == 0
+                        && let Some(m) = memo.as_deref_mut()
+                    {
+                        m.nz_shift[lby * m.xsize_blocks + bx][c] = shifted;
+                    }
                     // Pre-swap iteration (cov_x, cov_y from raw strategy).
                     for iy in 0..cov_y {
                         let target_row =
@@ -2309,6 +2606,20 @@ pub(crate) fn write_ac_group(
                         "remaining nzeros at end: strategy={} c={} pass={}",
                         strategy_code, c, pass
                     );
+                }
+                if token_memo && let Some(m) = memo.as_deref_mut() {
+                    for s in 0..streams {
+                        let src = if s < out.len() {
+                            &out[s]
+                        } else {
+                            &alternative_out[s - out.len()]
+                        };
+                        let new_tokens = &src[stream_starts[s]..];
+                        let arena = &mut m.tokens[s];
+                        m.spans[(bi * 3 + c) * streams + s] =
+                            (arena.len() as u32, new_tokens.len() as u32);
+                        arena.extend_from_slice(new_tokens);
+                    }
                 }
             }
         }

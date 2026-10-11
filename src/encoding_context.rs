@@ -288,6 +288,12 @@ impl EncodingContext {
             .fetch_max(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Frame-level race result: replaces the gate-raised scale.
+    pub(crate) fn set_b_qm_scale(&self, scale: u32) {
+        self.b_qm_scale
+            .store(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub(crate) fn b_qm_scale(&self) -> u32 {
         self.b_qm_scale.load(std::sync::atomic::Ordering::Relaxed)
     }

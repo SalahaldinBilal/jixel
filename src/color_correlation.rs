@@ -1467,14 +1467,23 @@ pub(crate) fn dc_candidate_levels(
     let mut y_levels = Vec::with_capacity(dc_datas.len());
     let mut b_levels = Vec::with_capacity(dc_datas.len());
     for dc in dc_datas {
-        let (sy, sb) = (dc.source_dc_y.as_ref().unwrap(), dc.source_dc_b.as_ref().unwrap());
+        let (sy, sb) = (
+            dc.source_dc_y.as_ref().unwrap(),
+            dc.source_dc_b.as_ref().unwrap(),
+        );
         let (w, h) = (sy.xsize(), sy.ysize());
         let mut yl = vec![0i32; w * h];
         let mut bl = vec![0i32; w * h];
         for y in 0..h {
             (ctx.quantize_dc_i32)(sy.row(y), factor_y, &mut yl[y * w..(y + 1) * w]);
             y_price.add_row(&yl[y * w..(y + 1) * w], y == 0);
-            (ctx.quantize_dc_cfl_i32)(sb.row(y), &yl[y * w..(y + 1) * w], factor_b, cfl_b, &mut bl[y * w..(y + 1) * w]);
+            (ctx.quantize_dc_cfl_i32)(
+                sb.row(y),
+                &yl[y * w..(y + 1) * w],
+                factor_b,
+                cfl_b,
+                &mut bl[y * w..(y + 1) * w],
+            );
             b_price.add_row(&bl[y * w..(y + 1) * w], y == 0);
         }
         y_levels.push(yl);

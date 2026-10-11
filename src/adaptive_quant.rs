@@ -96,13 +96,12 @@ pub(crate) fn hf_modulation_strength(distance: f32) -> f32 {
     (1.06836 * distance).clamp(0.1, 0.890398)
 }
 
-
 /// Distance knots of the masking strength and flat-level schedules.
-const AQ_KNOTS: [f32; 7] = [0.5, 1.0, 1.4, 1.75, 3.0, 5.0, 8.0];
+static AQ_KNOTS: [f32; 7] = [0.5, 1.0, 1.4, 1.75, 3.0, 5.0, 8.0];
 /// Masking strength at `AQ_KNOTS` (linear between, clamped outside); 0 = flat field.
-const AQ_STRENGTH: [f32; 7] = [0.26565, 0.275459, 0.058287, 0.0, 0.0, 0.0, 0.0];
+static AQ_STRENGTH: [f32; 7] = [0.26565, 0.275459, 0.058287, 0.0, 0.0, 0.0, 0.0];
 /// Flat field level (fraction of the distance-derived scale) at `AQ_KNOTS`.
-const AQ_BASE_LEVEL: [f32; 7] = [0.636493, 0.648351, 0.606759, 0.48, 0.48, 0.48, 0.48];
+static AQ_BASE_LEVEL: [f32; 7] = [0.636493, 0.648351, 0.606759, 0.48, 0.48, 0.48, 0.48];
 
 fn aq_schedule(values: &[f32; 7], distance: f32) -> f32 {
     if distance <= AQ_KNOTS[0] {
@@ -805,10 +804,10 @@ pub(crate) fn dirty_log2p1f(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AQ_STRENGTH, AqMapScratch, Image3F, ImageB,
-        apply_chroma_hf_protection, apply_chroma_hf_protection_with_stats, aq_dampen,
-        chroma_hf_stats_scalar, dirty_log2f, dirty_log2p1f, fill_quant_field_scalar,
-        hf_modulation_strength, selected_chroma_hf_stats_fn, selected_fill_quant_field_fn,
+        AQ_STRENGTH, AqMapScratch, Image3F, ImageB, apply_chroma_hf_protection,
+        apply_chroma_hf_protection_with_stats, aq_dampen, chroma_hf_stats_scalar, dirty_log2f,
+        dirty_log2p1f, fill_quant_field_scalar, hf_modulation_strength,
+        selected_chroma_hf_stats_fn, selected_fill_quant_field_fn,
     };
 
     #[test]

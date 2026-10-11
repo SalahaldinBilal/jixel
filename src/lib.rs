@@ -70,6 +70,7 @@ mod haar;
 mod icc_codec;
 mod image;
 mod inflated_cost;
+mod invisible;
 mod iso_gain_map;
 mod jpeg;
 mod lossless;

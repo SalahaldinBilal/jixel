@@ -301,6 +301,11 @@ pub struct EncodeConfig {
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub lossless: bool,
+    /// Smooth color samples underneath fully transparent pixels before lossy
+    /// encoding, using libjxl's neighbor fill. Alpha and partially transparent
+    /// source samples are unchanged by this preprocessing. Defaults to true.
+    /// Ignored for lossless encoding and CMYK images.
+    pub fill_invisible: bool,
     /// If true (and lossless), use the progressive Squeeze transform: a low-res
     /// preview that refines to bit-exact. Works at any size (single- and
     /// multi-group) and with alpha.
@@ -416,6 +421,8 @@ pub(crate) struct EncodeConfigImpl {
     /// If true, encode losslessly via the modular encoder. `distance` is then
     /// ignored. RGB and alpha both round-trip bit-perfectly.
     pub(crate) lossless: bool,
+    /// Invisible-color preprocessing (see `EncodeConfig::fill_invisible`).
+    pub(crate) fill_invisible: bool,
     pub(crate) progressive: bool,
     pub(crate) patches: bool,
     #[cfg(feature = "splines")]
@@ -456,6 +463,7 @@ impl Default for EncodeConfig {
             brotli_compression: None,
             orientation: Orientation::Normal,
             lossless: false,
+            fill_invisible: true,
             progressive: false,
             patches: false,
             #[cfg(feature = "splines")]
@@ -495,6 +503,7 @@ impl Default for EncodeConfigImpl {
             black: false,
             bits_per_sample: BitsPerSample::Eight,
             lossless: false,
+            fill_invisible: true,
             progressive: false,
             patches: false,
             #[cfg(feature = "splines")]
@@ -582,6 +591,11 @@ impl EncodeConfigImpl {
         self
     }
 
+    pub(crate) fn with_fill_invisible(mut self, fill_invisible: bool) -> Self {
+        self.fill_invisible = fill_invisible;
+        self
+    }
+
     pub(crate) fn with_progressive(mut self, progressive: bool) -> Self {
         self.progressive = progressive;
         self
@@ -614,13 +628,14 @@ impl EncodeConfigImpl {
         self
     }
 
-    /// Copy all lossy-progressive settings from a public `EncodeConfig`.
+    /// Copy frame settings from a public `EncodeConfig`.
     pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
         #[cfg(feature = "splines")]
         let this = self.with_splines(config.splines).with_dots(config.dots);
         #[cfg(not(feature = "splines"))]
         let this = self;
         this.with_progressive(config.progressive)
+            .with_fill_invisible(config.fill_invisible)
             .with_patches(config.patches)
             .with_progressive_passes(config.progressive_passes)
             .with_progressive_shifts(config.progressive_shifts.clone())
@@ -751,6 +766,14 @@ impl EncodeConfig {
     }
     pub fn with_lossless(mut self, lossless: bool) -> Self {
         self.lossless = lossless;
+        self
+    }
+
+    /// Enable invisible-color preprocessing (see [`EncodeConfig::fill_invisible`]).
+    /// Enabled by default; set to false to retain the original hidden colors
+    /// as input to lossy encoding.
+    pub fn with_fill_invisible(mut self, fill_invisible: bool) -> Self {
+        self.fill_invisible = fill_invisible;
         self
     }
 
@@ -2160,6 +2183,7 @@ pub(crate) fn encode_with_coded_planes(
         coded,
         config.grayscale,
         config.alpha.as_ref(),
+        config.fill_invisible && !config.lossless && !config.black,
         &coeff_shifts,
         config.patches,
         !config.bits_per_sample.is_float(),
@@ -2776,6 +2800,18 @@ mod tests {
     }
 
     #[test]
+    fn invisible_fill_defaults_on_and_can_be_disabled() {
+        assert!(EncodeConfig::default().fill_invisible);
+        let config = EncodeConfig::default().with_fill_invisible(false);
+        assert!(!config.fill_invisible);
+        assert!(
+            !EncodeConfigImpl::default()
+                .with_progressive_from(&config)
+                .fill_invisible
+        );
+    }
+
+    #[test]
     fn srgb_linearization_uses_requested_threads() {
         use std::collections::HashSet;
         use std::sync::{Barrier, Mutex};
@@ -3116,6 +3152,38 @@ mod encode_smoke_tests {
     #[test]
     fn rgb8_lossy() {
         ok(encode_image(&rgb8(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn invisible_fill_preserves_lossless_and_nontransparent_inputs() {
+        let on = lossy().with_num_threads(1);
+        let off = on.clone().with_fill_invisible(false);
+        assert_eq!(
+            encode_image(&rgb8(), W, H, &on).unwrap(),
+            encode_image(&rgb8(), W, H, &off).unwrap()
+        );
+        let mut rgba = rgba8();
+        for px in rgba.chunks_exact_mut(4) {
+            px[3] = 128; // Partial alpha must not be premultiplied or filled.
+        }
+        for coding in [
+            CodingTransform::Xyb,
+            CodingTransform::Rgb,
+            CodingTransform::YCbCr,
+        ] {
+            let on = on.clone().with_coding_transform(coding);
+            let off = off.clone().with_coding_transform(coding);
+            assert_eq!(
+                encode_image_with_alpha(&rgba, W, H, &on).unwrap(),
+                encode_image_with_alpha(&rgba, W, H, &off).unwrap()
+            );
+        }
+        let lossless_on = on.with_lossless(true);
+        let lossless_off = off.with_lossless(true);
+        assert_eq!(
+            encode_image_with_alpha(&rgba8(), W, H, &lossless_on).unwrap(),
+            encode_image_with_alpha(&rgba8(), W, H, &lossless_off).unwrap()
+        );
     }
 
     #[test]

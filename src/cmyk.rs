@@ -371,4 +371,25 @@ mod tests {
         .unwrap();
         assert!(has_box(&bytes, b"jxll"));
     }
+
+    #[test]
+    fn invisible_fill_never_treats_black_as_alpha() {
+        let pixels = ramp(16, 16);
+        let icc = cmyk_icc();
+        for coding in [crate::CodingTransform::Xyb, crate::CodingTransform::Rgb] {
+            for arm in [crate::LossyModular::Off, crate::LossyModular::Force] {
+                let on = EncodeConfig::default()
+                    .with_num_threads(1)
+                    .with_coding_transform(coding)
+                    .with_lossy_modular(arm);
+                let off = on.clone().with_fill_invisible(false);
+                for convention in [InkConvention::Amount, InkConvention::Inverted] {
+                    assert_eq!(
+                        encode_image_cmyk(&pixels, 16, 16, &icc, convention, &on).unwrap(),
+                        encode_image_cmyk(&pixels, 16, 16, &icc, convention, &off).unwrap()
+                    );
+                }
+            }
+        }
+    }
 }

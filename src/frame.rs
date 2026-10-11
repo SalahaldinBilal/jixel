@@ -824,9 +824,9 @@ pub(crate) fn epf_sharpness_id(distance: f32, screen_content: bool) -> i32 {
     }
     // Hard edges beside flat fills ring visibly; up to d=5 the strongest
     // filter wins both SSIMULACRA2 and butteraugli there at identical bytes.
-    if distance < 1.75 || (screen_content && distance < SCREEN_CONTENT_EPF_MAX_DISTANCE) {
+    if distance < 1.4 || (screen_content && distance < SCREEN_CONTENT_EPF_MAX_DISTANCE) {
         7
-    } else if distance < 2.75 {
+    } else if distance < 1.75 {
         6
     } else if distance < 3.5 {
         5
@@ -7054,8 +7054,10 @@ mod tests {
 
     #[test]
     fn epf_sharpness_strengthens_in_the_coarse_band() {
-        assert_eq!(epf_sharpness_id(1.74, false), 7);
-        assert_eq!(epf_sharpness_id(1.75, false), 6);
+        assert_eq!(epf_sharpness_id(1.39, false), 7);
+        assert_eq!(epf_sharpness_id(1.4, false), 6);
+        assert_eq!(epf_sharpness_id(1.74, false), 6);
+        assert_eq!(epf_sharpness_id(1.75, false), 5);
         assert_eq!(epf_sharpness_id(2.75, false), 5);
         assert_eq!(epf_sharpness_id(3.49, false), 5);
         assert_eq!(epf_sharpness_id(3.5, false), 4);

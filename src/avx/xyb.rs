@@ -31,6 +31,90 @@ use crate::xyb::*;
 use std::arch::x86_64::*;
 
 #[inline]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(target_feature = "fma", target_feature(enable = "fma"))]
+fn xyb_to_rgb_avx2(m: &XybMatrix, x: __m256, y: __m256, b: __m256) -> (__m256, __m256, __m256) {
+    let cube = |value: __m256| {
+        let value = _mm256_sub_ps(value, _mm256_set1_ps(NEG_BIAS_CBRT));
+        // Keep the cube and bias subtraction separate, as in the scalar inverse.
+        _mm256_sub_ps(
+            _mm256_mul_ps(_mm256_mul_ps(value, value), value),
+            _mm256_set1_ps(OPSIN_BIAS),
+        )
+    };
+    let m0 = cube(_mm256_add_ps(y, x));
+    let m1 = cube(_mm256_sub_ps(y, x));
+    let m2 = cube(b);
+    // Match dct::fmla, including builds that do not fuse the inverse matrix.
+    let row = |offset: usize| {
+        let value = _mm256_mul_ps(m2, _mm256_set1_ps(m.inv[offset + 2]));
+        #[cfg(target_feature = "fma")]
+        {
+            let value = _mm256_fmadd_ps(m1, _mm256_set1_ps(m.inv[offset + 1]), value);
+            _mm256_fmadd_ps(m0, _mm256_set1_ps(m.inv[offset]), value)
+        }
+        #[cfg(not(target_feature = "fma"))]
+        {
+            _mm256_add_ps(
+                _mm256_mul_ps(m0, _mm256_set1_ps(m.inv[offset])),
+                _mm256_add_ps(_mm256_mul_ps(m1, _mm256_set1_ps(m.inv[offset + 1])), value),
+            )
+        }
+    };
+    (row(0), row(3), row(6))
+}
+
+/// # Safety
+/// The CPU must support the enabled target features and all six slices must
+/// have equal lengths. Only complete SIMD vectors are read and written.
+#[target_feature(enable = "avx2")]
+#[cfg_attr(target_feature = "fma", target_feature(enable = "fma"))]
+pub(crate) unsafe fn to_linear_rows_avx2(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [f32]; 3],
+) -> usize {
+    let [r, g, b] = output;
+    let done = unsafe { to_linear_rows::<4>(m, input, [r, g, b]) };
+    done + unsafe {
+        to_linear_rows::<1>(
+            m,
+            input.map(|row| &row[done..]),
+            [&mut r[done..], &mut g[done..], &mut b[done..]],
+        )
+    }
+}
+
+#[inline]
+#[target_feature(enable = "avx2")]
+#[cfg_attr(target_feature = "fma", target_feature(enable = "fma"))]
+unsafe fn to_linear_rows<const N: usize>(
+    m: &XybMatrix,
+    [x, y, b]: [&[f32]; 3],
+    [r, g, out_b]: [&mut [f32]; 3],
+) -> usize {
+    const LANES: usize = 8;
+    let done = r.len() / (N * LANES) * (N * LANES);
+    for start in (0..done).step_by(N * LANES) {
+        for lane in 0..N {
+            let i = start + lane * LANES;
+            // The caller's equal-length contract and complete-vector loop
+            // bound cover every unaligned load and store.
+            unsafe {
+                let xv = _mm256_loadu_ps(x.as_ptr().add(i));
+                let yv = _mm256_loadu_ps(y.as_ptr().add(i));
+                let bv = _mm256_loadu_ps(b.as_ptr().add(i));
+                let (rv, gv, bv) = xyb_to_rgb_avx2(m, xv, yv, bv);
+                _mm256_storeu_ps(r.as_mut_ptr().add(i), rv);
+                _mm256_storeu_ps(g.as_mut_ptr().add(i), gv);
+                _mm256_storeu_ps(out_b.as_mut_ptr().add(i), bv);
+            }
+        }
+    }
+    done
+}
+
+#[inline]
 #[target_feature(enable = "avx2,fma")]
 fn halley_cbrt_avx2<const SCALAR_ORDER: bool>(x: __m256, a: __m256) -> __m256 {
     let tx = _mm256_mul_ps(_mm256_mul_ps(x, x), x);

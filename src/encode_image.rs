@@ -3858,8 +3858,11 @@ mod encode_smoke_tests {
         let fixed = learned.clone().with_learned_rate(false);
         let learned = encode_image(&pixels, SIZE, SIZE, &learned).unwrap();
         let fixed = encode_image(&pixels, SIZE, SIZE, &fixed).unwrap();
+        // The source-feature quant field already codes the lines well under
+        // the fixed model (1.6 KB vs 4 KB on the flat field); the learned
+        // prices still take a third off.
         assert!(
-            learned.len() * 3 < fixed.len(),
+            learned.len() * 4 < fixed.len() * 3,
             "{} vs {}",
             learned.len(),
             fixed.len()

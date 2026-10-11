@@ -28,7 +28,7 @@
  */
 //! Fixed symmetric Gaussian filter for the AQ loop's MS-SSIM moments.
 
-use std::sync::OnceLock;
+use std::{ops::Range, sync::OnceLock};
 
 pub(crate) const WINDOW: usize = 11;
 pub(crate) const RADIUS: usize = WINDOW / 2;
@@ -113,36 +113,148 @@ pub(crate) struct GaussianBlur {
     width: usize,
     ring: Vec<f32>,
     padded: Vec<f32>,
+    /// All-zero row for zero padding in the vertical pass.
+    zero_row: Vec<f32>,
     kernels: Kernels,
+    kernel: [f32; WINDOW],
+    zero_pad: bool,
 }
 
 impl GaussianBlur {
+    /// σ = 1.5 Gaussian with edge replication.
     pub(crate) fn new(width: usize) -> Self {
+        Self::with_kernel(width, *kernel(), false)
+    }
+
+    /// Any symmetric `WINDOW`-tap kernel; `zero_pad` treats pixels outside the
+    /// plane as zero instead of replicating the edge.
+    pub(crate) fn with_kernel(width: usize, kernel: [f32; WINDOW], zero_pad: bool) -> Self {
         Self {
             width,
             ring: vec![0.0; width * WINDOW],
             padded: vec![0.0; width + 2 * RADIUS],
+            zero_row: vec![0.0; width],
             kernels: selected_kernels(),
+            kernel,
+            zero_pad,
         }
     }
 
-    /// Separable Gaussian blur with edge replication in both directions.
+    /// Reconfigure the row scratch without discarding its allocated capacity.
+    pub(crate) fn set_width(&mut self, width: usize) {
+        self.width = width;
+        self.ring.resize(width * WINDOW, 0.0);
+        self.padded.resize(width + 2 * RADIUS, 0.0);
+        self.zero_row.resize(width, 0.0);
+    }
+
+    /// Separable blur; borders replicate the edge or read zeros (`zero_pad`).
     pub(crate) fn blur(&mut self, src: &[f32], height: usize, out: &mut [f32]) {
         let w = self.width;
         assert_eq!(src.len(), w * height);
         assert_eq!(out.len(), src.len());
-        if w == 0 || height == 0 {
+        self.blur_region(src, w, height, [0..w, 0..height], out, w);
+    }
+
+    /// Blur pointwise products directly from their source planes. Products are
+    /// computed in the padded row scratch, without materializing a full plane.
+    pub(crate) fn blur_product(&mut self, src: [&[f32]; 2], height: usize, out: &mut [f32]) {
+        let w = self.width;
+        assert_eq!(out.len(), w * height);
+        self.blur_product_region(src, w, height, [0..w, 0..height], out, w);
+    }
+
+    /// Blur only the requested columns and rows, reading their halo from the
+    /// source plane. The first output pixel is at `out[0]`; `out_stride` lets
+    /// callers write directly into a larger plane. Scratch width equals the
+    /// number of output columns, independently of the source width.
+    pub(crate) fn blur_region(
+        &mut self,
+        src: &[f32],
+        src_width: usize,
+        height: usize,
+        [columns, rows]: [Range<usize>; 2],
+        out: &mut [f32],
+        out_stride: usize,
+    ) {
+        self.blur_region_impl::<false>(
+            [src, src],
+            src_width,
+            height,
+            [columns, rows],
+            out,
+            out_stride,
+        );
+    }
+
+    /// Product version of `blur_region`, reading both planes' halo directly.
+    pub(crate) fn blur_product_region(
+        &mut self,
+        src: [&[f32]; 2],
+        src_width: usize,
+        height: usize,
+        region: [Range<usize>; 2],
+        out: &mut [f32],
+        out_stride: usize,
+    ) {
+        self.blur_region_impl::<true>(src, src_width, height, region, out, out_stride);
+    }
+
+    fn blur_region_impl<const PRODUCT: bool>(
+        &mut self,
+        [src, second]: [&[f32]; 2],
+        src_width: usize,
+        height: usize,
+        [columns, rows]: [Range<usize>; 2],
+        out: &mut [f32],
+        out_stride: usize,
+    ) {
+        let w = self.width;
+        assert_eq!(src.len(), src_width * height);
+        if PRODUCT {
+            assert_eq!(second.len(), src.len());
+        }
+        assert!(columns.start <= columns.end && columns.end <= src_width);
+        assert!(rows.start <= rows.end && rows.end <= height);
+        assert_eq!(columns.len(), w);
+        assert!(out_stride >= w);
+        if w == 0 || rows.is_empty() {
             return;
         }
-        let k = kernel();
-        let mut next_row = 0;
-        for y in 0..height {
+        assert!(out.len() >= (rows.len() - 1) * out_stride + w);
+        let k = &self.kernel;
+        let first = columns.start.saturating_sub(RADIUS);
+        let last = (columns.end + RADIUS).min(src_width);
+        let left_pad = RADIUS.saturating_sub(columns.start);
+        let copied_end = left_pad + last - first;
+        let mut next_row = rows.start.saturating_sub(RADIUS);
+        for y in rows.clone() {
             let last_row = (y + RADIUS).min(height - 1);
             while next_row <= last_row {
-                let row = &src[next_row * w..(next_row + 1) * w];
-                self.padded[..RADIUS].fill(row[0]);
-                self.padded[RADIUS..RADIUS + w].copy_from_slice(row);
-                self.padded[RADIUS + w..].fill(row[w - 1]);
+                let row = &src[next_row * src_width..(next_row + 1) * src_width];
+                let (left, right) = if self.zero_pad {
+                    (0.0, 0.0)
+                } else if PRODUCT {
+                    let other = &second[next_row * src_width..(next_row + 1) * src_width];
+                    (row[0] * other[0], row[src_width - 1] * other[src_width - 1])
+                } else {
+                    (row[0], row[src_width - 1])
+                };
+                self.padded[..left_pad].fill(left);
+                let dst = &mut self.padded[left_pad..copied_end];
+                if PRODUCT {
+                    let other = &second[next_row * src_width..(next_row + 1) * src_width];
+                    for ((out, &a), &b) in dst
+                        .iter_mut()
+                        .zip(&row[first..last])
+                        .zip(&other[first..last])
+                    {
+                        *out = a * b;
+                    }
+                } else {
+                    dst.copy_from_slice(&row[first..last]);
+                }
+                self.padded[copied_end..].fill(right);
                 let slot = next_row % WINDOW;
                 let dst = &mut self.ring[slot * w..(slot + 1) * w];
                 let done = (self.kernels.horizontal)(&self.padded, k, dst);
@@ -150,19 +262,31 @@ impl GaussianBlur {
                 next_row += 1;
             }
             // At most WINDOW consecutive source rows are live. Repeated edge
-            // rows point to the same slot without copying or re-filtering them.
-            let rows: BlurRows<'_> = std::array::from_fn(|i| {
-                let sy = (y + i).saturating_sub(RADIUS).min(height - 1);
+            // rows point to the same slot without copying or re-filtering them;
+            // with zero padding, rows outside the plane read the zero row.
+            let window_rows: BlurRows<'_> = std::array::from_fn(|i| {
+                let sy = (y + i) as isize - RADIUS as isize;
+                if self.zero_pad && (sy < 0 || sy >= height as isize) {
+                    return &self.zero_row[..];
+                }
+                let sy = sy.max(0).min(height as isize - 1) as usize;
                 let slot = sy % WINDOW;
                 &self.ring[slot * w..(slot + 1) * w]
             });
-            let dst = &mut out[y * w..(y + 1) * w];
-            let done = (self.kernels.vertical)(&rows, k, dst);
+            let start = (y - rows.start) * out_stride;
+            let dst = &mut out[start..start + w];
+            let done = (self.kernels.vertical)(&window_rows, k, dst);
             if done < w {
-                let tail = rows.map(|row| &row[done..]);
+                let tail = window_rows.map(|row| &row[done..]);
                 vertical_scalar(&tail, k, &mut dst[done..]);
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scratch_layout(&self) -> [(usize, usize); 3] {
+        [&self.ring, &self.padded, &self.zero_row]
+            .map(|buffer| (buffer.as_ptr() as usize, buffer.capacity()))
     }
 }
 
@@ -329,8 +453,146 @@ mod tests {
     }
 
     #[test]
+    fn region_matches_full_blur_and_preserves_surrounding_pixels() {
+        const GUARD: f32 = -12345.0;
+        for zero_pad in [false, true] {
+            for (name, kernels) in available_kernels() {
+                for (w, h) in [(1, 1), (3, 7), (17, 13), (65, 37)] {
+                    let src: Vec<f32> = (0..w * h)
+                        .map(|i| ((i * 71 + i / w * 113) % 101) as f32 / 50.0 - 1.0)
+                        .collect();
+                    let mut blur = GaussianBlur::with_kernel(w, *kernel(), zero_pad);
+                    blur.kernels = kernels;
+                    let ring = blur.ring.as_ptr();
+                    let padded = blur.padded.as_ptr();
+                    let zero = blur.zero_row.as_ptr();
+                    let mut full = vec![f32::NAN; src.len()];
+                    blur.blur(&src, h, &mut full);
+                    for [columns, rows] in [
+                        [0..w, 0..h],
+                        [0..1, 0..1],
+                        [w - 1..w, h - 1..h],
+                        [w / 3..w.div_ceil(2), h / 3..h.div_ceil(2)],
+                        [0..w.div_ceil(2), h / 2..h],
+                        [w / 2..w, 0..h.div_ceil(2)],
+                    ] {
+                        blur.set_width(columns.len());
+                        let mut out = vec![GUARD; src.len()];
+                        let offset = rows.start * w + columns.start;
+                        blur.blur_region(
+                            &src,
+                            w,
+                            h,
+                            [columns.clone(), rows.clone()],
+                            &mut out[offset..],
+                            w,
+                        );
+                        for y in 0..h {
+                            for x in 0..w {
+                                let expected = if columns.contains(&x) && rows.contains(&y) {
+                                    full[y * w + x]
+                                } else {
+                                    GUARD
+                                };
+                                assert_eq!(
+                                    out[y * w + x].to_bits(),
+                                    expected.to_bits(),
+                                    "{name}, zero_pad={zero_pad}, {w}x{h}, {columns:?}x{rows:?}, ({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                    assert_eq!(blur.ring.as_ptr(), ring);
+                    assert_eq!(blur.padded.as_ptr(), padded);
+                    assert_eq!(blur.zero_row.as_ptr(), zero);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn product_blurs_match_materialized_planes_and_regions_bit_exactly() {
+        const GUARD: f32 = -12345.0;
+        for zero_pad in [false, true] {
+            for (name, kernels) in available_kernels() {
+                for w in (1..=40).chain([47, 63, 64, 65, 127, 129]) {
+                    for h in [1, 3, 17, 37] {
+                        let values = [-0.0, 1e-23, -1e-20, -0.7, 0.125, 1.0, 1e15];
+                        let a: Vec<_> =
+                            (0..w * h).map(|i| values[(i * 3) % values.len()]).collect();
+                        let b: Vec<_> = (0..w * h)
+                            .map(|i| values[(i * 5 + 1) % values.len()])
+                            .collect();
+                        for sources in [[&a[..], &a[..]], [&a[..], &b[..]]] {
+                            let product: Vec<_> = sources[0]
+                                .iter()
+                                .zip(sources[1])
+                                .map(|(&a, &b)| a * b)
+                                .collect();
+                            let mut blur = GaussianBlur::with_kernel(w, *kernel(), zero_pad);
+                            blur.kernels = kernels;
+                            let mut expected = vec![f32::NAN; w * h];
+                            blur.blur(&product, h, &mut expected);
+                            let mut actual = vec![f32::NAN; w * h];
+                            blur.blur_product(sources, h, &mut actual);
+                            assert!(
+                                actual
+                                    .iter()
+                                    .zip(&expected)
+                                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                                "{name}, zero_pad={zero_pad}, {w}x{h}"
+                            );
+                            let scratch = blur.scratch_layout();
+                            for [columns, rows] in [
+                                [0..w, 0..h],
+                                [0..1, 0..1],
+                                [w - 1..w, h - 1..h],
+                                [w / 3..w.div_ceil(2), h / 3..h.div_ceil(2)],
+                                [0..w.div_ceil(2), h / 2..h],
+                                [w / 2..w, 0..h.div_ceil(2)],
+                                [0..0, 0..h],
+                                [0..w, 0..0],
+                            ] {
+                                blur.set_width(columns.len());
+                                actual.fill(GUARD);
+                                let offset = rows.start * w + columns.start;
+                                blur.blur_product_region(
+                                    sources,
+                                    w,
+                                    h,
+                                    [columns.clone(), rows.clone()],
+                                    &mut actual[offset..],
+                                    w,
+                                );
+                                for y in 0..h {
+                                    for x in 0..w {
+                                        let reference = if columns.contains(&x) && rows.contains(&y)
+                                        {
+                                            expected[y * w + x]
+                                        } else {
+                                            GUARD
+                                        };
+                                        assert_eq!(
+                                            actual[y * w + x].to_bits(),
+                                            reference.to_bits(),
+                                            "{name}, zero_pad={zero_pad}, {w}x{h}, {columns:?}x{rows:?}, ({x},{y})"
+                                        );
+                                    }
+                                }
+                            }
+                            assert_eq!(blur.scratch_layout(), scratch);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn empty_images_are_supported() {
         GaussianBlur::new(0).blur(&[], 4, &mut []);
         GaussianBlur::new(7).blur(&[], 0, &mut []);
+        GaussianBlur::new(0).blur_product([&[], &[]], 4, &mut []);
+        GaussianBlur::new(7).blur_product([&[], &[]], 0, &mut []);
     }
 }

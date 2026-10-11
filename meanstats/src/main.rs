@@ -54,7 +54,6 @@ use plotters::coord::combinators::{LogCoord, WithKeyPoints};
 use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
-use std::fmt::format;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};

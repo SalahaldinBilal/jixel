@@ -149,14 +149,14 @@ fn dirty_log2f_x4(d: float32x4_t) -> float32x4_t {
 #[inline]
 #[target_feature(enable = "neon")]
 fn compute_mask_x4(out_val: float32x4_t) -> float32x4_t {
-    let k_base = vdupq_n_f32(-0.7647);
+    let k_base = vdupq_n_f32(-0.699765);
     let k_mul4 = vdupq_n_f32(9.4708735624378946);
     let k_mul2 = vdupq_n_f32(17.35036561631863);
     let k_offset2 = vdupq_n_f32(302.59587815579727);
     let k_mul3 = vdupq_n_f32(6.7943250517376494);
     let k_offset3 = vdupq_n_f32(3.7179635626140772);
     let k_offset4 = vdupq_n_f32(0.25 * 3.7179635626140772);
-    let k_mul0 = vdupq_n_f32(0.80061762862741759);
+    let k_mul0 = vdupq_n_f32(1.07267);
     let one = vdupq_n_f32(1.0);
 
     let v1 = vmaxq_f32(vmulq_f32(out_val, k_mul0), vdupq_n_f32(1e-3));
@@ -221,11 +221,7 @@ fn gamma_modulation_blocks4_x4(
     let partial23 = vpaddq_f32(acc2, acc3);
     let overall = vmulq_n_f32(vpaddq_f32(partial01, partial23), 1.0 / 64.0);
 
-    vmlaf(
-        vdupq_n_f32(0.1005613337192697),
-        dirty_log2f_x4(overall),
-        out_val,
-    )
+    vmlaf(vdupq_n_f32(0.119146), dirty_log2f_x4(overall), out_val)
 }
 
 #[inline]
@@ -306,8 +302,8 @@ fn hf_modulation_blocks4_direct_x4(
 
     vmlaf(
         out,
-        vdupq_n_f32(-0.38 * strength),
-        vaddq_f32(out_val, vdupq_n_f32(0.42)),
+        vdupq_n_f32(-0.506626 * strength),
+        vaddq_f32(out_val, vdupq_n_f32(0.655866)),
     )
 }
 
@@ -359,7 +355,7 @@ fn blue_modulation_blocks4_x4(
 
     const K_LIMIT: f32 = 0.010474084867598155;
     const K_MAX_LIMIT: f32 = 15.463398341612438 * K_LIMIT;
-    let scale: f32 = 0.90590804735610064;
+    let scale: f32 = 0.127191;
 
     // Convert:
     //
@@ -1113,7 +1109,7 @@ pub(crate) fn fill_quant_field(
     }
 
     // ---- Stage 3: per-block modulations + integer quant field.
-    let base_level = 0.48 * scale;
+    let base_level = crate::adaptive_quant::aq_base_level(distance) * scale;
     let dampen = crate::adaptive_quant::aq_dampen(distance);
     let mul = scale * dampen;
     let add = (1.0 - dampen) * base_level;

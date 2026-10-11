@@ -153,14 +153,14 @@ fn dirty_log2f_x8(d: __m256) -> __m256 {
 #[inline]
 #[target_feature(enable = "avx2,fma")]
 fn compute_mask_x8(out_val: __m256) -> __m256 {
-    let k_base = _mm256_set1_ps(-0.7647);
+    let k_base = _mm256_set1_ps(-0.699765);
     let k_mul4 = _mm256_set1_ps(9.4708735624378946);
     let k_mul2 = _mm256_set1_ps(17.35036561631863);
     let k_offset2 = _mm256_set1_ps(302.59587815579727);
     let k_mul3 = _mm256_set1_ps(6.7943250517376494);
     let k_offset3 = _mm256_set1_ps(3.7179635626140772);
     let k_offset4 = _mm256_set1_ps(0.25 * 3.7179635626140772);
-    let k_mul0 = _mm256_set1_ps(0.80061762862741759);
+    let k_mul0 = _mm256_set1_ps(1.07267);
     let one = _mm256_set1_ps(1.0);
 
     let v1 = _mm256_max_ps(_mm256_mul_ps(out_val, k_mul0), _mm256_set1_ps(1e-3));
@@ -248,11 +248,7 @@ fn gamma_modulation_blocks8_x8(
         hsum8_vectors(s0, s1, s2, s3, s4, s5, s6, s7),
         _mm256_set1_ps(1.0 / 64.0),
     );
-    mlaf(
-        _mm256_set1_ps(0.1005613337192697),
-        dirty_log2f_x8(overall),
-        out_val,
-    )
+    mlaf(_mm256_set1_ps(0.119146), dirty_log2f_x8(overall), out_val)
 }
 
 #[inline]
@@ -347,8 +343,8 @@ fn hf_modulation_blocks8_direct_x8(
     let sums = hsum8_vectors(s0, s1, s2, s3, s4, s5, s6, s7);
     mlaf(
         sums,
-        _mm256_set1_ps(-0.38 * strength),
-        _mm256_add_ps(out_val, _mm256_set1_ps(0.42)),
+        _mm256_set1_ps(-0.506626 * strength),
+        _mm256_add_ps(out_val, _mm256_set1_ps(0.655866)),
     )
 }
 
@@ -400,7 +396,7 @@ fn blue_modulation_blocks8_x8(
 
     const K_LIMIT: f32 = 0.010474084867598155;
     const K_MAX_LIMIT: f32 = 15.463398341612438 * K_LIMIT;
-    const SCALE: f32 = 0.90590804735610064;
+    const SCALE: f32 = 0.127191;
 
     let mut sums = hsum8_vectors(s0, s1, s2, s3, s4, s5, s6, s7);
     let flip_mask = _mm256_cmp_ps::<_CMP_GE_OQ>(sums, _mm256_set1_ps(32.0 * K_LIMIT));
@@ -1119,7 +1115,7 @@ pub(crate) fn fill_quant_field(
     }
 
     // ---- Stage 3: per-block modulations + integer quant field.
-    let base_level = 0.48 * scale;
+    let base_level = crate::adaptive_quant::aq_base_level(distance) * scale;
     let dampen = crate::adaptive_quant::aq_dampen(distance);
     let mul = scale * dampen;
     let add = (1.0 - dampen) * base_level;

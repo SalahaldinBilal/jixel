@@ -158,7 +158,7 @@ mod tests {
         #[allow(unused_mut)] // Architecture-specific entries depend on enabled features.
         let mut kernels: Vec<(&str, HaarRowsFn)> = vec![("dispatch", selected_rows_fn())];
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
+        {
             kernels.push(("neon", |a, b, q, c, d| unsafe {
                 crate::neon::haar_rows_neon(a, b, q, c, d)
             }));

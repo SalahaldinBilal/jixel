@@ -82,14 +82,17 @@ fn selected_moments_fn() -> SsimMomentsFn {
             return |src, l, cs| unsafe { crate::sse::ssim_moments_sse41(src, l, cs) };
         }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return |src, l, cs| unsafe { crate::neon::ssim_moments_neon(src, l, cs) };
+        {
+            |src, l, cs| unsafe { crate::neon::ssim_moments_neon(src, l, cs) }
         }
         #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
         {
             crate::wasm::ssim_moments_wasm
         }
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
+        #[cfg(not(any(
+            all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
+            all(target_arch = "aarch64", feature = "neon")
+        )))]
         ssim_moments_scalar
     })
 }
@@ -183,16 +186,17 @@ fn selected_downsample_fn() -> DownsampleRowsFn {
             };
         }
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
-            return |top, bottom, dst| unsafe {
-                crate::neon::downsample_rows_neon(top, bottom, dst)
-            };
+        {
+            |top, bottom, dst| unsafe { crate::neon::downsample_rows_neon(top, bottom, dst) }
         }
         #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
         {
             crate::wasm::downsample_rows_wasm
         }
-        #[cfg(not(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")))]
+        #[cfg(not(any(
+            all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
+            all(target_arch = "aarch64", feature = "neon")
+        )))]
         downsample_rows_scalar
     })
 }
@@ -203,6 +207,29 @@ fn downsample_rows_scalar(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> usize
         *dst = 0.25 * (top[i] + top[i + 1] + bottom[i] + bottom[i + 1]);
     }
     dst.len()
+}
+
+/// Shared SIMD box filter. A final unpaired column repeats the right edge
+/// when the destination requests ceil rather than floor dimensions.
+pub(crate) fn downsample_rows(top: &[f32], bottom: &[f32], dst: &mut [f32]) {
+    downsample_rows_with_kernel(top, bottom, dst, selected_downsample_fn());
+}
+
+fn downsample_rows_with_kernel(
+    top: &[f32],
+    bottom: &[f32],
+    dst: &mut [f32],
+    rows: DownsampleRowsFn,
+) {
+    assert_eq!(top.len(), bottom.len());
+    assert!(dst.len() <= top.len().div_ceil(2));
+    let pairs = dst.len().min(top.len() / 2);
+    let done = rows(top, bottom, &mut dst[..pairs]);
+    downsample_rows_scalar(&top[2 * done..], &bottom[2 * done..], &mut dst[done..pairs]);
+    if pairs < dst.len() {
+        let i = 2 * pairs;
+        dst[pairs] = 0.25 * (top[i] + top[i] + bottom[i] + bottom[i]);
+    }
 }
 
 /// Half-size box filter. Incomplete pairs at the right and bottom are dropped.
@@ -225,10 +252,7 @@ fn downsample_into(a: &[f32], w: usize, h: usize, out: &mut [f32], rows: Downsam
         let top = &a[i..i + w];
         let bottom = &a[i + w..i + 2 * w];
         let dst = &mut out[y * w2..(y + 1) * w2];
-        let done = rows(top, bottom, dst);
-        if done < w2 {
-            downsample_rows_scalar(&top[2 * done..], &bottom[2 * done..], &mut dst[done..]);
-        }
+        downsample_rows_with_kernel(top, bottom, dst, rows);
     }
 }
 
@@ -351,6 +375,32 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn downsample_rows_support_floor_and_ceil_with_edge_replication() {
+        for w in (0usize..=40).chain([63, 64, 65, 127, 129]) {
+            let top: Vec<f32> = (0..w).map(|x| ((x * 71) % 101) as f32 - 50.0).collect();
+            let bottom: Vec<f32> = (0..w)
+                .map(|x| ((x * 113) % 101) as f32 / 50.0 - 1.0)
+                .collect();
+            for n in [w / 2, w.div_ceil(2)] {
+                let expected: Vec<f32> = (0..n)
+                    .map(|x| {
+                        let i = 2 * x;
+                        let j = (i + 1).min(w - 1);
+                        0.25 * (top[i] + top[j] + bottom[i] + bottom[j])
+                    })
+                    .collect();
+                for (name, kernel) in available_downsample_kernels() {
+                    let mut out = vec![f32::NAN; n];
+                    downsample_rows_with_kernel(&top, &bottom, &mut out, kernel);
+                    for (a, b) in out.iter().zip(&expected) {
+                        assert_eq!(a.to_bits(), b.to_bits(), "{name}: width={w}, outputs={n}");
+                    }
+                }
+            }
+        }
     }
 
     fn check_downsample(a: &[f32], w: usize, h: usize) {

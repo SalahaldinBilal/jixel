@@ -1278,7 +1278,7 @@ fn quantize_roundtrip_y_block(
 /// group-local plane, the pixel row offset of the current stripe in it, and
 /// the pass-0 token index at which each coded block starts.
 pub(crate) type ReconCapture<'a> = (
-    &'a mut crate::image::Plane<f32>,
+    &'a mut crate::image::Image3F,
     usize,
     &'a mut Vec<(u16, u16, u32)>,
 );
@@ -1745,6 +1745,7 @@ pub(crate) fn write_ac_group(
                 let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
                 let (px0, py0) = (opsin_origin.0 + bx * 8, opsin_origin.1 + by * 8);
                 let plane = opsin.plane(1);
+                let recon = recon.plane_mut(1);
                 for y in 0..ph {
                     let (sy, ly) = (py0 + y, y_off + by * 8 + y);
                     if sy >= plane.ysize() || ly >= recon.ysize() {
@@ -2094,6 +2095,49 @@ pub(crate) fn write_ac_group(
                     let error = ideal - dequantized_level(quantized[2][i]);
                     chroma_distortion =
                         fmla(ctx.channel_weight(2), error * error, chroma_distortion);
+                }
+            }
+            // ---- Chroma reconstruction capture (closed-loop quant field) ----
+            // CfL was applied against the dequantized Y, so the decoder's chroma
+            // error is the residual's own quantization error.
+            if let Some((recon, y_off, _)) = recon_y.as_mut() {
+                let y_off = *y_off;
+                let q_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
+                let q_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
+                for (c, inv_qm, q_scaled) in [(0usize, inv_qm_x, q_x), (2, inv_qm_b, q_b)] {
+                    for i in 0..size {
+                        let (v, u) = (i / row_stride, i % row_stride);
+                        recon_err[i] = if v < cy && u < cx {
+                            0.0
+                        } else {
+                            dequantized_level(quantized[c][i]) / (inv_qm[i] * q_scaled) - coeffs[c][i]
+                        };
+                    }
+                    crate::inflated_cost::reconstruct_error(
+                        ctx.idct,
+                        raw_strategy,
+                        &recon_err[..size],
+                        &mut recon_pix[..size],
+                    );
+                    let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
+                    let (px0, py0) = (opsin_origin.0 + bx * 8, opsin_origin.1 + by * 8);
+                    let plane = opsin.plane(c);
+                    let dst = recon.plane_mut(c);
+                    for y in 0..ph {
+                        let (sy, ly) = (py0 + y, y_off + by * 8 + y);
+                        if sy >= plane.ysize() || ly >= dst.ysize() {
+                            break;
+                        }
+                        let src_row = plane.row(sy);
+                        let dst_row = dst.row_mut(ly);
+                        for x in 0..pw {
+                            let (sx, lx) = (px0 + x, bx * 8 + x);
+                            if sx >= src_row.len() || lx >= dst_row.len() {
+                                break;
+                            }
+                            dst_row[lx] = src_row[sx] + recon_pix[y * pw + x];
+                        }
+                    }
                 }
             }
             // ---- Tokenize in order Y, X, B ----

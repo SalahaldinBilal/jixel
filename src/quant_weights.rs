@@ -98,7 +98,9 @@ pub(crate) struct BandOverride {
 }
 
 const QM_SS2_MIN_DISTANCE: f32 = 2.25;
-const QM_DCT8_MIN_DISTANCE: f32 = 3.5;
+const QM_DCT8_MIN_DISTANCE: f32 = 4.3;
+/// The color proxy and the tiers without rectangles keep the original coarse-DCT8 gate.
+const ORIGINAL_COARSE_DCT8_DISTANCE: f32 = 3.5;
 pub(crate) const QM_FLAT_B8_MIN_DISTANCE: f32 = 0.3;
 pub(crate) const QM_FLAT_B8_MID_MIN_DISTANCE: f32 = 1.25;
 pub(crate) const PAIR_B_FINE_BAND1: f32 = -0.35;
@@ -1608,6 +1610,7 @@ static CHROMATIC_DCT8_ROWS: [f32; 3] = [1.56, 1.07, 0.52];
 // row spends more rate than both perceptual metrics justify; retain the
 // fitted frequency shape and reduce only its base weight.
 const ORDINARY_DCT8_B_SCALE: f32 = 0.65;
+const SS2_DCT8_B_SCALE: f32 = 0.62;
 
 fn scale_dct8_base_weights(o: &mut BandOverride, mul: [f32; 3]) {
     for c in 0..3 {
@@ -1857,7 +1860,7 @@ impl DequantMatrices {
         if distance < QM_FLAT_B8_MIN_DISTANCE {
             return &DEQUANT_MATRIX_8X8[c];
         }
-        let table = if distance >= QM_DCT8_MIN_DISTANCE {
+        let table = if distance >= ORIGINAL_COARSE_DCT8_DISTANCE {
             COARSE.get_or_init(|| {
                 compute_dct8x8_matrix(&default_dct8_override(true, &FLAT_B8_BANDS_MID))
             })
@@ -1912,8 +1915,24 @@ impl DequantMatrices {
     pub(crate) fn new_fast(distance: f32) -> &'static Self {
         static HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static MID: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
-        if !(QM_FLAT_B8_MIN_DISTANCE..QM_SS2_MIN_DISTANCE).contains(&distance) {
+        static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if distance < QM_FLAT_B8_MIN_DISTANCE {
             return Self::new(distance);
+        }
+        if distance >= QM_SS2_MIN_DISTANCE {
+            let coarse = distance >= ORIGINAL_COARSE_DCT8_DISTANCE;
+            let cache = if coarse { &COARSE } else { &SS2 };
+            return cache.get_or_init(|| {
+                Self::compute_with_ordinary_fit(
+                    true,
+                    coarse,
+                    Some(&FLAT_B8_BANDS_MID),
+                    false,
+                    false,
+                    false,
+                )
+            });
         }
         let (cache, bands) = if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
             (&MID, &FLAT_B8_BANDS_MID)
@@ -2001,6 +2020,11 @@ impl DequantMatrices {
             && let Some(o) = o8.as_mut()
         {
             scale_dct8_base_weights(o, [1.0, 1.0, ORDINARY_DCT8_B_SCALE]);
+        } else if ordinary_fit
+            && use_ss2
+            && let Some(o) = o8.as_mut()
+        {
+            scale_dct8_base_weights(o, [1.0, 1.0, SS2_DCT8_B_SCALE]);
         }
         let o16 = use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16));
         let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
@@ -2692,6 +2716,10 @@ mod tests {
         for d in [2.25, 3.0, 3.5, 5.0] {
             assert_eq!(
                 DequantMatrices::new(d).custom_tables[0].unwrap().bands[2][0],
+                317.5 // F16(512 * 0.62 / 64) * 64
+            );
+            assert_eq!(
+                DequantMatrices::new_fast(d).custom_tables[0].unwrap().bands[2][0],
                 512.0
             );
         }
@@ -2708,7 +2736,10 @@ mod tests {
                 } else {
                     &FLAT_B8_BANDS_MID
                 };
-                compute_dct8x8_matrix(&default_dct8_override(d >= QM_DCT8_MIN_DISTANCE, b))
+                compute_dct8x8_matrix(&default_dct8_override(
+                    d >= ORIGINAL_COARSE_DCT8_DISTANCE,
+                    b,
+                ))
             };
             for c in 0..3 {
                 assert_eq!(DequantMatrices::color_proxy_matrix(d, c), &expected[c]);

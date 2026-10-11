@@ -162,6 +162,8 @@ const FINE_ADMIT_RATE_CORRECTION_BITS: f32 = 24.0;
 /// With learned prices the charge is this share of the candidate's rate,
 /// up to the fixed charge.
 const FINE_ADMIT_RATE_CORRECTION_SHARE: f32 = 0.1;
+/// The IDENTITY/DCT2X2 favor ramps in linearly up to this distance.
+const FINE_FAVOR_FULL_DISTANCE: f32 = 1.75;
 
 #[inline]
 fn fine_transform_bias(base: f32, distance: f32) -> f32 {
@@ -169,7 +171,7 @@ fn fine_transform_bias(base: f32, distance: f32) -> f32 {
     // and explicitly favors IDENTITY/DCT2X2 below distance 5.
     let favor = if distance < 5.0 {
         let t = (5.0 - distance) * 0.2;
-        0.4 * t * t
+        0.4 * t * t * (distance / FINE_FAVOR_FULL_DISTANCE).clamp(0.0, 1.0)
     } else {
         0.0
     };

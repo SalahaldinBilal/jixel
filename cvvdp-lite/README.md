@@ -95,7 +95,12 @@ scoring their contribution to a full frame.
 
 The original [ColorVideoVDP](https://github.com/gfxdisp/ColorVideoVDP) is the
 model authority. [fcvvdp](https://github.com/halidecx/fcvvdp) was inspected for
-comparison and performance ideas. Both revisions are pinned in `NOTICE`.
+comparison and performance ideas. The original revision is `0c1a0e093bd0f9b7c8f4e7e502f11a4d3fa7183c`;
+the fcvvdp revision is `98bd21a7a876be29ba06a29325b03624047ee850`.
+
+Project source uses the same BSD-3-Clause / Apache-2.0 licensing as Jixel.
+The original MIT copyright and permission notice for the sustained CSF data
+are retained inline in `src/tables.rs` and preserved by its generator.
 
 The implementation preserves DKLd65, independent test/reference `weber_g1`
 adaptation, sustained CASTLE CSF tables, the 1.45 red/green gain, mutual and

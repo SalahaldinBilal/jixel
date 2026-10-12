@@ -1,9 +1,37 @@
 #!/usr/bin/env python3
+# Copyright (c) Radzivon Bartoshyk 10/2026. All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without modification,
+# are permitted provided that the following conditions are met:
+#
+# 1.  Redistributions of source code must retain the above copyright notice, this
+# list of conditions and the following disclaimer.
+#
+# 2.  Redistributions in binary form must reproduce the above copyright notice,
+# this list of conditions and the following disclaimer in the documentation
+# and/or other materials provided with the distribution.
+#
+# 3.  Neither the name of the copyright holder nor the names of its
+# contributors may be used to endorse or promote products derived from
+# this software without specific prior written permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
 """Generate the static, sustained-channel CSF data from ColorVideoVDP.
 
 Usage: python3 tools/generate_tables.py /path/to/ColorVideoVDP
-The upstream revision and MIT attribution are recorded in NOTICE. This tool
-uses only Python's standard library; the Rust library does not parse JSON.
+Generated sources retain the project license header and the upstream MIT
+notice. This tool uses only Python's standard library; the Rust library does
+not parse JSON.
 """
 import argparse
 import json
@@ -24,7 +52,11 @@ def main():
     lut = json.loads((args.upstream/'pycvvdp/vvdp_data/csf_lut_weber_fixed_size.json').read_text())
     assert len(lut['L_bkg']) == len(lut['rho']) == 32
     assert all(len(row) == 32 for ch in range(1, 4) for row in lut[f'o0_c{ch}'])
-    lines = ['// Generated from ColorVideoVDP 0.5.7; see NOTICE and tools/generate_tables.py.',
+    project_header = (Path(__file__).resolve().parent/'license_header.txt').read_text().rstrip()
+    upstream_license = (args.upstream/'LICENSE').read_text().rstrip()
+    upstream_notice = '/*\n' + ''.join(' * '+line+'\n' if line else ' *\n' for line in upstream_license.splitlines()) + ' */'
+    lines = [project_header, '', upstream_notice, '',
+             '// Generated from ColorVideoVDP 0.5.7; see tools/generate_tables.py for attribution.',
              '#![allow(clippy::excessive_precision)]']
     for name, values in [('LOG_LUMINANCE', lut['L_bkg']), ('LOG_FREQUENCY', lut['rho'])]:
         lines.append(f'pub(crate) const {name}: [f32; 32] = ['+

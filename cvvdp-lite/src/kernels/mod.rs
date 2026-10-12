@@ -31,15 +31,14 @@
 //! only touch complete vectors, and scalar tails handle every remaining lane.
 //! Runtime CPU detection precedes every target-feature entry point.
 
-#[cfg(all(feature = "simd", target_arch = "aarch64"))]
-mod neon;
-#[cfg(all(
-    feature = "simd",
-    any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+#[cfg(any(
+    all(feature = "neon", target_arch = "aarch64"),
+    all(
+        any(feature = "avx", feature = "sse"),
+        any(target_arch = "x86", target_arch = "x86_64")
+    )
 ))]
-mod vector;
-#[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "x86")))]
-mod x86;
+pub(crate) mod vector;
 
 /// Arithmetic backend. Scalar uses libm powers; SIMD uses a bounded polynomial
 /// approximation to powers in the masking stage. Calibration/pooling are shared.
@@ -66,15 +65,17 @@ impl Backend {
     }
 
     pub fn is_available(self) -> bool {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
         if self == Self::Neon {
             return std::arch::is_aarch64_feature_detected!("neon");
         }
-        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "x86")))]
-        match self {
-            Self::Avx2 => return std::arch::is_x86_feature_detected!("avx2"),
-            Self::Sse2 => return std::arch::is_x86_feature_detected!("sse2"),
-            _ => {}
+        #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+        if self == Self::Avx2 {
+            return std::arch::is_x86_feature_detected!("avx2");
+        }
+        #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+        if self == Self::Sse2 {
+            return std::arch::is_x86_feature_detected!("sse2");
         }
         self == Self::Scalar
     }
@@ -143,15 +144,17 @@ pub(crate) fn contrast(
     // construction validates backend availability; the dispatch checks it again
     // by architecture, and only a supported target-feature entry is reachable.
     unsafe {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
         if backend == Backend::Neon {
-            done = neon::contrast(&mut data);
+            done = crate::neon::contrast_neon(&mut data);
         }
-        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "x86")))]
-        match backend {
-            Backend::Avx2 => done = x86::avx2_contrast(&mut data),
-            Backend::Sse2 => done = x86::sse2_contrast(&mut data),
-            _ => {}
+        #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Avx2 {
+            done = crate::avx::contrast_avx2(&mut data);
+        }
+        #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Sse2 {
+            done = crate::sse::contrast_sse2(&mut data);
         }
     }
     let _ = backend;
@@ -195,15 +198,17 @@ pub(crate) fn pool(
     // SAFETY: All input planes have the checked initialized count, and backend
     // is CPU-validated by Workspace. SIMD loops only consume complete vectors.
     unsafe {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+        #[cfg(all(feature = "neon", target_arch = "aarch64"))]
         if backend == Backend::Neon {
-            (done, squares) = neon::pool(&data);
+            (done, squares) = crate::neon::pool_neon(&data);
         }
-        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "x86")))]
-        match backend {
-            Backend::Avx2 => (done, squares) = x86::avx2_pool(&data),
-            Backend::Sse2 => (done, squares) = x86::sse2_pool(&data),
-            _ => {}
+        #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Avx2 {
+            (done, squares) = crate::avx::pool_avx2(&data);
+        }
+        #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+        if backend == Backend::Sse2 {
+            (done, squares) = crate::sse::pool_sse2(&data);
         }
     }
     let _ = backend;
@@ -225,39 +230,13 @@ pub(crate) fn pool(
     squares
 }
 
-#[allow(unused_mut, unused_unsafe)] // Scalar-only builds have no dispatch block.
-pub(crate) fn blur(backend: Backend, rows: [&[f32]; 13], dst: &mut [f32], kernel: &[f32; 13]) {
-    assert!(backend.is_available());
-    assert!(rows.iter().all(|r| r.len() == dst.len()));
-    let mut done = 0;
-    // SAFETY: Equal initialized row lengths were checked. The destination is
-    // exclusively borrowed, and SIMD accesses only whole in-bounds vectors.
-    unsafe {
-        #[cfg(all(feature = "simd", target_arch = "aarch64"))]
-        if backend == Backend::Neon {
-            done = neon::blur(rows, dst, kernel);
-        }
-        #[cfg(all(feature = "simd", any(target_arch = "x86_64", target_arch = "x86")))]
-        match backend {
-            Backend::Avx2 => done = x86::avx2_blur(rows, dst, kernel),
-            Backend::Sse2 => done = x86::sse2_blur(rows, dst, kernel),
-            _ => {}
-        }
-    }
-    let _ = backend;
-    for i in done..dst.len() {
-        let mut sum = rows[6][i] * kernel[6];
-        for k in 1..=6 {
-            sum += (rows[6 - k][i] + rows[6 + k][i]) * kernel[6 - k];
-        }
-        dst[i] = sum;
-    }
-}
-
 pub(crate) fn warmup(backend: Backend) {
-    #[cfg(all(
-        feature = "simd",
-        any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")
+    #[cfg(any(
+        all(feature = "neon", target_arch = "aarch64"),
+        all(
+            any(feature = "avx", feature = "sse"),
+            any(target_arch = "x86", target_arch = "x86_64")
+        )
     ))]
     if backend != Backend::Scalar {
         let _ = vector::power_tables();
@@ -278,15 +257,17 @@ mod tests {
         // SAFETY: Feature availability, normal positive inputs, equal lengths,
         // and normal result range are established by this test's input sweep.
         unsafe {
-            #[cfg(all(feature = "simd", target_arch = "aarch64"))]
+            #[cfg(all(feature = "neon", target_arch = "aarch64"))]
             if backend == Backend::Neon {
-                done = neon::powers(input, output, exponent);
+                done = crate::neon::powers_neon(input, output, exponent);
             }
-            #[cfg(all(feature = "simd", any(target_arch = "x86", target_arch = "x86_64")))]
-            match backend {
-                Backend::Avx2 => done = x86::avx2_powers(input, output, exponent),
-                Backend::Sse2 => done = x86::sse2_powers(input, output, exponent),
-                _ => {}
+            #[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+            if backend == Backend::Avx2 {
+                done = crate::avx::powers_avx2(input, output, exponent);
+            }
+            #[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+            if backend == Backend::Sse2 {
+                done = crate::sse::powers_sse2(input, output, exponent);
             }
         }
         for i in done..input.len() {

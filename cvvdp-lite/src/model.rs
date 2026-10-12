@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::{Backend, Error, RgbImage, kernels, pyramid, tables};
+use crate::{Backend, Error, RgbImage, blur::GaussianBlur, kernels, pyramid, tables};
 use kernels::{EPSILON, MASK_P, MASK_Q};
 
 const BASE_WEIGHT: [f64; 3] = [0.0036334486212581396, 1.6627724170684814, 4.11874532699585];
@@ -331,8 +331,7 @@ pub struct Workspace {
     expanded: [Vec<f32>; 3],
     mask: [Vec<f32>; 3],
     tmp: Vec<f32>,
-    padded_row: Vec<f32>,
-    gaussian: [f32; 13],
+    blur: GaussianBlur,
     mask_c: f32,
     dmax: f32,
     mask_zero: [f32; 3],
@@ -359,11 +358,6 @@ impl Workspace {
             return Err(Error::UnsupportedBackend);
         }
         kernels::warmup(backend);
-        let mut gaussian = std::array::from_fn(|i| (-(i as f32 - 6.0).powi(2) / 18.0).exp());
-        let sum: f32 = gaussian.iter().sum();
-        for v in &mut gaussian {
-            *v /= sum;
-        }
         let xcm_log = [
             [-0.18950105, -5.962151, -4.318346],
             [2.5655594, 0.34406713, -2.7196465],
@@ -376,8 +370,7 @@ impl Workspace {
             expanded: std::array::from_fn(|_| Vec::new()),
             mask: std::array::from_fn(|_| Vec::new()),
             tmp: Vec::new(),
-            padded_row: Vec::new(),
-            gaussian,
+            blur: GaussianBlur::new(backend),
             mask_c: 10.0_f32.powf(-0.7954971),
             dmax: 10.0_f32.powf(2.5642455),
             mask_zero: MASK_Q.map(|q| EPSILON.powf(q)),
@@ -398,7 +391,7 @@ impl Workspace {
         for plane in &mut self.mask {
             pyramid::ensure_len(plane, count);
         }
-        pyramid::ensure_len(&mut self.padded_row, width + 12);
+        self.blur.reserve(width, height);
         Ok(())
     }
 
@@ -410,7 +403,8 @@ impl Workspace {
             pyramid::ensure_len(&mut self.next[c], next_count);
             pyramid::ensure_len(&mut self.expanded[c], count);
         }
-        pyramid::ensure_len(&mut self.tmp, count);
+        let tmp_count = (width * height.div_ceil(2)).max(width.div_ceil(2) * height);
+        pyramid::ensure_len(&mut self.tmp, tmp_count);
         Ok(count)
     }
 
@@ -421,9 +415,10 @@ impl Workspace {
             .chain(&self.next)
             .chain(&self.expanded)
             .chain(&self.mask)
-            .chain([&self.tmp, &self.padded_row])
+            .chain([&self.tmp])
             .map(|v| v.capacity() * std::mem::size_of::<f32>())
             .sum::<usize>()
+            + self.blur.allocated_bytes()
             + self.band_scores.capacity() * std::mem::size_of::<BandScore>()
     }
 
@@ -493,15 +488,7 @@ impl Workspace {
                     band_scale,
                 );
                 for c in 0..3 {
-                    pyramid::mask_blur(
-                        &mut self.mask[c][..count],
-                        w,
-                        h,
-                        &mut self.tmp,
-                        &self.gaussian,
-                        &mut self.padded_row,
-                        self.backend,
-                    );
+                    self.blur.blur(&mut self.mask[c][..count], w, h);
                 }
                 let sums = kernels::pool(
                     self.backend,

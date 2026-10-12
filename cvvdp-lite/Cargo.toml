@@ -8,8 +8,12 @@ license = "BSD-3-Clause OR Apache-2.0"
 publish = false
 
 [features]
-default = ["simd"]
-simd = []
+default = ["avx", "neon", "sse"]
+avx = []
+neon = []
+sse = []
+# Compatibility alias for callers that enabled all SIMD backends together.
+simd = ["avx", "neon", "sse"]
 
 [lints.rust]
 unsafe_code = "deny"

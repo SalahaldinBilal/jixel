@@ -38,8 +38,9 @@ are cached; test pyramids stream one scale at a time. Candidate scratch
 allocations are reserved before evaluation, including the first candidate.
 Buffers keep their original orientation after odd pyramid depths, and scale
 processing no longer repeatedly grows and zeroes vectors. Masking blurs write
-back into their activity buffers, saving three full-resolution float planes. The reference is immutable and `Send + Sync`; use
-independent evaluators on the encoder's existing worker pool when needed.
+back into their activity buffers. A reusable 13-row ring streams horizontal
+results into the vertical pass, avoiding a full-frame blur intermediate. The
+reference is immutable and `Send + Sync`; use independent evaluators on the encoder's existing worker pool when needed.
 
 For a long-lived arbiter worker, keep `Workspace` independent of reference
 lifetimes and reuse it for reference preparation too:
@@ -71,7 +72,7 @@ its temporary analysis buffers reuse the workspace. `Evaluator::into_workspace`
 and `PreparedReference::evaluator_with` support moving existing evaluator state
 between references. Both state and reference expose `allocated_bytes()` for
 worker memory budgeting; storage grows as needed and does not shrink. A fresh
-768×512 worker retains approximately 16.1 MiB of scratch plus a shared 12.0 MiB
+768×512 worker retains approximately 15.4 MiB of scratch plus a shared 12.0 MiB
 reference cache. Use one workspace per concurrent worker and share references.
 
 `RgbImage` accepts strided interleaved sRGB `u8`, interleaved sRGB `f32`, or
@@ -134,8 +135,12 @@ It does not claim improved perceptual calibration over ColorVideoVDP.
 
 ## SIMD and numerical behavior
 
-The default `simd` feature selects NEON on AArch64, AVX2 on supported x86 CPUs,
-and SSE2 on older x86 CPUs. CPU features are detected and cached. Other targets
+The default `neon`, `avx`, and `sse` features match the main repository's
+architecture split: NEON on AArch64, AVX2 on supported x86 CPUs, and SSE2 on
+older x86 CPUs. Each backend has its own `src/<architecture>/mod.rs`,
+`metric.rs`, and `blur.rs`. The `simd` feature remains an alias enabling all
+three. Build individual backends with `--no-default-features --features neon`
+(or `avx` / `sse`). CPU features are detected and cached. Other targets
 use the scalar fallback. `Workspace::with_backend(Backend::Scalar)` explicitly
 selects libm masking powers; `--no-default-features` compiles out all intrinsics.
 Unsupported explicit backend requests return an error before entering CPU
@@ -144,9 +149,12 @@ instructions. The existing caller's worker pool owns concurrency.
 SIMD accelerates contrast weighting, the separable Gaussian masking blur, and
 masked-difference pooling. NEON/SSE2 process four pixels and AVX2 eight. Kernels
 use exact vector division, shared model equations, scalar tails, and f64
-reduction accumulators. Unsafe code is confined to the private kernel module,
-whose safe dispatch validates lengths and CPU availability; other library
-modules deny unsafe code.
+reduction accumulators. The blur uses the main tree's center-plus-symmetric-pairs
+kernels with four independent vector accumulators, retaining the sigma-3
+13-tap kernel and exclusive reflection at both edges. Cached function pointers
+select its horizontal and vertical kernels once per workspace. Multiply/add
+order is preserved without requiring FMA. Unsafe code is confined to private
+SIMD modules and validated dispatch; other library modules deny unsafe code.
 
 Masking powers decompose a positive float into a centered mantissa and integer
 exponent. A degree-ten binomial polynomial evaluates the mantissa power, and
@@ -170,13 +178,15 @@ cargo build -p cvvdp-lite --release --example score_raw --offline
 Regression tests include 39 pinned upstream predictions, zero-allocation
 scoring on the first/repeated candidate and across smaller references, backend
 agreement for padded tails/display extremes, invalid input recovery, tiny
-images, and transpose symmetry. Native NEON tests and AddressSanitizer pass;
+images, and transpose symmetry. Dedicated blur tests compare against literal
+13-tap convolution for all widths 1–69 and heights around the cutoff and ring
+boundaries, and check retained storage across dimensions. Native NEON tests and AddressSanitizer pass;
 SSE2 tests execute under Rosetta; this Rosetta runtime does not expose AVX2,
 so AVX2 is build/lint checked and awaits native x86 runtime validation.
 Strict Clippy also passes for the native,
 x86, and scalar-only configurations. The WebAssembly fallback compiles.
 
-`validation.json` records 51 comparisons against the corrected original,
+The upstream validation pass covers 51 comparisons against the corrected original,
 including three distortions on each of four Kodak images. The maximum error
 is **0.000001233 JOD**. Its single-thread 768×512 mildly noisy Kodak case
 measured 10.96 ms per cached NEON candidate, 50.34 ms for fcvvdp with a reused
@@ -184,8 +194,8 @@ context, and 270.24 ms for original PyTorch CPU. Rust reference preparation
 took 14.45 ms; reserving candidate state took 0.43 ms. These are local smoke
 measurements, not a broad perceptual ranking or native x86 performance study.
 
-`optimization-benchmark.json` compares the implementation before this
-optimization pass, the current scalar backend, and NEON on the same inputs.
+The initial optimization benchmark compared the implementation before SIMD
+optimization, the scalar backend, and NEON on the same inputs.
 Three trials alternate execution order; each trial averages seven cached
 comparisons. Image decoding and file I/O are outside the timed operations.
 
@@ -198,8 +208,18 @@ comparisons. Image decoding and file I/O are outside the timed operations.
 | 3840×2160 | 1056.86 | 639.08 | 329.00 | 3.21× |
 
 The resized Kodak inputs use deterministic RGB noise; numerical agreement is
-also checked separately on stronger distortions. The baseline binary's hash
-and complete trial outputs are retained in the report.
+also checked separately on stronger distortions. The benchmark harness records binary hashes and complete trial outputs in its
+requested output report.
+
+The architecture split and streaming blur pass was also compared directly
+with the previously optimized NEON binary, using five alternating trials of
+11 cached candidates. Predictions were identical in every case. Full scoring
+improved about 1% at 768×512 and 6% at 1920×1080; the 4K run was effectively
+unchanged. The isolated blur improved about 18% and 26% at the first two
+resolutions. Small-image timing was noisy and did not show a consistent gain.
+The 4K workspace retains 324.5 MiB instead of 340.2 MiB; at 768×512 it retains
+15.4 MiB instead of 16.1 MiB. These measurements are local single-thread NEON
+results; other scoring stages remain the larger optimization opportunities.
 
 Reproduce the benchmark with a pre-optimization `score_raw` binary if available:
 

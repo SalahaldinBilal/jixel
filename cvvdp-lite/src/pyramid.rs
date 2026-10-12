@@ -85,40 +85,6 @@ pub(crate) fn expand(src: &[f32], w: usize, h: usize, dst: &mut Vec<f32>, tmp: &
     }
 }
 
-// Torchvision GaussianBlur(13, 3) uses reflect padding excluding the edge.
-// The model deliberately skips this blur when either dimension is <= 6.
-pub(crate) fn mask_blur(
-    mask: &mut [f32],
-    w: usize,
-    h: usize,
-    tmp: &mut Vec<f32>,
-    kernel: &[f32; 13],
-    padded: &mut Vec<f32>,
-    backend: crate::Backend,
-) {
-    if w <= 6 || h <= 6 {
-        return;
-    }
-    ensure_len(tmp, w * h);
-    ensure_len(padded, w + 12);
-    for y in 0..h {
-        padded[6..w + 6].copy_from_slice(&mask[y * w..(y + 1) * w]);
-        for k in 0..6 {
-            padded[k] = mask[y * w + reflect_exclusive(k as isize - 6, w)];
-            padded[w + 6 + k] = mask[y * w + reflect_exclusive((w + k) as isize, w)];
-        }
-        let rows = std::array::from_fn(|k| &padded[k..k + w]);
-        crate::kernels::blur(backend, rows, &mut tmp[y * w..(y + 1) * w], kernel);
-    }
-    for y in 0..h {
-        let rows = std::array::from_fn(|k| {
-            let offset = reflect_exclusive(y as isize + k as isize - 6, h) * w;
-            &tmp[offset..offset + w]
-        });
-        crate::kernels::blur(backend, rows, &mut mask[y * w..(y + 1) * w], kernel);
-    }
-}
-
 fn reflect(i: isize, n: usize) -> usize {
     if n == 1 {
         return 0;
@@ -127,16 +93,6 @@ fn reflect(i: isize, n: usize) -> usize {
         (-i - 1) as usize
     } else if i >= n as isize {
         (2 * n) - i as usize - 1
-    } else {
-        i as usize
-    }
-}
-
-fn reflect_exclusive(i: isize, n: usize) -> usize {
-    if i < 0 {
-        (-i) as usize
-    } else if i >= n as isize {
-        (2 * n) - i as usize - 2
     } else {
         i as usize
     }

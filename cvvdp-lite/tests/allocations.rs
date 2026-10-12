@@ -100,7 +100,16 @@ fn reserved_workspace_allocates_nothing_on_first_or_repeated_candidates() {
     let mut workspace = Workspace::new();
     workspace.reserve(129, 513).unwrap();
     let bytes = workspace.allocated_bytes();
-    for (w, h) in [(65, 65), (31, 33), (63, 64), (128, 127), (1, 17)] {
+    for (w, h) in [
+        (129, 513),
+        (7, 513),
+        (129, 7),
+        (65, 65),
+        (31, 33),
+        (63, 64),
+        (128, 127),
+        (1, 17),
+    ] {
         let pixels: Vec<u8> = (0..w * h * 3)
             .map(|i| ((i * 31 + i / 3) % 256) as u8)
             .collect();

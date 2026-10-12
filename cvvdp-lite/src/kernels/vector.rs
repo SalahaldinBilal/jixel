@@ -36,7 +36,7 @@ use super::{Contrast, EPSILON, MASK_P, MASK_Q, Pool};
 /// # Safety
 /// Private vector implementations must provide LANES initialized f32 values,
 /// exact lane-wise arithmetic/bit operations, and f64 reduction accumulators.
-pub(super) unsafe trait Vector: Copy {
+pub(crate) unsafe trait Vector: Copy {
     type F: Copy;
     type D: Copy;
     const LANES: usize;
@@ -87,7 +87,7 @@ pub(super) fn power_tables() -> &'static [PowerTable; 4] {
 
 #[cfg(test)]
 #[inline(always)]
-pub(super) unsafe fn powers<V: Vector>(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
+pub(crate) unsafe fn powers<V: Vector>(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
     let done = input.len() / V::LANES * V::LANES;
     let table = PowerTable::new(exponent);
     // SAFETY: The test wrapper checks CPU availability, input domain, and lengths.
@@ -101,7 +101,7 @@ pub(super) unsafe fn powers<V: Vector>(input: &[f32], output: &mut [f32], expone
 }
 
 #[inline(always)]
-pub(super) unsafe fn pow<V: Vector>(x: V::F, table: &PowerTable) -> V::F {
+unsafe fn pow<V: Vector>(x: V::F, table: &PowerTable) -> V::F {
     // SAFETY: Positive normal inputs and enabled CPU features are guaranteed
     // by the caller. Vector::scale masks lookup indices to the table bounds.
     unsafe {
@@ -119,7 +119,9 @@ pub(super) unsafe fn pow<V: Vector>(x: V::F, table: &PowerTable) -> V::F {
 }
 
 #[inline(always)]
-pub(super) unsafe fn contrast<V: Vector>(data: &mut Contrast<'_>) -> usize {
+// CPU features are a caller precondition: this generic helper has no target
+// feature attribute of its own, so it must remain behind the unsafe ISA entry.
+pub(crate) unsafe fn contrast<V: Vector>(data: &mut Contrast<'_>) -> usize {
     let done = data.current[0].len() / V::LANES * V::LANES;
     // SAFETY: The safe wrapper checked all plane lengths. Each load/store
     // processes LANES initialized, non-overlapping elements before done.
@@ -150,7 +152,7 @@ pub(super) unsafe fn contrast<V: Vector>(data: &mut Contrast<'_>) -> usize {
 }
 
 #[inline(always)]
-pub(super) unsafe fn pool<V: Vector>(data: &Pool<'_>) -> (usize, [f64; 3]) {
+pub(crate) unsafe fn pool<V: Vector>(data: &Pool<'_>) -> (usize, [f64; 3]) {
     let done = data.current[0].len() / V::LANES * V::LANES;
     let p = data.parameters;
     let powers = power_tables();
@@ -196,29 +198,4 @@ pub(super) unsafe fn pool<V: Vector>(data: &Pool<'_>) -> (usize, [f64; 3]) {
             std::array::from_fn(|c| V::sum_d(lo[c]) + V::sum_d(hi[c])),
         )
     }
-}
-
-#[inline(always)]
-pub(super) unsafe fn blur<V: Vector>(
-    rows: [&[f32]; 13],
-    dst: &mut [f32],
-    kernel: &[f32; 13],
-) -> usize {
-    let done = dst.len() / V::LANES * V::LANES;
-    // SAFETY: The safe wrapper checked row lengths against dst; only complete
-    // vectors are loaded/stored, and the destination cannot alias the sources.
-    unsafe {
-        for i in (0..done).step_by(V::LANES) {
-            let mut sum = V::mul(V::load(rows[6].as_ptr().add(i)), V::splat(kernel[6]));
-            for k in 1..=6 {
-                let pair = V::add(
-                    V::load(rows[6 - k].as_ptr().add(i)),
-                    V::load(rows[6 + k].as_ptr().add(i)),
-                );
-                sum = V::add(sum, V::mul(pair, V::splat(kernel[6 - k])));
-            }
-            V::store(dst.as_mut_ptr().add(i), sum);
-        }
-    }
-    done
 }

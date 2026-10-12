@@ -51,11 +51,21 @@
 //! # Ok::<(), cvvdp_lite::Error>(())
 //! ```
 
+#[cfg(all(feature = "avx", any(target_arch = "x86_64", target_arch = "x86")))]
+#[allow(unsafe_code)]
+mod avx;
+mod blur;
 mod image;
 #[allow(unsafe_code)]
 mod kernels;
 mod model;
+#[cfg(all(feature = "neon", target_arch = "aarch64"))]
+#[allow(unsafe_code)]
+mod neon;
 mod pyramid;
+#[cfg(all(feature = "sse", any(target_arch = "x86_64", target_arch = "x86")))]
+#[allow(unsafe_code)]
+mod sse;
 mod tables;
 
 pub use image::RgbImage;

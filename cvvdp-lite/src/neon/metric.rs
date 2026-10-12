@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use super::{
+use crate::kernels::{
     Contrast, Pool,
     vector::{self, Vector},
 };
@@ -155,7 +155,7 @@ unsafe impl Vector for Neon {
         unsafe {
             let a = vcvt_f64_f32(vget_low_f32(value));
             let b = vcvt_high_f64_f32(value);
-            let e = vdupq_n_f64(2.0 * (super::EPSILON as f64));
+            let e = vdupq_n_f64(2.0 * (crate::kernels::EPSILON as f64));
             *lo = vaddq_f64(*lo, vaddq_f64(vmulq_f64(a, a), vmulq_f64(a, e)));
             *hi = vaddq_f64(*hi, vaddq_f64(vmulq_f64(b, b), vmulq_f64(b, e)));
         }
@@ -163,23 +163,18 @@ unsafe impl Vector for Neon {
 }
 
 #[target_feature(enable = "neon")]
-pub(super) unsafe fn contrast(data: &mut Contrast<'_>) -> usize {
+pub(crate) fn contrast_neon(data: &mut Contrast<'_>) -> usize {
     // SAFETY: The safe wrapper validates all plane lengths and NEON availability.
     unsafe { vector::contrast::<Neon>(data) }
 }
 #[target_feature(enable = "neon")]
-pub(super) unsafe fn pool(data: &Pool<'_>) -> (usize, [f64; 3]) {
+pub(crate) fn pool_neon(data: &Pool<'_>) -> (usize, [f64; 3]) {
     // SAFETY: The safe wrapper validates all plane lengths and NEON availability.
     unsafe { vector::pool::<Neon>(data) }
 }
-#[target_feature(enable = "neon")]
-pub(super) unsafe fn blur(rows: [&[f32]; 13], dst: &mut [f32], kernel: &[f32; 13]) -> usize {
-    // SAFETY: The safe wrapper validates initialized row lengths and NEON availability.
-    unsafe { vector::blur::<Neon>(rows, dst, kernel) }
-}
 #[cfg(test)]
 #[target_feature(enable = "neon")]
-pub(super) unsafe fn powers(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
+pub(crate) fn powers_neon(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
     // SAFETY: The test wrapper checks lengths, domain, and NEON availability.
     unsafe { vector::powers::<Neon>(input, output, exponent) }
 }

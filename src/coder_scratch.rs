@@ -436,12 +436,12 @@ mod tests {
     #[test]
     fn scratch_structs_are_only_small_heap_handles() {
         // MA split scoring keeps four buffers (plans, LUTs, histogram, counts).
-        assert!(size_of::<CoderScratch>() <= 1152);
+        assert!(size_of::<CoderScratch>() <= 1184);
         assert!(size_of::<LazyScratch<FineMosaicScratch>>() <= 32);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);
         assert!(size_of::<LazyScratch<Box<LzEntropyScratch>>>() <= 32);
-        assert!(size_of::<AcGroupScratch>() <= 128);
+        assert!(size_of::<AcGroupScratch>() <= 160);
     }
 
     #[test]

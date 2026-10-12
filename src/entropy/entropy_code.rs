@@ -30,6 +30,7 @@ use super::ans::{ANS_LOG_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram};
 use super::prefix_code::{ALPHABET_SIZE, PrefixCode};
 use super::token::{HybridUintConfig, Token, uint_encode_with_config};
 use crate::adaptive_quant::dirty_log2f;
+use crate::entropy::f_log2;
 
 pub(crate) struct EntropyCode<'a> {
     pub(crate) context_map: &'a [u8],
@@ -150,6 +151,38 @@ impl FrozenTokenPrices {
         }
         let (symbol, extra_bits, _) = uint_encode_with_config(token.value, self.configs[cluster]);
         self.symbol_bits[cluster][symbol as usize] + extra_bits as f32
+    }
+
+    /// Shannon bits of `streams` under this code's clustering and hybrid-uint
+    /// configs with the symbol histograms rebuilt from the streams themselves:
+    /// the cost of an adapted code, without its header.
+    pub(crate) fn adaptive_bits<'a>(&self, streams: impl Iterator<Item = &'a [Token]>) -> f32 {
+        let clusters = self.configs.len();
+        let mut counts = vec![0u32; clusters * ALPHABET_SIZE];
+        let mut extra = 0u64;
+        for stream in streams {
+            for token in stream {
+                let cluster = self.context_map[token.context as usize] as usize;
+                let (symbol, extra_bits, _) =
+                    uint_encode_with_config(token.value, self.configs[cluster]);
+                counts[cluster * ALPHABET_SIZE + (symbol as usize).min(ALPHABET_SIZE - 1)] += 1;
+                extra += u64::from(extra_bits);
+            }
+        }
+        let mut bits = extra as f64;
+        for hist in counts.as_chunks::<ALPHABET_SIZE>().0 {
+            let total: u32 = hist.iter().sum();
+            if total == 0 {
+                continue;
+            }
+            let log_total = f_log2(total as f64);
+            for &n in hist {
+                if n > 0 {
+                    bits += n as f64 * (log_total - f_log2(n as f64));
+                }
+            }
+        }
+        bits as f32
     }
 
     /// Prices the adjacent `prev = 0/1` coefficient contexts together.

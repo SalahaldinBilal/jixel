@@ -203,6 +203,64 @@ fn natural_scan_64x32() -> &'static [u32] {
     })
 }
 
+/// libjxl `CoeffOrderAndLut` natural order for a `cx >= cy` block in its
+/// normalized `cy*8`-row x `cx*8`-column layout (scan position -> raw index).
+fn natural_scan_generic(cx: usize, cy: usize) -> Vec<u32> {
+    let size = cx * cy * 64;
+    let side = cx * 8;
+    let xs = cx / cy;
+    let xsm = xs - 1;
+    let xss = xs.trailing_zeros() as usize;
+    let mut out = vec![0u32; size];
+    let mut cur = cx * cy;
+    for i in 0..side {
+        for j in 0..=i {
+            let (mut x, mut y) = (j, i - j);
+            if i % 2 != 0 {
+                std::mem::swap(&mut x, &mut y);
+            }
+            if y & xsm != 0 {
+                continue;
+            }
+            y >>= xss;
+            let val = if x < cx && y < cy {
+                y * cx + x
+            } else {
+                cur += 1;
+                cur - 1
+            };
+            out[val] = (y * side + x) as u32;
+        }
+    }
+    for ip in (1..side).rev() {
+        let i = ip - 1;
+        for j in 0..=i {
+            let (mut x, mut y) = (side - 1 - (i - j), side - 1 - j);
+            if i % 2 != 0 {
+                std::mem::swap(&mut x, &mut y);
+            }
+            if y & xsm != 0 {
+                continue;
+            }
+            y >>= xss;
+            out[cur] = (y * side + x) as u32;
+            cur += 1;
+        }
+    }
+    debug_assert_eq!(cur, size);
+    out
+}
+
+fn natural_scan_128() -> &'static [u32] {
+    static SCAN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    SCAN.get_or_init(|| natural_scan_generic(16, 16))
+}
+
+fn natural_scan_128x64() -> &'static [u32] {
+    static SCAN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    SCAN.get_or_init(|| natural_scan_generic(16, 8))
+}
+
 /// Natural scan position of every raw coefficient index, for one order group —
 /// the inverse of jixel's `K_COEFF_ORDER_*` tables (which map scan position to
 /// raw index). This is the space permutations are expressed in.
@@ -242,6 +300,14 @@ pub(crate) fn natural_position_lut(size: usize) -> Vec<u32> {
             .iter()
             .enumerate()
             .for_each(|(k, &r)| set(k, r as usize)),
+        8192 => natural_scan_128x64()
+            .iter()
+            .enumerate()
+            .for_each(|(k, &r)| set(k, r as usize)),
+        16384 => natural_scan_128()
+            .iter()
+            .enumerate()
+            .for_each(|(k, &r)| set(k, r as usize)),
         _ => unreachable!("no natural order table for size {size}"),
     }
     lut
@@ -267,6 +333,9 @@ pub(crate) fn scan_pos_lut(width: usize, height: usize) -> &'static [u32] {
             (64, 32),
             (32, 64),
             (64, 64),
+            (128, 64),
+            (64, 128),
+            (128, 128),
         ];
         shapes
             .iter()
@@ -595,6 +664,8 @@ impl CoeffOrders {
             None => match crate::ac_context::K_STRATEGY_ORDER[strategy_code as usize] {
                 7 => natural_scan_64(),
                 8 => natural_scan_64x32(),
+                9 => natural_scan_128(),
+                10 => natural_scan_128x64(),
                 order => unreachable!("unsupported natural-only order {order}"),
             },
         }

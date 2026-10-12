@@ -311,7 +311,7 @@ fn prune_control_points(
         points.remove(i);
         indices.remove(i);
         errors.remove(i);
-        // A deletion only changes the tangents of neighbouring spans.
+        // A deletion only changes the tangents of neighboring spans.
         let end = (i + 4).min(errors.len());
         errors[i.saturating_sub(3)..end].fill(None);
     }
@@ -711,20 +711,20 @@ impl FitSystem {
                     continue;
                 }
                 let (nx, ny) = (nx as usize, ny as usize);
-                let neighbour = if nx >= x0 && ny >= y0 && nx < x0 + bw && ny < y0 + bh {
+                let neighbor = if nx >= x0 && ny >= y0 && nx < x0 + bw && ny < y0 + bh {
                     scratch.slots[(ny - y0) * bw + nx - x0]
                 } else {
                     -1
                 };
                 // Interior edges once, and all edges of the finite support.
-                if neighbour >= 0 && (neighbour as usize) < slot {
+                if neighbor >= 0 && (neighbor as usize) < slot {
                     continue;
                 }
                 let mut diff = [0.0; MAX_COEFFS];
                 for i in 0..k {
                     diff[i] = row[i]
-                        - if neighbour >= 0 {
-                            scratch.rows[neighbour as usize * k + i]
+                        - if neighbor >= 0 {
+                            scratch.rows[neighbor as usize * k + i]
                         } else {
                             0.0
                         };
@@ -1430,7 +1430,7 @@ pub(super) fn fit_candidates(
                             .then_some(candidate);
                     }
                     let i = i - long_lines.joined.len();
-                    // Lean stand-ins still come last, after the coloured and
+                    // Lean stand-ins still come last, after the colored and
                     // curved candidates and the well-supported straight joins.
                     if i >= chains.len() + extensions.len() {
                         let line = &long_lines.chains[i - chains.len() - extensions.len()];
@@ -1575,15 +1575,15 @@ mod tests {
     }
 
     #[test]
-    fn joined_line_fit_preserves_colour_and_rejects_bends() {
+    fn joined_line_fit_preserves_color_and_rejects_bends() {
         let ctx = EncodingContext::default();
         let (w, h) = (256, 96);
-        let targets = [0.012f32, -0.35, -0.15].map(|colour| {
+        let targets = [0.012f32, -0.35, -0.15].map(|color| {
             (0..w * h)
                 .map(|i| {
                     if (16..240).contains(&(i % w)) {
                         let d = (i / w) as f32 - 48.0;
-                        colour * (-0.5 * (d / 0.6).powi(2)).exp()
+                        color * (-0.5 * (d / 0.6).powi(2)).exp()
                     } else {
                         0.0
                     }

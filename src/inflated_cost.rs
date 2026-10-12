@@ -217,7 +217,7 @@ fn fused_coefficient_scoring_preserves_distortion_and_coding_levels() {
                         let inverse: Vec<_> = (0..size)
                             .map(|i| if i % 3 == 0 { 1.0 } else { 0.125 })
                             .collect();
-                        // Include both signs of exact ties and their neighbouring
+                        // Include both signs of exact ties and their neighboring
                         // floats, zeros, and larger levels across every quadrant.
                         let values = [
                             0.0f32,
@@ -637,6 +637,9 @@ pub(crate) fn strategy_pixel_dims(strategy: u8) -> (usize, usize) {
         STRATEGY_DCT32X32 => (32, 32),
         STRATEGY_DCT64X64 => (64, 64),
         STRATEGY_DCT64X32 => (32, 64),
+        crate::dc_group_data::STRATEGY_DCT128X128 => (128, 128),
+        crate::dc_group_data::STRATEGY_DCT128X64 => (64, 128),
+        crate::dc_group_data::STRATEGY_DCT64X128 => (128, 64),
         STRATEGY_DCT32X64 => (64, 32),
         _ => (8, 8),
     }
@@ -776,6 +779,15 @@ pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
         STRATEGY_DCT64X64 => fwd_input!(dct::dct64x64_scalar_input, 4096, 64, 64),
         STRATEGY_DCT64X32 => fwd_input!(dct::dct64x32_scalar_input, 2048, 32, 64),
         STRATEGY_DCT32X64 => fwd_input!(dct::dct32x64_scalar_input, 2048, 64, 32),
+        crate::dc_group_data::STRATEGY_DCT128X128 => {
+            crate::dct128::dct128x128(DctInput::new(input, 128), out)
+        }
+        crate::dc_group_data::STRATEGY_DCT128X64 => {
+            crate::dct128::dct128x64(DctInput::new(input, 64), out)
+        }
+        crate::dc_group_data::STRATEGY_DCT64X128 => {
+            crate::dct128::dct64x128(DctInput::new(input, 128), out)
+        }
         _ => fwd!(dct::dct8x8, 64),
     }
 }
@@ -825,6 +837,9 @@ pub(crate) fn reconstruct_error(
         STRATEGY_DCT64X64 => inverse!(idct.idct64x64, 4096, 64, 64),
         STRATEGY_DCT64X32 => inverse!(idct.idct64x32, 2048, 64, 32),
         STRATEGY_DCT32X64 => inverse!(idct.idct32x64, 2048, 64, 32),
+        crate::dc_group_data::STRATEGY_DCT128X128 => inverse!(idct.idct128x128, 16384, 128, 128),
+        crate::dc_group_data::STRATEGY_DCT128X64 => inverse!(idct.idct128x64, 8192, 128, 64),
+        crate::dc_group_data::STRATEGY_DCT64X128 => inverse!(idct.idct64x128, 8192, 128, 64),
         _ => {
             let n = strategy_pixel_count(strategy);
             let matrix = inverse_matrix(strategy);
@@ -2196,6 +2211,7 @@ mod tests {
         ];
         for strategy in (0..NUM_STRATEGIES as u8)
             .filter(|&s| !matches!(s, STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64))
+            .filter(|&s| !crate::dc_group_data::is_128_strategy(s))
         {
             let (w, h) = strategy_pixel_dims(strategy);
             let (cx, cy) = (w.max(h), w.min(h));

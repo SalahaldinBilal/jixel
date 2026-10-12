@@ -322,6 +322,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         brotli_compression: None,
         orientation: base.orientation,
         lossless: gm.lossless,
+        fill_invisible: base.fill_invisible,
         progressive: false,
         patches: base.patches,
         #[cfg(feature = "splines")]

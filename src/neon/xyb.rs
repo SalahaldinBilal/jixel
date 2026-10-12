@@ -32,6 +32,82 @@ use std::arch::aarch64::*;
 
 #[inline]
 #[target_feature(enable = "neon")]
+fn xyb_to_rgb_neon(
+    m: &XybMatrix,
+    x: float32x4_t,
+    y: float32x4_t,
+    b: float32x4_t,
+) -> (float32x4_t, float32x4_t, float32x4_t) {
+    let cube = |value: float32x4_t| {
+        let value = vsubq_f32(value, vdupq_n_f32(NEG_BIAS_CBRT));
+        // Keep the cube and bias subtraction separate, as in the scalar inverse.
+        vsubq_f32(
+            vmulq_f32(vmulq_f32(value, value), value),
+            vdupq_n_f32(OPSIN_BIAS),
+        )
+    };
+    let m0 = cube(vaddq_f32(y, x));
+    let m1 = cube(vsubq_f32(y, x));
+    let m2 = cube(b);
+    // Match dct::fmla, including builds that do not fuse the inverse matrix.
+    let row = |offset: usize| {
+        let value = vmulq_n_f32(m2, m.inv[offset + 2]);
+        let value = vfmaq_n_f32(value, m1, m.inv[offset + 1]);
+        vfmaq_n_f32(value, m0, m.inv[offset])
+    };
+    (row(0), row(3), row(6))
+}
+
+/// # Safety
+/// The CPU must support the enabled target features and all six slices must
+/// have equal lengths. Only complete SIMD vectors are read and written.
+#[target_feature(enable = "neon")]
+pub(crate) unsafe fn to_linear_rows_neon(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [f32]; 3],
+) -> usize {
+    let [r, g, b] = output;
+    let done = unsafe { to_linear_rows::<4>(m, input, [r, g, b]) };
+    done + unsafe {
+        to_linear_rows::<1>(
+            m,
+            input.map(|row| &row[done..]),
+            [&mut r[done..], &mut g[done..], &mut b[done..]],
+        )
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn to_linear_rows<const N: usize>(
+    m: &XybMatrix,
+    [x, y, b]: [&[f32]; 3],
+    [r, g, out_b]: [&mut [f32]; 3],
+) -> usize {
+    const LANES: usize = 4;
+    let done = r.len() / (N * LANES) * (N * LANES);
+    for start in (0..done).step_by(N * LANES) {
+        for lane in 0..N {
+            let i = start + lane * LANES;
+            // The caller's equal-length contract and complete-vector loop
+            // bound cover every unaligned load and store.
+            unsafe {
+                let xv = vld1q_f32(x.as_ptr().add(i));
+                let yv = vld1q_f32(y.as_ptr().add(i));
+                let bv = vld1q_f32(b.as_ptr().add(i));
+                let (rv, gv, bv) = xyb_to_rgb_neon(m, xv, yv, bv);
+                vst1q_f32(r.as_mut_ptr().add(i), rv);
+                vst1q_f32(g.as_mut_ptr().add(i), gv);
+                vst1q_f32(out_b.as_mut_ptr().add(i), bv);
+            }
+        }
+    }
+    done
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
 fn halley_cbrt<const SCALAR_ORDER: bool>(x: float32x4_t, a: float32x4_t) -> float32x4_t {
     let tx = vmulq_f32(vmulq_f32(x, x), x);
     let num = vfmaq_n_f32(tx, a, 2.0);

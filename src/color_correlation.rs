@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::adaptive_quant::{dirty_log2f, dirty_log2p1f};
+use crate::adaptive_quant::dirty_log2f;
 use crate::dc_group_data::DcGroupData;
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
@@ -62,59 +62,63 @@ pub(crate) type CflRdoBlockFn = fn(
 );
 
 pub(crate) type CflRdoStatsFn = fn(&[f32], &[f32]) -> [f32; 4];
-pub(crate) type CflClosedLoopCostFn = fn(&[f32], &[f32], f32, &[f32; 63]) -> [f32; 2];
+pub(crate) type CflRdCostFn = fn(&[f32], &[f32], f32, f32, f32) -> f32;
 
+/// Context-free rate of a coded residual coefficient in bits: a nonzero plus
+/// its magnitude. The tile is scored before any entropy code exists.
+pub(crate) const CFL_NONZERO_BITS: f32 = 4.0;
+pub(crate) const CFL_MAGNITUDE_BITS: f32 = 1.5;
+
+/// Per-coefficient RDOQ decision on the residual `s - factor*m`, in
+/// quant-step units: a coefficient is zeroed (its error is the whole
+/// residual) or coded at its rounded level when `weight*err^2 + lambda*bits`
+/// is lower, the rule the chroma trellis applies afterwards. Returns the sum
+/// of the winning costs.
 #[allow(dead_code)]
-pub(crate) fn cfl_closed_loop_cost_scalar(
+pub(crate) fn cfl_rd_cost_scalar(
     m: &[f32],
     s: &[f32],
     factor: f32,
-    thresholds: &[f32; 63],
-) -> [f32; 2] {
-    let mut distortion = 0.0f32;
-    let mut coeff_bits = 0.0f32;
-    let mut coeff = 1usize;
+    weight: f32,
+    lambda: f32,
+) -> f32 {
+    let mut cost = 0.0f32;
     for (&mv, &sv) in m.iter().zip(s) {
         let residual = sv - factor * mv;
-        let level = if residual.abs() >= thresholds[coeff - 1] {
-            residual.round()
-        } else {
-            0.0
-        };
-        let reconstructed = crate::group::dequantized_level_f32(level);
-        let quant_error = residual - reconstructed;
-        distortion += quant_error.abs() + 0.15 * residual.abs();
+        let mut best = weight * residual * residual;
+        let level = residual.round();
         if level != 0.0 {
-            coeff_bits += 1.0 + dirty_log2p1f(level.abs());
+            let coded_err = residual - crate::group::dequantized_level_f32(level);
+            let coded = weight * coded_err * coded_err
+                + lambda * (CFL_NONZERO_BITS + CFL_MAGNITUDE_BITS * dirty_log2f(level.abs()));
+            best = best.min(coded);
         }
-        coeff += 1;
-        if coeff == 64 {
-            coeff = 1;
-        }
+        cost += best;
     }
-    [distortion, coeff_bits]
+    cost
 }
 
-pub(crate) fn selected_cfl_closed_loop_cost_fn() -> CflClosedLoopCostFn {
+pub(crate) fn selected_cfl_rd_cost_fn() -> CflRdCostFn {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        |m, s, factor, thresholds| unsafe {
-            crate::neon::cfl_closed_loop_cost_neon(m, s, factor, thresholds)
+        |m, s, factor, weight, lambda| unsafe {
+            crate::neon::cfl_rd_cost_neon(m, s, factor, weight, lambda)
         }
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
-        return |m, s, factor, thresholds| unsafe {
-            crate::avx::cfl_closed_loop_cost_avx2(m, s, factor, thresholds)
+        return |m, s, factor, weight, lambda| unsafe {
+            crate::avx::cfl_rd_cost_avx2(m, s, factor, weight, lambda)
         };
     }
-    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
-    return crate::wasm::cfl_closed_loop_cost_wasm;
-    #[cfg(not(any(
-        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
-        all(target_arch = "aarch64", feature = "neon")
-    )))]
-    cfl_closed_loop_cost_scalar
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |m, s, factor, weight, lambda| unsafe {
+            crate::sse::cfl_rd_cost_sse41(m, s, factor, weight, lambda)
+        };
+    }
+    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    cfl_rd_cost_scalar
 }
 
 #[allow(dead_code)]
@@ -244,45 +248,6 @@ const CFL_DEADZONE_AMOUNT: f32 = 1.5;
 const CFL_DEADZONE_LO: f32 = 1.0;
 const CFL_DEADZONE_HI: f32 = 2.0;
 
-struct CflRdoFit {
-    /// Rate weight for the (cand - pred) token estimate, scaled by tile_q.
-    lambda_bits: f32,
-    /// Per-unit multiplier magnitude cost, scaled by tile_q.
-    mag_cost: f32,
-    /// Magnitude-cost amplification on strongly/mildly neutral tiles.
-    dz_strong: f32,
-    dz_mild: f32,
-    corr_strong: f32,
-    corr_mild: f32,
-    energy_strong: f32,
-    energy_mild: f32,
-    /// Mean |chroma DC| gates, raw opsin scale (X is tiny; B tracks luma).
-    dc_thr_x: f32,
-    dc_thr_b: f32,
-    /// Fall back to the L2 path at and above this distance: the L1
-    /// objective drifts off-metric at high d (Kodak: win < 3, loss at 3 —
-    /// the stress-corpus fit wanted 3.5, the holdout overrules).
-    max_d: f32,
-}
-
-static CFL_RDO: CflRdoFit = CflRdoFit {
-    lambda_bits: 0.045,
-    mag_cost: 0.09,
-    dz_strong: 3.4,
-    dz_mild: 2.45,
-    corr_strong: 0.20,
-    corr_mild: 0.35,
-    energy_strong: 0.09,
-    energy_mild: 0.073,
-    dc_thr_x: 0.10,
-    dc_thr_b: 0.55,
-    max_d: 3.0,
-};
-
-/// From this luma correlation up, an X tile is one hue modulated by
-/// luminance and takes the least-squares multiplier.
-const CFL_X_LS_MIN_CORRELATION: f32 = 0.98;
-
 #[inline]
 fn cfl_deadzone(distance: f32) -> f32 {
     if distance <= CFL_DEADZONE_LO {
@@ -411,8 +376,8 @@ fn compute_cmap_tile(
 }
 
 /// Worst-case per-tile coefficient count: a full 8×8-block tile keeps 63 AC
-/// coefficients per block. The L1 candidate cost needs every coefficient (it
-/// has no closed-form sufficient statistics, unlike the default L2 path), so
+/// coefficients per block. The candidate cost quantizes every coefficient (it
+/// has no closed-form sufficient statistics, unlike the regression path), so
 /// the tile's worth of them is staged here.
 const CFL_RDO_TILE_AC: usize = K_TILE_DIM_IN_BLOCKS * K_TILE_DIM_IN_BLOCKS * 63;
 
@@ -480,64 +445,32 @@ fn cmap_residual_bits(res: i32) -> f32 {
     }
 }
 
-/// Pick one channel's multiplier by candidate search: L1 distortion + rate
-/// to the spatial predictor + a neutral-gated magnitude cost. `m`/`s` are
-/// luma/chroma coefficients in quant-step units; `base` is the base
-/// correlation the signaled value offsets.
+/// Pick one channel's multiplier by candidate search around the least-squares
+/// slope and the spatial prediction: quantized-residual RD cost plus the map
+/// token's rate. `m`/`s` are luma/chroma coefficients in quant-step units;
+/// `base` is the base correlation the signaled value offsets.
 #[allow(clippy::too_many_arguments)]
 fn optimize_channel_rdo(
     stats_fn: CflRdoStatsFn,
-    closed_loop_cost_fn: CflClosedLoopCostFn,
+    cost_fn: CflRdCostFn,
     m: &[f32],
     s: &[f32],
-    channel: usize,
-    distance: f32,
-    closed_loop: bool,
-    qm_multiplier: f32,
+    weight: f32,
+    lambda: f32,
     pred: i32,
     base: f32,
-    dc_avg: f32,
-    dc_thr: f32,
-    tile_q: f32,
     color_factor: f32,
 ) -> i32 {
     if m.is_empty() {
         return if pred.abs() <= 4 { pred } else { 0 };
     }
 
-    let [dot_ms, dot_mm, dot_ss, sum_abs_s] = stats_fn(m, s);
-    let energy = sum_abs_s / m.len() as f32;
-    let corr = if dot_mm > 1e-6 && dot_ss > 1e-6 {
-        dot_ms.abs() / (dot_mm * dot_ss).sqrt()
-    } else {
-        0.0
-    };
-
+    let [dot_ms, dot_mm, _, _] = stats_fn(m, s);
     // Analytical least-squares seed: argmin_f sum (s - f*m)^2.
     let target_factor = if dot_mm > 1e-6 { dot_ms / dot_mm } else { base };
     let target_cand = ((target_factor - base) * color_factor)
         .round()
         .clamp(-128.0, 127.0) as i32;
-
-    // Neutral-tile gate: only amplify the magnitude cost where chroma is
-    // uncorrelated, low-energy, and near-neutral, so the deadzone suppresses
-    // color noise without desaturating regions with a real slope.
-    let dz_penalty =
-        if corr < CFL_RDO.corr_strong && energy < CFL_RDO.energy_strong && dc_avg < dc_thr {
-            CFL_RDO.dz_strong
-        } else if corr < CFL_RDO.corr_mild && energy < CFL_RDO.energy_mild && dc_avg < dc_thr * 1.5
-        {
-            CFL_RDO.dz_mild
-        } else {
-            1.0
-        };
-
-    // The candidate costs count error per coefficient. A multiplier off the
-    // least-squares one leaves a residual that copies luma, and what the
-    // quantizer drops of it shifts the whole tile's saturation one way.
-    if channel == 0 && corr >= CFL_X_LS_MIN_CORRELATION {
-        return target_cand;
-    }
 
     let mut cands = [0i32; 19];
     let mut num_cands = 0usize;
@@ -558,35 +491,10 @@ fn optimize_channel_rdo(
         add_cand(pred + d);
     }
 
-    let lambda = CFL_RDO.lambda_bits * tile_q;
-    let mag_cost = CFL_RDO.mag_cost * tile_q * dz_penalty;
-    let quadrant_thresholds =
-        crate::group::quantize_ac_thresholds_scaled(channel, 1, 1, distance, qm_multiplier);
-    let thresholds: [f32; 63] = std::array::from_fn(|i| {
-        let coeff = i + 1;
-        quadrant_thresholds[usize::from(coeff >= 32) * 2 + usize::from(coeff & 7 >= 4)]
-    });
     let mut best = (f32::MAX, 0i32);
     for &cand in &cands[..num_cands] {
         let factor = fmla(cand as f32, 1.0 / color_factor, base);
-        let (distortion, coeff_bits) = if closed_loop {
-            // Closed-loop error is the primary term. A small residual-energy
-            // term and coefficient-rate proxy retain CfL's compression goal
-            // instead of choosing an expensive phase-aligned residual.
-            let [distortion, coeff_bits] = closed_loop_cost_fn(m, s, factor, &thresholds);
-            (distortion, coeff_bits)
-        } else {
-            let mut distortion = 0.0f32;
-            for (&mv, &sv) in m.iter().zip(s) {
-                let residual = sv - factor * mv;
-                distortion += residual.abs();
-            }
-            (distortion, 0.0)
-        };
-        let cost = distortion
-            + 0.15 * lambda * coeff_bits
-            + lambda * cmap_residual_bits(cand - pred)
-            + cand.abs() as f32 * mag_cost;
+        let cost = cost_fn(m, s, factor, weight, lambda) + lambda * cmap_residual_bits(cand - pred);
         if cost < best.0 {
             best = (cost, cand);
         }
@@ -605,7 +513,7 @@ struct CflRdoQuantization<'a> {
     field: &'a crate::image::ImageB,
     scale: f32,
     distance: f32,
-    closed_loop: bool,
+    x_qm_scale: u32,
     block_x: usize,
     block_y: usize,
 }
@@ -652,20 +560,10 @@ fn compute_cmap_tile_rdo(
 
     rdo.len = 0;
 
-    let mut dc_abs_x = 0.0f32;
-    let mut dc_abs_b = 0.0f32;
-    let mut tile_q_sum = 0.0f32;
-    let mut num_blocks = 0usize;
-    let x_mul = if quant.closed_loop && (ctx.x_heavy() || quant.distance >= 1.25) {
-        1.25
-    } else {
-        1.0
-    };
-    let b_mul = if quant.closed_loop {
-        ctx.b_qm_mul()
-    } else {
-        1.0
-    };
+    // CfL is selected before coefficient coding but must see the frame's X/B
+    // precision multipliers that coding will use.
+    let x_mul = 1.25f32.powf(quant.x_qm_scale as f32 - 2.0);
+    let b_mul = ctx.b_qm_mul();
     for by in 0..blocks.height {
         for bx in 0..blocks.width {
             let px = (blocks.x + bx) * K_BLOCK_DIM;
@@ -689,13 +587,9 @@ fn compute_cmap_tile_rdo(
             );
 
             shift_to_xyb_bases(ctx, &block_y, &mut block_x, &mut block_b);
-            dc_abs_x += block_x[0].abs();
-            dc_abs_b += block_b[0].abs();
 
             let q_block =
                 quant.scale * quant.field.row(quant.block_y + by)[quant.block_x + bx] as f32;
-            tile_q_sum += q_block;
-            num_blocks += 1;
 
             // Skip the DC (index 0): the per-tile factor controls AC only.
             let n = rdo.len;
@@ -707,13 +601,13 @@ fn compute_cmap_tile_rdo(
             (ctx.cfl_rdo_block)(
                 mx, sx, mb, sb, &block_y, &block_x, &block_b, qm_x, qm_b, q_block,
             );
-            // The SIMD staging kernel produces base quant-step units. CfL is
-            // selected before coefficient coding but must see the same frame
-            // X/B precision multipliers that coding will use.
-            if quant.closed_loop {
+            // The staging kernel produces base quant-step units.
+            if x_mul != 1.0 {
                 for value in mx.iter_mut().chain(sx.iter_mut()) {
                     *value *= x_mul;
                 }
+            }
+            if b_mul != 1.0 {
                 for value in mb.iter_mut().chain(sb.iter_mut()) {
                     *value *= b_mul;
                 }
@@ -722,44 +616,33 @@ fn compute_cmap_tile_rdo(
         }
     }
 
-    let (dc_avg_x, dc_avg_b, tile_q) = if num_blocks > 0 {
-        let inv = 1.0 / num_blocks as f32;
-        (dc_abs_x * inv, dc_abs_b * inv, tile_q_sum * inv)
-    } else {
-        (0.0, 0.0, 1.0)
-    };
-
+    // The same per-bit price and channel weights as the chroma trellis, so
+    // the slope search and the quantizer agree on which residuals survive.
+    let lambda = crate::group::rdoq_lambda(1.0);
+    let chroma_weight = crate::group::chroma_rdoq_weight(quant.distance);
+    let [weight_x, _, weight_b] = crate::group::rdoq_channel_weights(ctx.coding);
+    let color_factor = ctx.cfl_frame().color_factor;
     let ytox = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
-        ctx.cfl_closed_loop_cost,
+        ctx.cfl_rd_cost,
         &rdo.m_x[..rdo.len],
         &rdo.s_x[..rdo.len],
-        0,
-        quant.distance,
-        quant.closed_loop,
-        x_mul,
+        weight_x * chroma_weight,
+        lambda,
         prediction.ytox,
         0.0,
-        dc_avg_x,
-        CFL_RDO.dc_thr_x,
-        tile_q,
-        ctx.cfl_frame().color_factor,
+        color_factor,
     );
     let ytob = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
-        ctx.cfl_closed_loop_cost,
+        ctx.cfl_rd_cost,
         &rdo.m_b[..rdo.len],
         &rdo.s_b[..rdo.len],
-        2,
-        quant.distance,
-        quant.closed_loop,
-        b_mul,
+        weight_b * chroma_weight,
+        lambda,
         prediction.ytob,
         1.0,
-        dc_avg_b,
-        CFL_RDO.dc_thr_b,
-        tile_q,
-        ctx.cfl_frame().color_factor,
+        color_factor,
     );
     (ytox, ytob)
 }
@@ -780,6 +663,7 @@ pub(crate) fn fill_cmap(
     ytox_map: &mut ImageSB,
     ytob_map: &mut ImageSB,
     distance: f32,
+    x_qm_scale: u32,
 ) {
     let xtiles = ytox_map.xsize();
     let ytiles = ytox_map.ysize();
@@ -790,15 +674,11 @@ pub(crate) fn fill_cmap(
         block_y: [0.; 64],
     };
 
-    // Coarse chroma structure still benefits from searching the
-    // quantized residual cost. Dropping to regression at d=3 erases yellow detail
-    // on the very frames for which we retain extra X/B precision.
     // YCbCr chroma follows luma with large, content-dependent slopes, which
     // the regression's deadzone misses; it searches them at Fast too.
     let ycbcr =
         ctx.coding == crate::coding::CodingTransform::YCbCr && ctx.speed.effort().cfl_ycbcr_rdo;
-    let use_rdo =
-        (distance < CFL_RDO.max_d || ctx.x_heavy()) && (ctx.speed.effort().cfl_rdo || ycbcr);
+    let use_rdo = ctx.speed.effort().cfl_rdo || ycbcr;
 
     for ty in 0..ytiles {
         for tx in 0..xtiles {
@@ -830,7 +710,7 @@ pub(crate) fn fill_cmap(
                             field: raw_quant_field,
                             scale,
                             distance,
-                            closed_loop: ctx.x_heavy(),
+                            x_qm_scale,
                             block_x: tx * K_TILE_DIM_IN_BLOCKS,
                             block_y: ty * K_TILE_DIM_IN_BLOCKS,
                         },
@@ -2123,35 +2003,104 @@ mod tests {
         }
     }
 
+    fn rd_cost_kernels() -> Vec<(&'static str, CflRdCostFn)> {
+        #[allow(unused_mut)]
+        let mut kernels: Vec<(&str, CflRdCostFn)> = vec![("selected", selected_cfl_rd_cost_fn())];
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            kernels.push(("avx2", |m, s, factor, weight, lambda| unsafe {
+                crate::avx::cfl_rd_cost_avx2(m, s, factor, weight, lambda)
+            }));
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            kernels.push(("sse4.1", |m, s, factor, weight, lambda| unsafe {
+                crate::sse::cfl_rd_cost_sse41(m, s, factor, weight, lambda)
+            }));
+        }
+        kernels
+    }
+
     #[test]
-    fn selected_closed_loop_cost_matches_scalar() {
-        let cost_fn = selected_cfl_closed_loop_cost_fn();
-        let quadrant_thresholds = [0.42, 0.57, 0.73, 0.91];
-        let thresholds: [f32; 63] = std::array::from_fn(|i| {
-            let coeff = i + 1;
-            quadrant_thresholds[usize::from(coeff >= 32) * 2 + usize::from(coeff & 7 >= 4)]
-        });
-        for len in [0, 1, 3, 4, 7, 8, 15, 62, 63, 64, 127, CFL_RDO_TILE_AC] {
-            let m: Vec<f32> = (0..len)
-                .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.07125)
-                .collect();
-            let s: Vec<f32> = (0..len)
-                .map(|i| ((i * 53 % 97) as f32 - 48.0) * 0.05375)
-                .collect();
-            for factor in [-1.25, -0.1875, 0.0, 0.3125, 1.75] {
-                let expected = cfl_closed_loop_cost_scalar(&m, &s, factor, &thresholds);
-                let actual = cost_fn(&m, &s, factor, &thresholds);
-                for i in 0..2 {
-                    let tolerance = 2e-5 * expected[i].abs().max(1.0);
-                    assert!(
-                        (actual[i] - expected[i]).abs() <= tolerance,
-                        "cost {i} at len {len}, factor {factor}: SIMD={}, scalar={}, tolerance={tolerance}",
-                        actual[i],
-                        expected[i]
-                    );
+    fn selected_rd_cost_matches_scalar() {
+        for (name, cost_fn) in rd_cost_kernels() {
+            for len in (0..=17).chain([31, 32, 33, 63, 64, 130, CFL_RDO_TILE_AC]) {
+                for (m_extra, s_extra) in [(0, 0), (0, 3), (5, 0)] {
+                    let mut m: Vec<f32> = (0..len)
+                        .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.125)
+                        .collect();
+                    let mut s: Vec<f32> = (0..len)
+                        .map(|i| ((i * 53 % 97) as f32 - 48.0) * 0.09375)
+                        .collect();
+                    // The zip-length contract must ignore the longer slice's suffix.
+                    m.resize(len + m_extra, f32::NAN);
+                    s.resize(len + s_extra, f32::NAN);
+                    for factor in [-0.5f32, 0.0, 0.37, 1.0] {
+                        for (weight, lambda) in [(0.3, 0.03), (1.0, 0.0), (0.0, 0.03), (0.3, 2.0)] {
+                            let expected = cfl_rd_cost_scalar(&m, &s, factor, weight, lambda);
+                            let actual = cost_fn(&m, &s, factor, weight, lambda);
+                            let tolerance = 1e-4 * expected.abs().max(1.0);
+                            assert!(
+                                (actual - expected).abs() <= tolerance,
+                                "{name} len {len} extra {m_extra}/{s_extra} factor {factor} \
+                                 weight {weight} lambda {lambda}: SIMD={actual}, scalar={expected}"
+                            );
+                        }
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn rd_cost_rounding_boundaries_match_scalar() {
+        let kernels = rd_cost_kernels();
+        let m = [0.0; 9];
+        for residual in [
+            0.0f32,
+            0.5,
+            1.0,
+            1.5,
+            2.0,
+            2.5,
+            3.5,
+            8.5,
+            8_388_608.0,
+            2_147_483_648.0,
+        ] {
+            for residual in [residual.next_down(), residual, residual.next_up()] {
+                for residual in [residual, -residual] {
+                    let s = [residual; 9];
+                    // Offset the slices to exercise unaligned vector loads.
+                    let m = &m[1..];
+                    let s = &s[1..];
+                    for &(name, cost_fn) in &kernels {
+                        for lambda in [0.0, 0.03] {
+                            let expected = cfl_rd_cost_scalar(m, s, 0.0, 10.0, lambda);
+                            let actual = cost_fn(m, s, 0.0, 10.0, lambda);
+                            assert!(
+                                (actual - expected).abs() <= 2e-6 * expected.abs().max(1.0),
+                                "{name} residual {residual} lambda {lambda}: SIMD={actual}, scalar={expected}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rd_cost_codes_only_when_cheaper_than_the_error() {
+        // A residual of 0.3 steps is zeroed: coding it costs lambda*bits on
+        // top of the quantization error. A residual of 3 steps is coded.
+        let small = cfl_rd_cost_scalar(&[1.0], &[0.3], 0.0, 1.0, 0.03);
+        assert!((small - 0.09).abs() < 1e-6, "{small}");
+        let large = cfl_rd_cost_scalar(&[1.0], &[3.0], 0.0, 1.0, 0.03);
+        let err = 3.0 - crate::group::dequantized_level_f32(3.0);
+        let coded = err * err + 0.03 * (CFL_NONZERO_BITS + CFL_MAGNITUDE_BITS * 3f32.log2());
+        assert!((large - coded).abs() < 1e-4, "{large} vs {coded}");
+        assert!(large < 9.0);
     }
 
     #[test]
@@ -2237,7 +2186,7 @@ mod tests {
                     field: &qf,
                     scale: 1.0 / 32.0,
                     distance: 1.0,
-                    closed_loop: true,
+                    x_qm_scale: 2,
                     block_x: 0,
                     block_y: 0,
                 },
@@ -2291,44 +2240,21 @@ mod tests {
 
     #[test]
     fn rdo_empty_tile_falls_back_to_small_predictions() {
-        assert_eq!(
+        let pick = |pred| {
             optimize_channel_rdo(
                 cfl_rdo_stats_scalar,
-                cfl_closed_loop_cost_scalar,
+                cfl_rd_cost_scalar,
                 &[],
                 &[],
-                0,
-                1.0,
-                true,
-                1.0,
-                3,
+                0.3,
+                0.03,
+                pred,
                 0.0,
-                0.0,
-                0.1,
-                1.0,
                 K_COLOR_FACTOR,
-            ),
-            3
-        );
-        assert_eq!(
-            optimize_channel_rdo(
-                cfl_rdo_stats_scalar,
-                cfl_closed_loop_cost_scalar,
-                &[],
-                &[],
-                0,
-                1.0,
-                true,
-                1.0,
-                100,
-                0.0,
-                0.0,
-                0.1,
-                1.0,
-                K_COLOR_FACTOR,
-            ),
-            0
-        );
+            )
+        };
+        assert_eq!(pick(3), 3);
+        assert_eq!(pick(100), 0);
     }
 
     fn dc_group_with_residual_correlation(slope: f32) -> DcGroupData {
@@ -2369,7 +2295,7 @@ mod tests {
 
     #[test]
     fn dc_steps_move_the_levels_under_a_flat_value() {
-        // A flat B that sits half a level from its neighbours under the
+        // A flat B that sits half a level from its neighbors under the
         // default step, with a flicker that rounds it either way.
         let flicker = |x: usize, y: usize| {
             let mut state = (x as u32 * 7919 + y as u32 * 104729) | 1;

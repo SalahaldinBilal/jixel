@@ -27,7 +27,11 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::dct::{DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, WC4, WC8, WC16, WC32};
+use crate::dct::{
+    DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64,
+    RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
+};
+use crate::dct128::{DCT128_SPLIT_COS, DCT128_SPLIT_SIN, INV_WC128, RESAMPLE_SCALE_128_TO_16};
 use core::arch::wasm32::*;
 use std::mem::MaybeUninit;
 
@@ -1115,9 +1119,476 @@ pub(crate) fn dct16x32_wasm(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]
     }
 }
 
-#[cfg(target_feature = "simd128")]
+// Restore the natural frequency order of the 64-point split-radix kernel.
+#[target_feature(enable = "simd128")]
+fn dct1d_64_natural(c: &mut [v128; 64]) {
+    dct1d_64_s(c);
+    let split = *c;
+    for i in 0..64 {
+        c[i] = split[crate::dct128::dct64_natural_index(i)];
+    }
+}
+
+/// Split-radix DCT-II over 4 independent 128-point columns.
+#[target_feature(enable = "simd128")]
+fn dct1d_128(c: &mut [v128; 128]) {
+    for i in 0..32 {
+        let bottom = c[i];
+        let top = c[127 - i];
+        let half_bottom = c[63 - i];
+        let half_top = c[64 + i];
+        let lower = f32x4_sub(bottom, top);
+        let upper = f32x4_sub(half_bottom, half_top);
+        c[i] = f32x4_add(bottom, top);
+        c[63 - i] = f32x4_add(half_bottom, half_top);
+        c[64 + i] = f32x4_add(
+            f32x4_mul(lower, f32x4_splat(DCT128_SPLIT_COS[i])),
+            f32x4_mul(upper, f32x4_splat(DCT128_SPLIT_SIN[i])),
+        );
+        let sin = f32x4_sub(
+            f32x4_mul(upper, f32x4_splat(DCT128_SPLIT_COS[i])),
+            f32x4_mul(lower, f32x4_splat(DCT128_SPLIT_SIN[i])),
+        );
+        c[127 - i] = if i & 1 == 0 { sin } else { f32x4_neg(sin) };
+    }
+    dct1d_64_natural((&mut c[..64]).try_into().unwrap());
+    dct1d_32_s((&mut c[64..96]).try_into().unwrap());
+    dct1d_32_s((&mut c[96..]).try_into().unwrap());
+    for i in 1..32 {
+        let cos = c[64 + i];
+        let sin = if i & 1 == 0 {
+            f32x4_neg(c[128 - i])
+        } else {
+            c[128 - i]
+        };
+        c[64 + i] = f32x4_add(cos, sin);
+        c[128 - i] = f32x4_sub(cos, sin);
+    }
+    c[64] = f32x4_mul(c[64], f32x4_splat(std::f32::consts::SQRT_2));
+    c[96] = f32x4_mul(c[96], f32x4_splat(-std::f32::consts::SQRT_2));
+    let split = *c;
+    for i in 0..64 {
+        c[2 * i] = split[i];
+        let odd = if i == 0 {
+            64
+        } else if i & 1 != 0 {
+            65 + i / 2
+        } else {
+            128 - i / 2
+        };
+        c[2 * i + 1] = split[odd];
+    }
+}
+
+// Transposed scratch makes both separable passes use contiguous SIMD loads.
+macro_rules! dct128_wasm {
+    ($name:ident, $n:literal, $w:literal, $h:literal, $dct_v:path, $dct_h:path) => {
+        #[target_feature(enable = "simd128")]
+        pub(crate) fn $name(input: DctInput<'_, $w, $h>, output: &mut [f32; $n]) {
+            let mut scratch = Box::<[f32; $n]>::new_uninit();
+            let dst = scratch.as_mut_ptr() as *mut f32;
+            for x in (0..$w).step_by(4) {
+                let mut c: [v128; $h] =
+                    std::array::from_fn(|y| load_strip(input.row(y)[x..].as_ptr()));
+                $dct_v(&mut c);
+                for v in (0..$h).step_by(4) {
+                    let mut tile: [v128; 4] = c[v..v + 4].try_into().unwrap();
+                    let (r0, r1, r2, r3) = transpose_4x4(tile[0], tile[1], tile[2], tile[3]);
+                    tile = [r0, r1, r2, r3];
+                    for (j, value) in tile.iter().enumerate() {
+                        unsafe { v128_store(dst.add((x + j) * $h + v) as *mut v128, *value) };
+                    }
+                }
+            }
+            // Every scratch element was written by exactly one tile above.
+            let scratch = unsafe { scratch.assume_init() };
+            let scale = 1.0 / $n as f32;
+            for v in (0..$h).step_by(4) {
+                let mut c: [v128; $w] =
+                    std::array::from_fn(|x| load_strip(scratch[x * $h + v..].as_ptr()));
+                $dct_h(&mut c);
+                if $h >= $w {
+                    for u in 0..$w {
+                        unsafe {
+                            v128_store(
+                                output.as_mut_ptr().add(u * $h + v) as *mut v128,
+                                f32x4_mul(c[u], f32x4_splat(scale)),
+                            )
+                        };
+                    }
+                } else {
+                    for u in (0..$w).step_by(4) {
+                        let mut tile: [v128; 4] = c[u..u + 4].try_into().unwrap();
+                        let (r0, r1, r2, r3) = transpose_4x4(tile[0], tile[1], tile[2], tile[3]);
+                        tile = [r0, r1, r2, r3];
+                        for (j, value) in tile.iter().enumerate() {
+                            unsafe {
+                                v128_store(
+                                    output.as_mut_ptr().add((v + j) * $w + u) as *mut v128,
+                                    f32x4_mul(*value, f32x4_splat(scale)),
+                                )
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+dct128_wasm!(dct128x128_wasm, 16384, 128, 128, dct1d_128, dct1d_128);
+dct128_wasm!(dct128x64_wasm, 8192, 64, 128, dct1d_128, dct1d_64_natural);
+dct128_wasm!(dct64x128_wasm, 8192, 128, 64, dct1d_64_natural, dct1d_128);
+
+const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn idct2_s(a: v128, b: v128) -> (v128, v128) {
+    (
+        f32x4_mul(f32x4_add(a, b), f32x4_splat(0.5)),
+        f32x4_mul(f32x4_sub(a, b), f32x4_splat(0.5)),
+    )
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn inv_dct1d_4_s(c: &mut [v128; 4]) {
+    let (t0, t1, mut t2, t3) = (c[0], c[2], c[1], c[3]);
+    t2 = f32x4_mul(f32x4_sub(t2, t3), f32x4_splat(IS2));
+    let (n2, n3) = idct2_s(t2, t3);
+    let a2 = f32x4_mul(n2, f32x4_splat(INV_WC4[0]));
+    let a3 = f32x4_mul(n3, f32x4_splat(INV_WC4[1]));
+    let (m0, m1) = idct2_s(t0, t1);
+    c[0] = f32x4_mul(f32x4_add(m0, a2), f32x4_splat(0.5));
+    c[3] = f32x4_mul(f32x4_sub(m0, a2), f32x4_splat(0.5));
+    c[1] = f32x4_mul(f32x4_add(m1, a3), f32x4_splat(0.5));
+    c[2] = f32x4_mul(f32x4_sub(m1, a3), f32x4_splat(0.5));
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn inv_dct1d_8_s(c: &mut [v128; 8]) {
+    let mut t = [c[0]; 8];
+    for i in 0..4 {
+        t[i] = c[2 * i];
+        t[4 + i] = c[2 * i + 1];
+    }
+    t[6] = f32x4_sub(t[6], t[7]);
+    t[5] = f32x4_sub(t[5], t[6]);
+    t[4] = f32x4_mul(f32x4_sub(t[4], t[5]), f32x4_splat(IS2));
+    let mut o: [v128; 4] = [t[4], t[5], t[6], t[7]];
+    inv_dct1d_4_s(&mut o);
+    for i in 0..4 {
+        o[i] = f32x4_mul(o[i], f32x4_splat(INV_WC8[i]));
+    }
+    let mut e: [v128; 4] = [t[0], t[1], t[2], t[3]];
+    inv_dct1d_4_s(&mut e);
+    for i in 0..4 {
+        c[i] = f32x4_mul(f32x4_add(e[i], o[i]), f32x4_splat(0.5));
+        c[7 - i] = f32x4_mul(f32x4_sub(e[i], o[i]), f32x4_splat(0.5));
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn inv_dct1d_16_s(c: &mut [v128; 16]) {
+    let mut t = [c[0]; 16];
+    for i in 0..8 {
+        t[i] = c[2 * i];
+        t[8 + i] = c[2 * i + 1];
+    }
+    for i in (9..=14).rev() {
+        t[i] = f32x4_sub(t[i], t[i + 1]);
+    }
+    t[8] = f32x4_mul(f32x4_sub(t[8], t[9]), f32x4_splat(IS2));
+    let mut o: [v128; 8] = std::array::from_fn(|i| t[8 + i]);
+    inv_dct1d_8_s(&mut o);
+    for i in 0..8 {
+        o[i] = f32x4_mul(o[i], f32x4_splat(INV_WC16[i]));
+    }
+    let mut e: [v128; 8] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_8_s(&mut e);
+    for i in 0..8 {
+        c[i] = f32x4_mul(f32x4_add(e[i], o[i]), f32x4_splat(0.5));
+        c[15 - i] = f32x4_mul(f32x4_sub(e[i], o[i]), f32x4_splat(0.5));
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn inv_dct1d_32_s(c: &mut [v128; 32]) {
+    let mut t = [c[0]; 32];
+    for i in 0..16 {
+        t[i] = c[2 * i];
+        t[16 + i] = c[2 * i + 1];
+    }
+    for i in (17..=30).rev() {
+        t[i] = f32x4_sub(t[i], t[i + 1]);
+    }
+    t[16] = f32x4_mul(f32x4_sub(t[16], t[17]), f32x4_splat(IS2));
+    let mut o: [v128; 16] = std::array::from_fn(|i| t[16 + i]);
+    inv_dct1d_16_s(&mut o);
+    for i in 0..16 {
+        o[i] = f32x4_mul(o[i], f32x4_splat(INV_WC32[i]));
+    }
+    let mut e: [v128; 16] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_16_s(&mut e);
+    for i in 0..16 {
+        c[i] = f32x4_mul(f32x4_add(e[i], o[i]), f32x4_splat(0.5));
+        c[31 - i] = f32x4_mul(f32x4_sub(e[i], o[i]), f32x4_splat(0.5));
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn inv_dct1d_64_s(c: &mut [v128; 64]) {
+    let mut t = [c[0]; 64];
+    for i in 0..32 {
+        t[i] = c[2 * i];
+        t[32 + i] = c[2 * i + 1];
+    }
+    for i in (33..=62).rev() {
+        t[i] = f32x4_sub(t[i], t[i + 1]);
+    }
+    t[32] = f32x4_mul(
+        f32x4_sub(t[32], t[33]),
+        f32x4_splat(std::f32::consts::FRAC_1_SQRT_2),
+    );
+    let mut odd: [v128; 32] = std::array::from_fn(|i| t[32 + i]);
+    inv_dct1d_32_s(&mut odd);
+    for i in 0..32 {
+        odd[i] = f32x4_mul(odd[i], f32x4_splat(INV_WC64[i]));
+    }
+    let mut even: [v128; 32] = std::array::from_fn(|i| t[i]);
+    inv_dct1d_32_s(&mut even);
+    for i in 0..32 {
+        c[i] = f32x4_mul(f32x4_add(even[i], odd[i]), f32x4_splat(0.5));
+        c[63 - i] = f32x4_mul(f32x4_sub(even[i], odd[i]), f32x4_splat(0.5));
+    }
+}
+
+macro_rules! horizontal_idct_pass_wasm {
+    ($tmp:expr, $out:expr, $h:literal, $w:literal, $inv_h:path) => {{
+        for y4 in (0..$h).step_by(4) {
+            let mut c = [f32x4_splat(0.0); $w];
+            for u4 in (0..$w).step_by(4) {
+                let (a, b, cc, d) = transpose_4x4(
+                    load_strip(unsafe { $tmp.get_unchecked(y4 * $w + u4..) }.as_ptr()),
+                    load_strip(unsafe { $tmp.get_unchecked((y4 + 1) * $w + u4..) }.as_ptr()),
+                    load_strip(unsafe { $tmp.get_unchecked((y4 + 2) * $w + u4..) }.as_ptr()),
+                    load_strip(unsafe { $tmp.get_unchecked((y4 + 3) * $w + u4..) }.as_ptr()),
+                );
+                c[u4] = a;
+                c[u4 + 1] = b;
+                c[u4 + 2] = cc;
+                c[u4 + 3] = d;
+            }
+            $inv_h(&mut c);
+            for x4 in (0..$w).step_by(4) {
+                let (r0, r1, r2, r3) = transpose_4x4(c[x4], c[x4 + 1], c[x4 + 2], c[x4 + 3]);
+                unsafe {
+                    v128_store(($out.as_mut_ptr().add(y4 * $w + x4)).cast(), r0);
+                    v128_store(($out.as_mut_ptr().add((y4 + 1) * $w + x4)).cast(), r1);
+                    v128_store(($out.as_mut_ptr().add((y4 + 2) * $w + x4)).cast(), r2);
+                    v128_store(($out.as_mut_ptr().add((y4 + 3) * $w + x4)).cast(), r3);
+                }
+            }
+        }
+    }};
+}
+
+/// IDCT for a natural coefficient layout `[vfreq * W + hfreq]`.
+macro_rules! inv_dct_natural_wasm {
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        inv_dct_natural_wasm!(
+            $name,
+            $n,
+            $h,
+            $w,
+            $inv_v,
+            $inv_h,
+            MaybeUninit::<[f32; $n]>::uninit()
+        );
+    };
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path, $scratch:expr) => {
+        #[target_feature(enable = "simd128")]
+        pub(crate) fn $name(coeff: DctInput<'_, $w, $h>, out: &mut [f32; $n]) {
+            let mut tmp_u = $scratch;
+            let tmp_ptr = tmp_u.as_mut_ptr() as *mut f32;
+            for u4 in (0..$w).step_by(4) {
+                let mut c: [v128; $h] = std::array::from_fn(|v| {
+                    f32x4_mul(
+                        load_strip(coeff.row(v)[u4..].as_ptr()),
+                        f32x4_splat($n as f32),
+                    )
+                });
+                $inv_v(&mut c);
+                for y in 0..$h {
+                    unsafe { v128_store((tmp_ptr.add(y * $w + u4)).cast(), c[y]) };
+                }
+            }
+            let tmp = unsafe { tmp_u.assume_init() };
+            horizontal_idct_pass_wasm!(tmp, out, $h, $w, $inv_h);
+        }
+    };
+}
+
+/// IDCT for a transposed coefficient layout `[hfreq * H + vfreq]`.
+macro_rules! inv_dct_transposed_wasm {
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        inv_dct_transposed_wasm!(
+            $name,
+            $n,
+            $h,
+            $w,
+            $inv_v,
+            $inv_h,
+            MaybeUninit::<[f32; $n]>::uninit()
+        );
+    };
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path, $scratch:expr) => {
+        #[target_feature(enable = "simd128")]
+        pub(crate) fn $name(coeff: DctInput<'_, $h, $w>, out: &mut [f32; $n]) {
+            let mut tmp_u = $scratch;
+            let tmp_ptr = tmp_u.as_mut_ptr() as *mut f32;
+            for u4 in (0..$w).step_by(4) {
+                let mut c = [f32x4_splat(0.0); $h];
+                for v4 in (0..$h).step_by(4) {
+                    let (a, b, cc, d) = transpose_4x4(
+                        load_strip(coeff.row(u4)[v4..].as_ptr()),
+                        load_strip(coeff.row(u4 + 1)[v4..].as_ptr()),
+                        load_strip(coeff.row(u4 + 2)[v4..].as_ptr()),
+                        load_strip(coeff.row(u4 + 3)[v4..].as_ptr()),
+                    );
+                    c[v4] = f32x4_mul(a, f32x4_splat($n as f32));
+                    c[v4 + 1] = f32x4_mul(b, f32x4_splat($n as f32));
+                    c[v4 + 2] = f32x4_mul(cc, f32x4_splat($n as f32));
+                    c[v4 + 3] = f32x4_mul(d, f32x4_splat($n as f32));
+                }
+                $inv_v(&mut c);
+                for y in 0..$h {
+                    unsafe { v128_store((tmp_ptr.add(y * $w + u4)).cast(), c[y]) };
+                }
+            }
+            let tmp = unsafe { tmp_u.assume_init() };
+            horizontal_idct_pass_wasm!(tmp, out, $h, $w, $inv_h);
+        }
+    };
+}
+
+#[target_feature(enable = "simd128")]
+fn inv_dct1d_128(c: &mut [v128; 128]) {
+    let mut even: [v128; 64] = std::array::from_fn(|i| c[2 * i]);
+    let mut odd: [v128; 64] = std::array::from_fn(|i| c[2 * i + 1]);
+    for i in (1..63).rev() {
+        odd[i] = f32x4_sub(odd[i], odd[i + 1]);
+    }
+    odd[0] = f32x4_mul(
+        f32x4_sub(odd[0], odd[1]),
+        f32x4_splat(std::f32::consts::FRAC_1_SQRT_2),
+    );
+    inv_dct1d_64_s(&mut odd);
+    inv_dct1d_64_s(&mut even);
+    for i in 0..64 {
+        let o = f32x4_mul(odd[i], f32x4_splat(INV_WC128[i]));
+        c[i] = f32x4_mul(f32x4_add(even[i], o), f32x4_splat(0.5));
+        c[127 - i] = f32x4_mul(f32x4_sub(even[i], o), f32x4_splat(0.5));
+    }
+}
+
+inv_dct_transposed_wasm!(
+    inv_dct128x128_wasm,
+    16384,
+    128,
+    128,
+    inv_dct1d_128,
+    inv_dct1d_128,
+    Box::<[f32; 16384]>::new_uninit()
+);
+inv_dct_transposed_wasm!(
+    inv_dct128x64_wasm,
+    8192,
+    128,
+    64,
+    inv_dct1d_128,
+    inv_dct1d_64_s,
+    Box::<[f32; 8192]>::new_uninit()
+);
+inv_dct_natural_wasm!(
+    inv_dct64x128_wasm,
+    8192,
+    64,
+    128,
+    inv_dct1d_64_s,
+    inv_dct1d_128,
+    Box::<[f32; 8192]>::new_uninit()
+);
+
+macro_rules! dc_from_dct128_wasm {
+    ($name:ident, $n:literal, $rows:literal, $inv_v:path) => {
+        #[target_feature(enable = "simd128")]
+        pub(crate) fn $name(coeffs: &[f32; $n], dc: &mut [f32; { $rows * 16 }]) {
+            let mut scratch = [[0.0f32; 16]; $rows];
+            for x in (0..16).step_by(4) {
+                let resample = load_strip(RESAMPLE_SCALE_128_TO_16[x..].as_ptr());
+                let mut c: [v128; $rows] = std::array::from_fn(|y| {
+                    let row_scale = if $rows == 16 {
+                        RESAMPLE_SCALE_128_TO_16[y]
+                    } else {
+                        RESAMPLE_SCALE_64_TO_8[y]
+                    };
+                    f32x4_mul(
+                        f32x4_mul(load_strip(coeffs[y * 128 + x..].as_ptr()), resample),
+                        f32x4_splat(($rows * 16) as f32 * row_scale),
+                    )
+                });
+                $inv_v(&mut c);
+                for y in 0..$rows {
+                    unsafe { v128_store((scratch[y].as_mut_ptr().add(x)).cast(), c[y]) };
+                }
+            }
+            for y in (0..$rows).step_by(4) {
+                let mut c = [f32x4_splat(0.0); 16];
+                for x in (0..16).step_by(4) {
+                    let mut tile: [v128; 4] =
+                        std::array::from_fn(|j| load_strip(scratch[y + j][x..].as_ptr()));
+                    let (r0, r1, r2, r3) = transpose_4x4(tile[0], tile[1], tile[2], tile[3]);
+                    tile = [r0, r1, r2, r3];
+                    c[x..x + 4].copy_from_slice(&tile);
+                }
+                inv_dct1d_16_s(&mut c);
+                // Square and tall footprints store the transposed DC grid.
+                for x in 0..16 {
+                    unsafe { v128_store((dc.as_mut_ptr().add(x * $rows + y)).cast(), c[x]) };
+                }
+            }
+        }
+    };
+}
+
+dc_from_dct128_wasm!(dc_from_dct128x128_wasm, 16384, 16, inv_dct1d_16_s);
+dc_from_dct128_wasm!(dc_from_dct128x64_wasm, 8192, 8, inv_dct1d_8_s);
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dc_from_dct64x128_wasm(coeffs: &[f32; 8192], dc: &mut [f32; 128]) {
+    let mut transposed = [0.0f32; 128];
+    dc_from_dct128x64_wasm(coeffs, &mut transposed);
+    for y in (0..8).step_by(4) {
+        for x in (0..16).step_by(4) {
+            let mut tile: [v128; 4] =
+                std::array::from_fn(|j| load_strip(transposed[(x + j) * 8 + y..].as_ptr()));
+            let (r0, r1, r2, r3) = transpose_4x4(tile[0], tile[1], tile[2], tile[3]);
+            tile = [r0, r1, r2, r3];
+            for (j, row) in tile.iter().enumerate() {
+                unsafe { v128_store((dc.as_mut_ptr().add((y + j) * 16 + x)).cast(), *row) };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
-mod neon_dct_tests {
+mod wasm_dct_tests {
     use crate::dct::{DctInput, dct8x8_scalar, dct8x16_scalar, dct16x8_scalar};
 
     const ATOL: f32 = 1e-4;

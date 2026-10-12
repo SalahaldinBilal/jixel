@@ -54,7 +54,6 @@ use plotters::coord::combinators::{LogCoord, WithKeyPoints};
 use plotters::coord::ranged1d::{AsRangedCoord, ValueFormatter};
 use plotters::prelude::*;
 use ssimulacra2::{ColorPrimaries, Rgb, TransferCharacteristic, compute_frame_ssimulacra2};
-use std::fmt::format;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::num::NonZero;
 use std::path::{Path, PathBuf};
@@ -825,7 +824,7 @@ fn bench_jixel(
         .with_distance(d)
         .with_num_threads(threads)
         .with_patches(patches)
-        .with_speed(Speed::Slow)
+        .with_speed(Speed::ExtraSlow)
         .with_splines(true);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;

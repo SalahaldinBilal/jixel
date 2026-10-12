@@ -428,7 +428,7 @@ fn mean_max_mixer(butteraugli_target: f32) -> f32 {
 }
 
 #[inline]
-fn aggregate_quant(max_q: u8, sum: u32, covered: usize, butteraugli_target: f32) -> u8 {
+pub(crate) fn aggregate_quant(max_q: u8, sum: u32, covered: usize, butteraugli_target: f32) -> u8 {
     if covered < 4 {
         return max_q;
     }

@@ -29,6 +29,8 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
+mod aq_blur;
+mod aq_loop;
 mod cfl;
 mod dc_ops;
 mod dct;
@@ -51,10 +53,9 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_wasm, afv1_wasm, afv2_wasm, afv3_wasm};
-pub(crate) use cfl::{
-    apply_cfl_wasm, cfl_closed_loop_cost_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm,
-    cfl_regression_wasm,
-};
+pub(crate) use aq_blur::{blur_horizontal_wasm, blur_vertical_wasm};
+pub(crate) use aq_loop::downsample_rows_wasm;
+pub(crate) use cfl::{apply_cfl_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm, cfl_regression_wasm};
 pub(crate) use dc_ops::{adjust_b_dc_wasm, compensate_b_dc_wasm, reconstruct_dc_wasm};
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;
@@ -73,7 +74,7 @@ pub(crate) use quant::{
 pub(crate) use quantize_xyb::{
     quantize_xyb_channels_wasm, quantize_xyb_tile_colors_wasm, round_lattice_pow2_wasm,
 };
-pub(crate) use xyb::to_xyb_wasm_band;
+pub(crate) use xyb::{to_linear_rows_wasm, to_xyb_wasm_band};
 pub(crate) use ytob::{fill_ytob_residuals_wasm, fill_ytob_row_wasm};
 
 #[cfg(feature = "splines")]

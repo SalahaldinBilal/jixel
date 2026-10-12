@@ -29,6 +29,8 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
+mod aq_blur;
+mod aq_loop;
 mod cfl;
 mod color;
 mod dc_ops;
@@ -44,6 +46,7 @@ mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
 mod splines;
+mod ssimulacra2;
 mod xyb;
 mod yellow_opsin;
 mod ytob;
@@ -54,20 +57,23 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
+pub(crate) use aq_blur::{blur_horizontal_avx2, blur_vertical_avx2};
+pub(crate) use aq_loop::downsample_rows_avx2;
 pub(crate) use cfl::{
-    apply_cfl_avx2, cfl_closed_loop_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2,
-    cfl_regression_avx2,
+    apply_cfl_avx2, cfl_rd_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2, cfl_regression_avx2,
 };
 pub(crate) use color::color_matrix_shaper_avx2;
 pub(crate) use dc_ops::{adjust_b_dc_avx2, compensate_b_dc_avx2, reconstruct_dc_avx2};
 pub(crate) use dct::{
     dc_from_dct16x32_avx2, dc_from_dct32x16_avx2, dc_from_dct32x32_avx2, dc_from_dct32x64_avx2,
-    dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dct2x2_8x8_avx2, dct4x4_avx2, dct4x8_avx2,
-    dct8x4_avx2, dct8x8_avx2, dct8x16_avx2, dct16x8_avx2, dct16x16_avx2, dct16x32_avx2,
-    dct32x16_avx2, dct32x32_avx2, dct32x64_avx2, dct64x32_avx2, dct64x64_avx2, identity8x8_avx2,
-    inv_dct2x2_8x8_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2, inv_dct16x8_avx2, inv_dct16x16_avx2,
-    inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2, inv_dct32x64_avx2, inv_dct64x32_avx2,
-    inv_dct64x64_avx2, inv_identity8x8_avx2,
+    dc_from_dct64x32_avx2, dc_from_dct64x64_avx2, dc_from_dct64x128_avx2, dc_from_dct128x64_avx2,
+    dc_from_dct128x128_avx2, dct2x2_8x8_avx2, dct4x4_avx2, dct4x8_avx2, dct8x4_avx2, dct8x8_avx2,
+    dct8x16_avx2, dct16x8_avx2, dct16x16_avx2, dct16x32_avx2, dct32x16_avx2, dct32x32_avx2,
+    dct32x64_avx2, dct64x32_avx2, dct64x64_avx2, dct64x128_avx2, dct128x64_avx2, dct128x128_avx2,
+    identity8x8_avx2, inv_dct2x2_8x8_avx2, inv_dct8x8_avx2, inv_dct8x16_avx2, inv_dct16x8_avx2,
+    inv_dct16x16_avx2, inv_dct16x32_avx2, inv_dct32x16_avx2, inv_dct32x32_avx2, inv_dct32x64_avx2,
+    inv_dct64x32_avx2, inv_dct64x64_avx2, inv_dct64x128_avx2, inv_dct128x64_avx2,
+    inv_dct128x128_avx2, inv_identity8x8_avx2,
 };
 pub(crate) use entropy::{counts_bit_cost_avx2, entropy_of_hist_avx2};
 pub(crate) use frame::chroma_gradient_sums_avx2;
@@ -89,7 +95,8 @@ pub(crate) use quant::{
 pub(crate) use quantize_xyb::{
     quantize_xyb_channels_avx2, quantize_xyb_tile_colors_avx2, round_lattice_pow2_avx2,
 };
-pub(crate) use xyb::to_xyb_avx2_band;
+pub(crate) use ssimulacra2::{ss2_contribution_avx2, ss2_expand_row_avx2};
+pub(crate) use xyb::{to_linear_rows_avx2, to_xyb_avx2_band};
 pub(crate) use yellow_opsin::sampled_b_gradient_ratio_avx2;
 pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};
 

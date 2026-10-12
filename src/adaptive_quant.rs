@@ -65,14 +65,14 @@ pub(crate) fn ratio_cubic_to_simple_gamma<const INVERT: bool>(v: f32) -> f32 {
 /// Visual-masking transform applied to the accumulated per-block difference.
 #[inline]
 pub(crate) fn compute_mask(out_val: f32) -> f32 {
-    let k_base = -0.7647f32;
+    let k_base = -0.699765f32;
     let k_mul4 = 9.4708735624378946f32;
     let k_mul2 = 17.35036561631863f32;
     let k_offset2 = 302.59587815579727f32;
     let k_mul3 = 6.7943250517376494f32;
     let k_offset3 = 3.7179635626140772f32;
     let k_offset4 = 0.25f32 * k_offset3;
-    let k_mul0 = 0.80061762862741759f32;
+    let k_mul0 = 1.07267f32;
 
     let v1 = (out_val * k_mul0).max(1e-3);
     let v2 = 1.0 / (v1 + k_offset2);
@@ -93,19 +93,35 @@ pub(crate) fn masking_sqrt(v: f32) -> f32 {
 /// HF modulation (current libjxl): per-difference clamp at `valmin_y`, summed
 /// over the 8x8 Y block, then `sum * kMul_y + kOffset` added to `out_val`.
 pub(crate) fn hf_modulation_strength(distance: f32) -> f32 {
-    (0.5 * distance).clamp(0.1, 1.0)
+    (1.06836 * distance).clamp(0.1, 0.890398)
 }
 
-const AQ_PEAK: f32 = 0.8;
-const AQ_FADE_START: f32 = 1.0;
-const AQ_FADE_END: f32 = 1.75;
+/// Distance knots of the masking strength and flat-level schedules.
+static AQ_KNOTS: [f32; 7] = [0.5, 1.0, 1.4, 1.75, 3.0, 5.0, 8.0];
+/// Masking strength at `AQ_KNOTS` (linear between, clamped outside); 0 = flat field.
+static AQ_STRENGTH: [f32; 7] = [0.26565, 0.275459, 0.058287, 0.0, 0.0, 0.0, 0.0];
+/// Flat field level (fraction of the distance-derived scale) at `AQ_KNOTS`.
+static AQ_BASE_LEVEL: [f32; 7] = [0.636493, 0.648351, 0.606759, 0.48, 0.48, 0.48, 0.48];
+
+fn aq_schedule(values: &[f32; 7], distance: f32) -> f32 {
+    if distance <= AQ_KNOTS[0] {
+        return values[0];
+    }
+    for i in 1..AQ_KNOTS.len() {
+        if distance <= AQ_KNOTS[i] {
+            let f = (distance - AQ_KNOTS[i - 1]) / (AQ_KNOTS[i] - AQ_KNOTS[i - 1]);
+            return values[i - 1] + f * (values[i] - values[i - 1]);
+        }
+    }
+    values[AQ_KNOTS.len() - 1]
+}
 
 pub(crate) fn aq_dampen(distance: f32) -> f32 {
-    if distance < AQ_FADE_START {
-        return AQ_PEAK;
-    }
-    let t = (distance - AQ_FADE_START) / (AQ_FADE_END - AQ_FADE_START);
-    (AQ_PEAK * (1.0 - t)).clamp(0.0, 1.0)
+    aq_schedule(&AQ_STRENGTH, distance).clamp(0.0, 1.0)
+}
+
+pub(crate) fn aq_base_level(distance: f32) -> f32 {
+    aq_schedule(&AQ_BASE_LEVEL, distance)
 }
 
 pub(crate) fn hf_modulation(
@@ -136,8 +152,8 @@ pub(crate) fn hf_modulation(
             sum_y += valmin_y.min((p - row_next[c0]).abs());
         }
     }
-    let k_mul_y = -0.38 * strength;
-    let k_offset = 0.42f32; // higher value -> more bpp
+    let k_mul_y = -0.506626 * strength;
+    let k_offset = 0.655866f32; // higher value -> more bpp
     fmla(sum_y, k_mul_y, k_offset) + out_val
 }
 
@@ -165,7 +181,7 @@ pub(crate) fn blue_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) -
             }
         }
     }
-    let k_mul = 0.90590804735610064f32;
+    let k_mul = 0.127191f32;
     let mut scalar_sum = sum;
     // If it is all blue, don't boost the quantization (avoid over-spending on sky).
     if scalar_sum >= 32.0 * k_limit {
@@ -413,7 +429,7 @@ pub(crate) fn gamma_modulation(x: usize, y: usize, xyb: &Image3F, out_val: f32) 
     }
     overall_ratio *= 1.0 / 64.0;
     // ideally -1.0, but optimal correction adds some entropy, so slightly less.
-    let k_gam = 0.1005613337192697f32;
+    let k_gam = 0.119146f32;
     fmla(k_gam, dirty_log2f(overall_ratio), out_val)
 }
 
@@ -674,7 +690,7 @@ fn fill_quant_field_scalar(
     }
 
     // ---- Stage 3: PerBlockModulations + write integer quant field.
-    let base_level = 0.48 * scale;
+    let base_level = aq_base_level(distance) * scale;
     let dampen = aq_dampen(distance);
     let mul = scale * dampen;
     let add = (1.0 - dampen) * base_level;
@@ -788,10 +804,10 @@ pub(crate) fn dirty_log2p1f(x: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        AQ_FADE_END, AQ_FADE_START, AQ_PEAK, AqMapScratch, Image3F, ImageB,
-        apply_chroma_hf_protection, apply_chroma_hf_protection_with_stats, aq_dampen,
-        chroma_hf_stats_scalar, dirty_log2f, dirty_log2p1f, fill_quant_field_scalar,
-        hf_modulation_strength, selected_chroma_hf_stats_fn, selected_fill_quant_field_fn,
+        AQ_STRENGTH, AqMapScratch, Image3F, ImageB, apply_chroma_hf_protection,
+        apply_chroma_hf_protection_with_stats, aq_dampen, chroma_hf_stats_scalar, dirty_log2f,
+        dirty_log2p1f, fill_quant_field_scalar, hf_modulation_strength,
+        selected_chroma_hf_stats_fn, selected_fill_quant_field_fn,
     };
 
     #[test]
@@ -908,34 +924,14 @@ mod tests {
 
     #[test]
     fn aq_dampen_holds_then_fades_to_a_flat_field() {
-        for d in [0.0, 0.1, 0.5, 0.99] {
-            assert_eq!(
-                aq_dampen(d),
-                AQ_PEAK,
-                "AQ should be at full strength at d={d}"
-            );
-        }
-        assert_eq!(aq_dampen(AQ_FADE_START), AQ_PEAK);
-        // Fully faded at and beyond the end of the ramp — never negative, and
-        // never re-activating at the very coarse distances.
-        for d in [AQ_FADE_END, 2.0, 4.0, 10.0, 25.0] {
+        assert_eq!(aq_dampen(0.5), AQ_STRENGTH[0]);
+        assert_eq!(aq_dampen(1.0), AQ_STRENGTH[1]);
+        assert!((aq_dampen(1.4) - AQ_STRENGTH[2]).abs() < 1e-6);
+        for d in [1.75, 2.0, 5.0, 12.0] {
             assert_eq!(aq_dampen(d), 0.0, "AQ should be off at d={d}");
         }
-        // Monotonically non-increasing and in range across the whole domain.
-        let mut prev = f32::INFINITY;
-        for i in 0..=200 {
-            let d = i as f32 * 0.05;
-            let v = aq_dampen(d);
-            assert!(v <= prev + 1e-7, "aq_dampen rose at d={d}");
-            assert!(
-                (0.0..=AQ_PEAK).contains(&v),
-                "aq_dampen out of range at d={d}"
-            );
-            prev = v;
-        }
-        // Halfway through the ramp is half strength.
-        let mid = 0.5 * (AQ_FADE_START + AQ_FADE_END);
-        assert!((aq_dampen(mid) - 0.5 * AQ_PEAK).abs() < 1e-6);
+        let mid = 0.5 * (1.4 + 1.75);
+        assert!((aq_dampen(mid) - 0.5 * AQ_STRENGTH[2]).abs() < 1e-6);
     }
 
     /// The SIMD backends take a wide vector path only for groups of blocks that
@@ -1030,11 +1026,14 @@ mod tests {
 
     #[test]
     fn hf_modulation_strength_protects_high_quality_detail() {
-        assert_eq!(hf_modulation_strength(0.1), 0.1);
-        assert_eq!(hf_modulation_strength(0.3), 0.15);
-        assert_eq!(hf_modulation_strength(0.5), 0.25);
-        assert_eq!(hf_modulation_strength(1.0), 0.5);
-        assert_eq!(hf_modulation_strength(2.0), 1.0);
-        assert_eq!(hf_modulation_strength(6.0), 1.0);
+        // Floor 0.1, linear ramp, capped: monotone and bounded.
+        assert_eq!(hf_modulation_strength(0.05), 0.1);
+        let mut prev = hf_modulation_strength(0.05);
+        for i in 1..60 {
+            let s = hf_modulation_strength(0.1 * i as f32);
+            assert!(s >= prev && s <= hf_modulation_strength(100.0));
+            prev = s;
+        }
+        assert_eq!(hf_modulation_strength(6.0), hf_modulation_strength(100.0));
     }
 }

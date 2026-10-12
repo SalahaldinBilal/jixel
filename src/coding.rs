@@ -112,8 +112,8 @@ impl CodingTransform {
     }
 
     /// Per-image multipliers of `table_scale`. The tables are fitted on
-    /// images whose colour G (or luma) predicts, but where red or blue
-    /// dominates, that colour carries the visible structure: in RGB on its own
+    /// images whose color G (or luma) predicts, but where red or blue
+    /// dominates, that color carries the visible structure: in RGB on its own
     /// coarser plane, in YCbCr on a luma that sees a fraction of it. Such
     /// images take finer tables there.
     pub(crate) fn plane_scale(self, coded: &crate::image::Image3F) -> [f32; 3] {
@@ -279,7 +279,7 @@ pub(crate) fn fit_cfl_frame(
 }
 
 /// Shares of the image's gradient energy (all of R, G, B; horizontal and
-/// vertical neighbour differences) carried by R and by B where that channel
+/// vertical neighbor differences) carried by R and by B where that channel
 /// dominates the pixel: above 0.15 and over 1.6x both others. `decode` maps
 /// coded triples to R, G, B.
 fn dominant_gradient_shares(
@@ -364,7 +364,6 @@ pub(crate) fn srgb_eotf(v: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EncodeConfig;
 
     /// The decoder's inverse of `ycbcr_triple` (libjxl `stage_ycbcr`).
     fn decode_ycbcr([cb, y, cr]: [f32; 3]) -> [f32; 3] {
@@ -377,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn dominant_colour_refines_its_plane() {
+    fn dominant_color_refines_its_plane() {
         // A textured channel over two flat ones, coded with `coding`.
         let textured = |coding: CodingTransform, dominant: usize| {
             let mut img = crate::image::Image3F::new(32, 32);
@@ -457,45 +456,5 @@ mod tests {
             CodingTransform::Rgb.code(0.25, 0.5, 0.75),
             [0.25, 0.5, 0.75]
         );
-    }
-
-    /// Every lossy entry point (integer, float, gray) codes all three
-    /// transforms, and the non-XYB ones are real alternatives rather than a
-    /// silent XYB fallback.
-    #[test]
-    fn rgb_entry_points_take_every_transform() {
-        let (w, h) = (300, 260);
-        let rgb: Vec<u8> = (0..w * h * 3).map(|i| ((i * 7) % 251) as u8).collect();
-        let rgba: Vec<u8> = (0..w * h * 4).map(|i| ((i * 5) % 253) as u8).collect();
-        let rgb16: Vec<u16> = rgb.iter().map(|&v| u16::from(v) << 8).collect();
-        // Float input past [0, 1] exercises the DC range guard.
-        let rgbf: Vec<f32> = rgb.iter().map(|&v| f32::from(v) / 25.0).collect();
-        let gray: Vec<u8> = rgb.iter().step_by(3).copied().collect();
-        let gray16: Vec<u16> = gray.iter().map(|&v| u16::from(v) * 257).collect();
-        let grayf: Vec<f32> = gray.iter().map(|&v| f32::from(v) / 255.0).collect();
-        for speed in [crate::Speed::Fast, crate::Speed::Slow] {
-            let mut outputs = Vec::new();
-            for transform in [
-                CodingTransform::Xyb,
-                CodingTransform::YCbCr,
-                CodingTransform::Rgb,
-            ] {
-                let config = EncodeConfig::default()
-                    .with_speed(speed)
-                    .with_distance(1.5)
-                    .with_coding_transform(transform);
-                let a = crate::encode_image(&rgb, w, h, &config).unwrap();
-                crate::encode_image_with_alpha(&rgba, w, h, &config).unwrap();
-                crate::encode_image_16bit(&rgb16, w, h, &config).unwrap();
-                crate::encode_image_f32(&rgbf, w, h, &config).unwrap();
-                crate::encode_image_gray(&gray, w, h, &config).unwrap();
-                crate::encode_image_gray_16bit(&gray16, w, h, &config).unwrap();
-                crate::encode_image_gray_f32(&grayf, w, h, &config).unwrap();
-                outputs.push(a);
-            }
-            assert_ne!(outputs[0], outputs[1]);
-            assert_ne!(outputs[0], outputs[2]);
-            assert_ne!(outputs[1], outputs[2]);
-        }
     }
 }

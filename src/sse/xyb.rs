@@ -36,6 +36,90 @@ use std::arch::x86_64::*;
 
 #[inline]
 #[target_feature(enable = "sse4.1")]
+#[cfg_attr(target_feature = "fma", target_feature(enable = "fma"))]
+fn xyb_to_rgb_sse41(m: &XybMatrix, x: __m128, y: __m128, b: __m128) -> (__m128, __m128, __m128) {
+    let cube = |value: __m128| {
+        let value = _mm_sub_ps(value, _mm_set1_ps(NEG_BIAS_CBRT));
+        // Keep the cube and bias subtraction separate, as in the scalar inverse.
+        _mm_sub_ps(
+            _mm_mul_ps(_mm_mul_ps(value, value), value),
+            _mm_set1_ps(OPSIN_BIAS),
+        )
+    };
+    let m0 = cube(_mm_add_ps(y, x));
+    let m1 = cube(_mm_sub_ps(y, x));
+    let m2 = cube(b);
+    // Match dct::fmla, including builds that do not fuse the inverse matrix.
+    let row = |offset: usize| {
+        let value = _mm_mul_ps(m2, _mm_set1_ps(m.inv[offset + 2]));
+        #[cfg(target_feature = "fma")]
+        {
+            let value = _mm_fmadd_ps(m1, _mm_set1_ps(m.inv[offset + 1]), value);
+            _mm_fmadd_ps(m0, _mm_set1_ps(m.inv[offset]), value)
+        }
+        #[cfg(not(target_feature = "fma"))]
+        {
+            _mm_add_ps(
+                _mm_mul_ps(m0, _mm_set1_ps(m.inv[offset])),
+                _mm_add_ps(_mm_mul_ps(m1, _mm_set1_ps(m.inv[offset + 1])), value),
+            )
+        }
+    };
+    (row(0), row(3), row(6))
+}
+
+/// # Safety
+/// The CPU must support the enabled target features and all six slices must
+/// have equal lengths. Only complete SIMD vectors are read and written.
+#[target_feature(enable = "sse4.1")]
+#[cfg_attr(target_feature = "fma", target_feature(enable = "fma"))]
+pub(crate) unsafe fn to_linear_rows_sse41(
+    m: &XybMatrix,
+    input: [&[f32]; 3],
+    output: [&mut [f32]; 3],
+) -> usize {
+    let [r, g, b] = output;
+    let done = unsafe { to_linear_rows::<4>(m, input, [r, g, b]) };
+    done + unsafe {
+        to_linear_rows::<1>(
+            m,
+            input.map(|row| &row[done..]),
+            [&mut r[done..], &mut g[done..], &mut b[done..]],
+        )
+    }
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
+#[cfg_attr(target_feature = "fma", target_feature(enable = "fma"))]
+unsafe fn to_linear_rows<const N: usize>(
+    m: &XybMatrix,
+    [x, y, b]: [&[f32]; 3],
+    [r, g, out_b]: [&mut [f32]; 3],
+) -> usize {
+    const LANES: usize = 4;
+    let done = r.len() / (N * LANES) * (N * LANES);
+    for start in (0..done).step_by(N * LANES) {
+        for lane in 0..N {
+            let i = start + lane * LANES;
+            // The caller's equal-length contract and complete-vector loop
+            // bound cover every unaligned load and store.
+            unsafe {
+                let xv = _mm_loadu_ps(x.as_ptr().add(i));
+                let yv = _mm_loadu_ps(y.as_ptr().add(i));
+                let bv = _mm_loadu_ps(b.as_ptr().add(i));
+                let (rv, gv, bv) = xyb_to_rgb_sse41(m, xv, yv, bv);
+                _mm_storeu_ps(r.as_mut_ptr().add(i), rv);
+                _mm_storeu_ps(g.as_mut_ptr().add(i), gv);
+                _mm_storeu_ps(out_b.as_mut_ptr().add(i), bv);
+            }
+        }
+    }
+    done
+}
+
+#[inline]
+#[target_feature(enable = "sse4.1")]
 fn halley_cbrt_sse41(x: __m128, a: __m128) -> __m128 {
     let tx = _mm_mul_ps(_mm_mul_ps(x, x), x);
     let two = _mm_set1_ps(2.0);

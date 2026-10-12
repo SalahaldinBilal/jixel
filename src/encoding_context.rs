@@ -147,7 +147,7 @@ pub(crate) struct EncodingContext {
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
     pub(crate) cfl_rdo_block: color_correlation::CflRdoBlockFn,
     pub(crate) cfl_rdo_stats: color_correlation::CflRdoStatsFn,
-    pub(crate) cfl_closed_loop_cost: color_correlation::CflClosedLoopCostFn,
+    pub(crate) cfl_rd_cost: color_correlation::CflRdCostFn,
     pub(crate) chroma_gradient_sums: frame::ChromaGradientSumsFn,
     pub(crate) fill_ytob_row: color_correlation::FillYtobRowFn,
     pub(crate) accumulate_ytob_weights: color_correlation::AccumulateYtobWeightsFn,
@@ -167,6 +167,9 @@ pub(crate) struct EncodingContext {
     pub(crate) dct64x64: &'static dct::DctFn<64, 64, 4096>,
     pub(crate) dct64x32: &'static dct::DctFn<32, 64, 2048>,
     pub(crate) dct32x64: &'static dct::DctFn<64, 32, 2048>,
+    pub(crate) dct128x128: &'static dct::DctFn<128, 128, 16384>,
+    pub(crate) dct128x64: &'static dct::DctFn<64, 128, 8192>,
+    pub(crate) dct64x128: &'static dct::DctFn<128, 64, 8192>,
     pub(crate) dct32x16: &'static dct::DctFn<16, 32, 512>,
     pub(crate) dct16x32: &'static dct::DctFn<32, 16, 512>,
     pub(crate) dc_from_dct32x32: dct::DcFromDct32x32Fn,
@@ -175,6 +178,9 @@ pub(crate) struct EncodingContext {
     pub(crate) dc_from_dct64x64: dct::DcFromDct64x64Fn,
     pub(crate) dc_from_dct64x32: dct::DcFromDct64x32Fn,
     pub(crate) dc_from_dct32x64: dct::DcFromDct32x64Fn,
+    pub(crate) dc_from_dct128x128: dct::DcFromDct128x128Fn,
+    pub(crate) dc_from_dct128x64: dct::DcFromDct128x64Fn,
+    pub(crate) dc_from_dct64x128: dct::DcFromDct64x128Fn,
     pub(crate) afv0: afv::AfvFn,
     pub(crate) afv1: afv::AfvFn,
     pub(crate) afv2: afv::AfvFn,
@@ -286,6 +292,12 @@ impl EncodingContext {
     pub(crate) fn raise_b_qm_scale(&self, scale: u32) {
         self.b_qm_scale
             .fetch_max(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Frame-level race result: replaces the gate-raised scale.
+    pub(crate) fn set_b_qm_scale(&self, scale: u32) {
+        self.b_qm_scale
+            .store(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn b_qm_scale(&self) -> u32 {
@@ -506,7 +518,7 @@ impl EncodingContext {
             cfl_regression: color_correlation::selected_cfl_regression_fn(),
             cfl_rdo_block: color_correlation::selected_cfl_rdo_block_fn(),
             cfl_rdo_stats: color_correlation::selected_cfl_rdo_stats_fn(),
-            cfl_closed_loop_cost: color_correlation::selected_cfl_closed_loop_cost_fn(),
+            cfl_rd_cost: color_correlation::selected_cfl_rd_cost_fn(),
             chroma_gradient_sums: frame::selected_chroma_gradient_sums_fn(),
             fill_ytob_row: color_correlation::selected_fill_ytob_row_fn(),
             accumulate_ytob_weights: color_correlation::selected_accumulate_ytob_weights_fn(),
@@ -526,6 +538,9 @@ impl EncodingContext {
             dct64x64: dct::selected_dct64x64(),
             dct64x32: dct::selected_dct64x32(),
             dct32x64: dct::selected_dct32x64(),
+            dct128x128: crate::dct128::selected_dct128x128(),
+            dct128x64: crate::dct128::selected_dct128x64(),
+            dct64x128: crate::dct128::selected_dct64x128(),
             dct32x16: dct::selected_dct32x16(),
             dct16x32: dct::selected_dct16x32(),
             dc_from_dct32x32: dc_from_dct.dct32x32,
@@ -534,6 +549,9 @@ impl EncodingContext {
             dc_from_dct64x64: dc_from_dct.dct64x64,
             dc_from_dct64x32: dc_from_dct.dct64x32,
             dc_from_dct32x64: dc_from_dct.dct32x64,
+            dc_from_dct128x128: dc_from_dct.dct128x128,
+            dc_from_dct128x64: dc_from_dct.dct128x64,
+            dc_from_dct64x128: dc_from_dct.dct64x128,
             afv0: afv.afv0,
             afv1: afv.afv1,
             afv2: afv.afv2,

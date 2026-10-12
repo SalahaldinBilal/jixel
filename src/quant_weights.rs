@@ -98,7 +98,9 @@ pub(crate) struct BandOverride {
 }
 
 const QM_SS2_MIN_DISTANCE: f32 = 2.25;
-const QM_DCT8_MIN_DISTANCE: f32 = 3.5;
+const QM_DCT8_MIN_DISTANCE: f32 = 4.3;
+/// The color proxy and the tiers without rectangles keep the original coarse-DCT8 gate.
+const ORIGINAL_COARSE_DCT8_DISTANCE: f32 = 3.5;
 pub(crate) const QM_FLAT_B8_MIN_DISTANCE: f32 = 0.3;
 pub(crate) const QM_FLAT_B8_MID_MIN_DISTANCE: f32 = 1.25;
 pub(crate) const PAIR_B_FINE_BAND1: f32 = -0.35;
@@ -1123,6 +1125,128 @@ static DCT32X64_BANDS: [[f32; 8]; 3] = [
     ],
 ];
 
+/// JPEG XL DCT128X128 library parameters.
+static DCT128X128_BANDS: [[f32; 8]; 3] = [
+    [
+        1.8 * 26629.073922049845,
+        -1.025,
+        -0.78,
+        -0.65012,
+        -0.19041574084286472,
+        -0.20819395464,
+        -0.421064,
+        -0.3273384553584867,
+    ],
+    [
+        1.8 * 9311.323871001005,
+        -0.3041958212306401,
+        -0.3633036457487539,
+        -0.35660379990111464,
+        -0.3443074455424403,
+        -0.33699592683512467,
+        -0.3018086652624211,
+        -0.27321683125358037,
+    ],
+    [
+        1.8 * 4992.248644553863,
+        -1.2,
+        -1.2,
+        -0.8,
+        -0.7,
+        -0.7,
+        -0.4,
+        -0.5,
+    ],
+];
+
+/// JPEG XL DCT64X128 library parameters, shared by both orientations.
+static DCT64X128_BANDS: [[f32; 8]; 3] = [
+    [
+        1.3 * 23629.073922049845,
+        -1.025,
+        -0.78,
+        -0.65012,
+        -0.19041574084286472,
+        -0.20819395464,
+        -0.421064,
+        -0.3273384553584867,
+    ],
+    [
+        1.3 * 8611.323871001005,
+        -0.3041958212306401,
+        -0.3633036457487539,
+        -0.35660379990111464,
+        -0.3443074455424403,
+        -0.33699592683512467,
+        -0.3018086652624211,
+        -0.27321683125358037,
+    ],
+    [
+        1.3 * 4492.248644553863,
+        -1.2,
+        -1.2,
+        -0.8,
+        -0.7,
+        -0.7,
+        -0.4,
+        -0.5,
+    ],
+];
+
+/// A `rows x cols` DCT-mode table (rows <= cols, the normalized layout).
+fn compute_band_matrix(src: &[[f32; 8]; 3], rows: usize, cols: usize) -> [Vec<f32>; 3] {
+    const NUM_BANDS: usize = 8;
+    std::array::from_fn(|c| {
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = src[c][0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(src[c][i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let rcprow = scale / (rows - 1) as f32;
+        let rcpcol = scale / (cols - 1) as f32;
+        let mut out = vec![0.0f32; rows * cols];
+        for y in 0..rows {
+            let dy = y as f32 * rcprow;
+            for x in 0..cols {
+                let dx = x as f32 * rcpcol;
+                out[y * cols + x] =
+                    1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
+            }
+        }
+        out
+    })
+}
+
+pub(crate) struct Tables128 {
+    pub(crate) matrix_128x128: [Vec<f32>; 3],
+    pub(crate) inv_matrix_128x128: [Vec<f32>; 3],
+    pub(crate) matrix_128x64: [Vec<f32>; 3],
+    pub(crate) inv_matrix_128x64: [Vec<f32>; 3],
+}
+
+/// Spec-default tables of the 128 family; never signaled.
+pub(crate) fn tables_128() -> &'static Tables128 {
+    static TABLES: std::sync::OnceLock<Tables128> = std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let reciprocals = |m: &[Vec<f32>; 3]| -> [Vec<f32>; 3] {
+            std::array::from_fn(|c| {
+                let mut inv = vec![0.0f32; m[c].len()];
+                fill_ac_reciprocals(&m[c], &mut inv);
+                inv
+            })
+        };
+        let matrix_128x128 = compute_band_matrix(&DCT128X128_BANDS, 128, 128);
+        let matrix_128x64 = compute_band_matrix(&DCT64X128_BANDS, 64, 128);
+        Tables128 {
+            inv_matrix_128x128: reciprocals(&matrix_128x128),
+            inv_matrix_128x64: reciprocals(&matrix_128x64),
+            matrix_128x128,
+            matrix_128x64,
+        }
+    })
+}
+
 fn compute_dct64x64_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 3, 4096> {
     const NUM_BANDS: usize = 8;
     let mut src = DCT64X64_BANDS;
@@ -1608,6 +1732,7 @@ static CHROMATIC_DCT8_ROWS: [f32; 3] = [1.56, 1.07, 0.52];
 // row spends more rate than both perceptual metrics justify; retain the
 // fitted frequency shape and reduce only its base weight.
 const ORDINARY_DCT8_B_SCALE: f32 = 0.65;
+const SS2_DCT8_B_SCALE: f32 = 0.62;
 
 fn scale_dct8_base_weights(o: &mut BandOverride, mul: [f32; 3]) {
     for c in 0..3 {
@@ -1857,7 +1982,7 @@ impl DequantMatrices {
         if distance < QM_FLAT_B8_MIN_DISTANCE {
             return &DEQUANT_MATRIX_8X8[c];
         }
-        let table = if distance >= QM_DCT8_MIN_DISTANCE {
+        let table = if distance >= ORIGINAL_COARSE_DCT8_DISTANCE {
             COARSE.get_or_init(|| {
                 compute_dct8x8_matrix(&default_dct8_override(true, &FLAT_B8_BANDS_MID))
             })
@@ -1912,8 +2037,24 @@ impl DequantMatrices {
     pub(crate) fn new_fast(distance: f32) -> &'static Self {
         static HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static MID: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
-        if !(QM_FLAT_B8_MIN_DISTANCE..QM_SS2_MIN_DISTANCE).contains(&distance) {
+        static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        if distance < QM_FLAT_B8_MIN_DISTANCE {
             return Self::new(distance);
+        }
+        if distance >= QM_SS2_MIN_DISTANCE {
+            let coarse = distance >= ORIGINAL_COARSE_DCT8_DISTANCE;
+            let cache = if coarse { &COARSE } else { &SS2 };
+            return cache.get_or_init(|| {
+                Self::compute_with_ordinary_fit(
+                    true,
+                    coarse,
+                    Some(&FLAT_B8_BANDS_MID),
+                    false,
+                    false,
+                    false,
+                )
+            });
         }
         let (cache, bands) = if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
             (&MID, &FLAT_B8_BANDS_MID)
@@ -2001,6 +2142,11 @@ impl DequantMatrices {
             && let Some(o) = o8.as_mut()
         {
             scale_dct8_base_weights(o, [1.0, 1.0, ORDINARY_DCT8_B_SCALE]);
+        } else if ordinary_fit
+            && use_ss2
+            && let Some(o) = o8.as_mut()
+        {
+            scale_dct8_base_weights(o, [1.0, 1.0, SS2_DCT8_B_SCALE]);
         }
         let o16 = use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16));
         let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
@@ -2347,6 +2493,27 @@ impl DequantMatrices {
         &self.inv_matrix_64x64[c]
     }
 
+    /// Forward/inverse table of a 128-family strategy.
+    #[inline]
+    pub(crate) fn matrix_128(&self, strategy: u8, c: usize) -> &'static [f32] {
+        let t = tables_128();
+        if strategy == crate::dc_group_data::STRATEGY_DCT128X128 {
+            &t.matrix_128x128[c]
+        } else {
+            &t.matrix_128x64[c]
+        }
+    }
+
+    #[inline]
+    pub(crate) fn inv_matrix_128(&self, strategy: u8, c: usize) -> &'static [f32] {
+        let t = tables_128();
+        if strategy == crate::dc_group_data::STRATEGY_DCT128X128 {
+            &t.inv_matrix_128x128[c]
+        } else {
+            &t.inv_matrix_128x64[c]
+        }
+    }
+
     #[inline]
     pub(crate) fn matrix_64x32(&self, c: usize) -> &[f32; 2048] {
         &self.matrix_64x32[c]
@@ -2411,6 +2578,21 @@ fn fill_ac_reciprocals(matrix: &[f32], inv: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_band_matrix_matches_the_64_tables() {
+        let square = compute_band_matrix(&DCT64X64_BANDS, 64, 64);
+        let rect = compute_band_matrix(&DCT32X64_BANDS, 32, 64);
+        let m64 = compute_dct64x64_matrix(None);
+        let m6432 = compute_dct64x32_matrix(None);
+        for c in 0..3 {
+            assert_eq!(&square[c][..], &m64[c][..]);
+            assert_eq!(&rect[c][..], &m6432[c][..]);
+        }
+        let t = tables_128();
+        assert_eq!(t.matrix_128x128[1].len(), 16384);
+        assert_eq!(t.matrix_128x64[1].len(), 8192);
+    }
 
     #[test]
     fn chromatic_sets_scale_the_dct8_base_weights() {
@@ -2692,6 +2874,10 @@ mod tests {
         for d in [2.25, 3.0, 3.5, 5.0] {
             assert_eq!(
                 DequantMatrices::new(d).custom_tables[0].unwrap().bands[2][0],
+                317.5 // F16(512 * 0.62 / 64) * 64
+            );
+            assert_eq!(
+                DequantMatrices::new_fast(d).custom_tables[0].unwrap().bands[2][0],
                 512.0
             );
         }
@@ -2708,7 +2894,10 @@ mod tests {
                 } else {
                     &FLAT_B8_BANDS_MID
                 };
-                compute_dct8x8_matrix(&default_dct8_override(d >= QM_DCT8_MIN_DISTANCE, b))
+                compute_dct8x8_matrix(&default_dct8_override(
+                    d >= ORIGINAL_COARSE_DCT8_DISTANCE,
+                    b,
+                ))
             };
             for c in 0..3 {
                 assert_eq!(DequantMatrices::color_proxy_matrix(d, c), &expected[c]);

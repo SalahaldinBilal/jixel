@@ -204,6 +204,68 @@ pub(crate) fn xyb_to_rgb_pixel_f32(m: &XybMatrix, x: f32, y: f32, b: f32) -> [f3
     ]
 }
 
+/// Row kernels return the SIMD prefix; the driver applies the scalar inverse
+/// to the tail, preserving its operation order and fused/unfused arithmetic.
+type ToLinearRowsFn = unsafe fn(&XybMatrix, [&[f32]; 3], [&mut [f32]; 3]) -> usize;
+
+fn to_linear_rows_scalar(
+    m: &XybMatrix,
+    [x, y, b]: [&[f32]; 3],
+    [r, g, out_b]: [&mut [f32]; 3],
+) -> usize {
+    for (((((x, y), b), r), g), out_b) in x.iter().zip(y).zip(b).zip(r).zip(g).zip(out_b) {
+        [*r, *g, *out_b] = xyb_to_rgb_pixel_f32(m, *x, *y, *b);
+    }
+    x.len()
+}
+
+fn selected_to_linear_rows_fn() -> ToLinearRowsFn {
+    static ROWS: OnceLock<ToLinearRowsFn> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") {
+            return crate::avx::to_linear_rows_avx2;
+        }
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        if std::is_x86_feature_detected!("sse4.1") {
+            return crate::sse::to_linear_rows_sse41;
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        {
+            crate::neon::to_linear_rows_neon
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+        {
+            crate::wasm::to_linear_rows_wasm
+        }
+        #[cfg(not(any(
+            all(target_arch = "aarch64", feature = "neon"),
+            all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128")
+        )))]
+        to_linear_rows_scalar
+    })
+}
+
+/// Planar XYB → linear RGB, with runtime SIMD dispatch and scalar tails.
+/// Input and output rows may be cropped and unaligned, but must have equal lengths.
+pub(crate) fn xyb_to_rgb_rows(m: &XybMatrix, input: [&[f32]; 3], output: [&mut [f32]; 3]) {
+    let n = input[0].len();
+    assert!(input.iter().all(|row| row.len() == n));
+    assert!(output.iter().all(|row| row.len() == n));
+    let rows = selected_to_linear_rows_fn();
+    let [r, g, b] = output;
+    // SAFETY: runtime dispatch selects supported CPU features, and all six
+    // slices have `n` elements. The SIMD kernels process only complete vectors.
+    let done = unsafe { rows(m, input, [r, g, b]) };
+    if done < n {
+        to_linear_rows_scalar(
+            m,
+            input.map(|row| &row[done..]),
+            [&mut r[done..], &mut g[done..], &mut b[done..]],
+        );
+    }
+}
+
 pub(crate) type ToXybBandFn = unsafe fn(&XybMatrix, [&[f32]; 3], [&mut [f32]; 3], usize);
 
 fn select_to_xyb_band_fn() -> ToXybBandFn {
@@ -486,6 +548,179 @@ pub(crate) fn quantize_xyb_tile_colors(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn inverse_row_kernels() -> Vec<(&'static str, ToLinearRowsFn)> {
+        #[allow(unused_mut)]
+        let mut kernels: Vec<(&str, ToLinearRowsFn)> = vec![
+            ("dispatch", selected_to_linear_rows_fn()),
+            ("scalar", to_linear_rows_scalar),
+        ];
+        #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            kernels.push(("neon", crate::neon::to_linear_rows_neon));
+        }
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::is_x86_feature_detected!("avx2") {
+            kernels.push(("avx2", crate::avx::to_linear_rows_avx2));
+        }
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
+        if std::is_x86_feature_detected!("sse4.1") {
+            kernels.push(("sse4.1", crate::sse::to_linear_rows_sse41));
+        }
+        #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+        kernels.push(("wasm", crate::wasm::to_linear_rows_wasm));
+        kernels
+    }
+
+    fn check_inverse_rows(m: &XybMatrix, input: [&[f32]; 3], offset: usize) {
+        const GUARD: f32 = -12345.0;
+        let n = input[0].len();
+        let expected: Vec<[f32; 3]> = (0..n)
+            .map(|i| xyb_to_rgb_pixel_f32(m, input[0][i], input[1][i], input[2][i]))
+            .collect();
+        for (name, rows) in inverse_row_kernels() {
+            let mut out: [Vec<f32>; 3] = std::array::from_fn(|_| vec![GUARD; offset + n + 4]);
+            let [r, g, b] = &mut out;
+            // SAFETY: the inventory checks the kernel's CPU features, and
+            // all six slices have `n` elements, including empty rows.
+            let done = unsafe {
+                rows(
+                    m,
+                    input,
+                    [
+                        &mut r[offset..offset + n],
+                        &mut g[offset..offset + n],
+                        &mut b[offset..offset + n],
+                    ],
+                )
+            };
+            assert!(done <= n, "{name}: processed {done} of {n}");
+            to_linear_rows_scalar(
+                m,
+                input.map(|p| &p[done..]),
+                [
+                    &mut r[offset + done..offset + n],
+                    &mut g[offset + done..offset + n],
+                    &mut b[offset + done..offset + n],
+                ],
+            );
+            for c in 0..3 {
+                for (i, rgb) in expected.iter().enumerate() {
+                    let actual = out[c][offset + i];
+                    if rgb[c].is_nan() {
+                        assert!(
+                            actual.is_nan(),
+                            "{name}: n={n}, offset={offset}, channel={c}, pixel={i}"
+                        );
+                    } else {
+                        assert_eq!(
+                            actual.to_bits(),
+                            rgb[c].to_bits(),
+                            "{name}: n={n}, offset={offset}, channel={c}, pixel={i}"
+                        );
+                    }
+                }
+                assert!(
+                    out[c][..offset]
+                        .iter()
+                        .chain(&out[c][offset + n..])
+                        .all(|&v| v == GUARD),
+                    "{name}: output guards"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_rows_match_scalar_for_all_tails_alignment_and_matrices() {
+        let custom = XybMatrix {
+            fwd: XybMatrix::SPEC.fwd,
+            inv: std::array::from_fn(|i| XybMatrix::SPEC.inv[i] + (i as f32 - 4.0) * 0.125),
+        };
+        for m in [XybMatrix::SPEC, custom] {
+            for n in (0..=65).chain([95, 127, 128, 129, 257]) {
+                for offset in 0..4 {
+                    let input: [Vec<f32>; 3] = std::array::from_fn(|c| {
+                        (0..n + 4)
+                            .map(|i| {
+                                let noise = ((i * 71 + c * 113) % 101) as f32 / 101.0;
+                                if c == 0 {
+                                    0.16 * noise - 0.08
+                                } else {
+                                    1.5 * noise - 0.2
+                                }
+                            })
+                            .collect()
+                    });
+                    check_inverse_rows(
+                        &m,
+                        input.each_ref().map(|p| &p[offset..offset + n]),
+                        offset,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_rows_preserve_signed_values_hdr_and_extreme_arithmetic() {
+        let values = [
+            -0.0,
+            0.0,
+            NEG_BIAS_CBRT,
+            -NEG_BIAS_CBRT,
+            f32::from_bits(1),
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            -2.0,
+            2.0,
+            16.0,
+            -16.0,
+            1e12,
+            -1e12,
+            1e13,
+            -1e13,
+            f32::MAX,
+            -f32::MAX,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+        ];
+        for c in 0..3 {
+            let input: [Vec<f32>; 3] = std::array::from_fn(|channel| {
+                (0..128)
+                    .map(|i| {
+                        if c == channel {
+                            values[i % values.len()]
+                        } else {
+                            0.3
+                        }
+                    })
+                    .collect()
+            });
+            check_inverse_rows(&XybMatrix::SPEC, input.each_ref().map(|p| &p[..]), 1);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn inverse_rows_reject_mismatched_inputs() {
+        xyb_to_rgb_rows(
+            &XybMatrix::SPEC,
+            [&[0.0; 8], &[0.0; 7], &[0.0; 8]],
+            [&mut [0.0; 8], &mut [0.0; 8], &mut [0.0; 8]],
+        );
+    }
+
+    #[test]
+    #[should_panic]
+    fn inverse_rows_reject_mismatched_outputs() {
+        xyb_to_rgb_rows(
+            &XybMatrix::SPEC,
+            [&[0.0; 8]; 3],
+            [&mut [0.0; 7], &mut [0.0; 8], &mut [0.0; 8]],
+        );
+    }
 
     unsafe fn scalar_band(m: &XybMatrix, input: [&[f32]; 3], output: [&mut [f32]; 3], _w: usize) {
         let [r, g, b] = input;

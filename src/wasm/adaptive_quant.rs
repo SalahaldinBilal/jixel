@@ -227,14 +227,14 @@ fn dirty_log2f_x4(d: v128) -> v128 {
 #[inline]
 #[target_feature(enable = "simd128")]
 fn compute_mask_x4(out_val: v128) -> v128 {
-    let k_base = f32x4_splat(-0.7647);
+    let k_base = f32x4_splat(-0.699765);
     let k_mul4 = f32x4_splat(9.4708735624378946);
     let k_mul2 = f32x4_splat(17.35036561631863);
     let k_offset2 = f32x4_splat(302.59587815579727);
     let k_mul3 = f32x4_splat(6.7943250517376494);
     let k_offset3 = f32x4_splat(3.7179635626140772);
     let k_offset4 = f32x4_splat(0.25 * 3.7179635626140772);
-    let k_mul0 = f32x4_splat(0.80061762862741759);
+    let k_mul0 = f32x4_splat(1.07267);
     let one = f32x4_splat(1.0);
 
     let v1 = f32x4_max(f32x4_mul(out_val, k_mul0), f32x4_splat(1e-3));
@@ -296,11 +296,7 @@ fn gamma_modulation_blocks4_x4(
     }
 
     let overall = f32x4_mul(hsum4x4(acc0, acc1, acc2, acc3), f32x4_splat(1.0 / 64.0));
-    vmlaf(
-        f32x4_splat(0.1005613337192697),
-        dirty_log2f_x4(overall),
-        out_val,
-    )
+    vmlaf(f32x4_splat(0.119146), dirty_log2f_x4(overall), out_val)
 }
 
 #[inline]
@@ -380,8 +376,8 @@ fn hf_modulation_blocks4_direct_x4(
     let out = hsum4x4(s0, s1, s2, s3);
     vmlaf(
         out,
-        f32x4_splat(-0.38 * strength),
-        f32x4_add(out_val, f32x4_splat(0.42)),
+        f32x4_splat(-0.506626 * strength),
+        f32x4_add(out_val, f32x4_splat(0.655866)),
     )
 }
 
@@ -433,7 +429,7 @@ fn blue_modulation_blocks4_x4(
 
     const K_LIMIT: f32 = 0.010474084867598155;
     const K_MAX_LIMIT: f32 = 15.463398341612438 * K_LIMIT;
-    const SCALE: f32 = 0.90590804735610064;
+    const SCALE: f32 = 0.127191;
 
     let mut sums = hsum4x4(s0, s1, s2, s3);
 
@@ -1034,7 +1030,7 @@ pub(crate) fn fill_quant_field(
     }
 
     // ---- Stage 3: per-block modulations + integer quant field.
-    let base_level = 0.48 * scale;
+    let base_level = crate::adaptive_quant::aq_base_level(distance) * scale;
     let dampen = crate::adaptive_quant::aq_dampen(distance);
     let mul = scale * dampen;
     let add = (1.0 - dampen) * base_level;

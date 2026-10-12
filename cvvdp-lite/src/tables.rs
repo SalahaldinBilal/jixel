@@ -53,7 +53,7 @@
 
 // Generated from ColorVideoVDP 0.5.7; see tools/generate_tables.py for attribution.
 #![allow(clippy::excessive_precision)]
-pub(crate) const LOG_LUMINANCE: [f32; 32] = [
+pub(crate) static LOG_LUMINANCE: [f32; 32] = [
     -2.301029920578003,
     -2.097770929336548,
     -1.8945119380950928,
@@ -87,7 +87,7 @@ pub(crate) const LOG_LUMINANCE: [f32; 32] = [
     3.796741008758545,
     4.0,
 ];
-pub(crate) const LOG_FREQUENCY: [f32; 32] = [
+pub(crate) static LOG_FREQUENCY: [f32; 32] = [
     -1.0,
     -0.9094780683517456,
     -0.8189561367034912,
@@ -121,7 +121,8 @@ pub(crate) const LOG_FREQUENCY: [f32; 32] = [
     1.7156580686569214,
     1.8061800003051758,
 ];
-pub(crate) const LOG_SENSITIVITY: [[[f32; 32]; 32]; 3] = [
+
+pub(crate) static LOG_SENSITIVITY: [[[f32; 32]; 32]; 3] = [
     [
         [
             0.5404148101806641,

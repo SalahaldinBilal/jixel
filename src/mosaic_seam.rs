@@ -127,7 +127,13 @@ mod tests {
 
     #[test]
     fn zero_and_nonfinite_excess_handling() {
-        let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 1.0, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
         let opsin = Image3F::new(16, 16);
         for value in [
             0.0,

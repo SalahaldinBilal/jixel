@@ -941,7 +941,13 @@ mod tests {
 
     #[test]
     fn dct64_views_preserve_gathered_coefficients_and_edge_replication() {
-        let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 2.0, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            2.0,
+            1,
+        );
         let mut image = Image3F::new(131, 137);
         for c in 0..3 {
             for (i, v) in image.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
@@ -1030,8 +1036,13 @@ mod tests {
     }
 
     fn learn(opsin: &Image3F, distance: f32) -> Arc<RatePrices> {
-        let ctx =
-            EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            distance,
+            1,
+        );
         let blocks = opsin.xsize() / 8;
         let quant_field = ImageB::new_fill(blocks, blocks, 5);
         let maps = ImageSB::new_fill(blocks.div_ceil(8), blocks.div_ceil(8), 0);
@@ -1083,7 +1094,13 @@ mod tests {
             }
         }
         let learn = |layout: Option<&AcStrategyImage>| {
-            let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 2.0, 1);
+            let ctx = EncodingContext::new(
+                crate::Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                crate::xyb::XybMatrix::SPEC,
+                2.0,
+                1,
+            );
             let quant_field = ImageB::new_fill(32, 32, 5);
             let maps = ImageSB::new_fill(4, 4, 0);
             let mut scratch = CoderScratch::default();

@@ -164,17 +164,17 @@ unsafe impl Vector for Neon {
 
 #[target_feature(enable = "neon")]
 pub(crate) fn contrast_neon(data: &mut Contrast<'_>) -> usize {
-    // SAFETY: The safe wrapper validates all plane lengths and NEON availability.
-    unsafe { vector::contrast::<Neon>(data) }
+    // Dispatch validates all plane lengths and NEON availability.
+    vector::contrast::<Neon>(data)
 }
 #[target_feature(enable = "neon")]
 pub(crate) fn pool_neon(data: &Pool<'_>) -> (usize, [f64; 3]) {
-    // SAFETY: The safe wrapper validates all plane lengths and NEON availability.
-    unsafe { vector::pool::<Neon>(data) }
+    // Dispatch validates all plane lengths and NEON availability.
+    vector::pool::<Neon>(data)
 }
 #[cfg(test)]
 #[target_feature(enable = "neon")]
 pub(crate) fn powers_neon(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
-    // SAFETY: The test wrapper checks lengths, domain, and NEON availability.
-    unsafe { vector::powers::<Neon>(input, output, exponent) }
+    // The test wrapper checks lengths, domain, and NEON availability.
+    vector::powers::<Neon>(input, output, exponent)
 }

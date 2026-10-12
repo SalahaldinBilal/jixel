@@ -27,14 +27,16 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::{Backend, Error, RgbImage, blur::GaussianBlur, kernels, pyramid, tables};
+use crate::{
+    Backend, Error, RgbImage, blur::GaussianBlur, image::RgbToDkl, kernels, pyramid, tables,
+};
 use kernels::{EPSILON, MASK_P, MASK_Q};
 
-const BASE_WEIGHT: [f64; 3] = [0.0036334486212581396, 1.6627724170684814, 4.11874532699585];
+static BASE_WEIGHT: [f64; 3] = [0.0036334486212581396, 1.6627724170684814, 4.11874532699585];
 const IMAGE_INTEGRATION: f64 = 0.577918291091919;
 const JOD_A: f64 = 0.0439569391310215;
 const JOD_EXP: f64 = 0.9302042722702026;
-const CH_GAIN: [f32; 3] = [1.0, 1.45, 1.0];
+static CH_GAIN: [f32; 3] = [1.0, 1.45, 1.0];
 
 /// SDR display conditions, with emitted black and reflected light specified
 /// separately. Supported angular resolution is 0.01..=10000 pixels/degree;
@@ -92,10 +94,10 @@ impl Display {
         Ok(self)
     }
 
-    fn scale(self) -> f32 {
+    pub(crate) fn scale(self) -> f32 {
         self.peak_luminance - self.black_luminance
     }
-    fn black(self) -> f32 {
+    pub(crate) fn black(self) -> f32 {
         self.black_luminance + self.reflected_luminance
     }
 }
@@ -137,9 +139,16 @@ impl CvvdpLite {
             next,
             expanded,
             tmp,
+            pyramid: pyramid_kernels,
+            conversion,
             ..
         } = workspace;
-        image.to_dkl(self.display.scale(), self.display.black(), current)?;
+        image.to_dkl(
+            self.display.scale(),
+            self.display.black(),
+            current,
+            conversion,
+        )?;
         let height = pyramid_height(image.width, image.height, self.display.pixels_per_degree);
         let (mut w, mut h) = (image.width, image.height);
         let mut bands = Vec::with_capacity(height + 1);
@@ -166,13 +175,21 @@ impl CvvdpLite {
                 }
             } else {
                 for c in 0..3 {
-                    pyramid::reduce(&current[c][..count], w, h, &mut next[c], tmp);
+                    pyramid::reduce(
+                        &current[c][..count],
+                        w,
+                        h,
+                        &mut next[c],
+                        tmp,
+                        pyramid_kernels,
+                    );
                     pyramid::expand(
                         &next[c][..w.div_ceil(2) * h.div_ceil(2)],
                         w,
                         h,
                         &mut expanded[c],
                         tmp,
+                        pyramid_kernels,
                     );
                 }
                 let band_scale = if level == 0 { 1.0 } else { 2.0 };
@@ -218,20 +235,20 @@ impl CvvdpLite {
     }
 }
 
-struct ReferenceBand {
-    w: usize,
-    h: usize,
+pub(crate) struct ReferenceBand {
+    pub(crate) w: usize,
+    pub(crate) h: usize,
     frequency: f32,
-    contrast: [Vec<f32>; 3],
-    sensitivity: [Vec<f32>; 3],
+    pub(crate) contrast: [Vec<f32>; 3],
+    pub(crate) sensitivity: [Vec<f32>; 3],
 }
 
 /// Immutable cached reference; may be shared among independent evaluators.
 pub struct PreparedReference {
-    width: usize,
-    height: usize,
-    display: Display,
-    bands: Vec<ReferenceBand>,
+    pub(crate) width: usize,
+    pub(crate) height: usize,
+    pub(crate) display: Display,
+    pub(crate) bands: Vec<ReferenceBand>,
 }
 
 impl PreparedReference {
@@ -268,6 +285,9 @@ impl PreparedReference {
         workspace
             .reserve(self.width, self.height)
             .expect("validated reference dimensions");
+        workspace
+            .conversion
+            .set_display(self.display.scale(), self.display.black());
         Evaluator {
             reference: self,
             workspace,
@@ -332,6 +352,8 @@ pub struct Workspace {
     mask: [Vec<f32>; 3],
     tmp: Vec<f32>,
     blur: GaussianBlur,
+    pyramid: pyramid::Kernels,
+    conversion: RgbToDkl,
     mask_c: f32,
     dmax: f32,
     mask_zero: [f32; 3],
@@ -371,6 +393,8 @@ impl Workspace {
             mask: std::array::from_fn(|_| Vec::new()),
             tmp: Vec::new(),
             blur: GaussianBlur::new(backend),
+            pyramid: pyramid::Kernels::for_backend(backend),
+            conversion: RgbToDkl::new(backend),
             mask_c: 10.0_f32.powf(-0.7954971),
             dmax: 10.0_f32.powf(2.5642455),
             mask_zero: MASK_Q.map(|q| EPSILON.powf(q)),
@@ -419,6 +443,7 @@ impl Workspace {
             .map(|v| v.capacity() * std::mem::size_of::<f32>())
             .sum::<usize>()
             + self.blur.allocated_bytes()
+            + self.conversion.allocated_bytes()
             + self.band_scores.capacity() * std::mem::size_of::<BandScore>()
     }
 
@@ -438,7 +463,12 @@ impl Workspace {
         }
         self.reserve(test.width, test.height)?;
         let display = reference.display;
-        test.to_dkl(display.scale(), display.black(), &mut self.current)?;
+        test.to_dkl(
+            display.scale(),
+            display.black(),
+            &mut self.current,
+            &mut self.conversion,
+        )?;
         self.band_scores.clear();
         let mut per_channel = [0.0; 3];
         for (level, band) in reference.bands.iter().enumerate() {
@@ -466,6 +496,7 @@ impl Workspace {
                         h,
                         &mut self.next[c],
                         &mut self.tmp,
+                        &self.pyramid,
                     );
                     pyramid::expand(
                         &self.next[c][..next_count],
@@ -473,6 +504,7 @@ impl Workspace {
                         h,
                         &mut self.expanded[c],
                         &mut self.tmp,
+                        &self.pyramid,
                     );
                 }
                 let band_scale = if level == 0 { 1.0 } else { 2.0 };
@@ -506,10 +538,8 @@ impl Workspace {
                 std::mem::swap(&mut self.current, &mut self.next);
                 sums
             };
-            let rms = squares.map(|sum| safe_pow(sum / count as f64, 0.5));
-            for c in 0..3 {
-                per_channel[c] += safe_pow(rms[c] * if base { BASE_WEIGHT[c] } else { 1.0 }, 4.0);
-            }
+            let rms = band_rms(squares, count);
+            accumulate_band(&mut per_channel, rms, base);
             self.band_scores.push(BandScore {
                 width: w,
                 height: h,
@@ -522,30 +552,62 @@ impl Workspace {
         if (reference.bands.len() - 1) % 2 == 1 {
             std::mem::swap(&mut self.current, &mut self.next);
         }
-        // The epsilon requires both fourth-norm reductions to remain distinct.
-        let total: f64 = per_channel
-            .into_iter()
-            .map(|sum| safe_pow(safe_pow(sum, 0.25), 4.0))
-            .sum();
-        let distortion = safe_pow(total, 0.25) * IMAGE_INTEGRATION;
-        let deficit = if distortion <= 0.1 {
-            JOD_A * 0.1_f64.powf(JOD_EXP - 1.0) * distortion
-        } else {
-            JOD_A * distortion.powf(JOD_EXP)
-        };
-        Ok(Score {
-            jod: 10.0 - deficit,
-            distortion,
-        })
+        Ok(finish_score(per_channel))
     }
 }
 
-fn safe_pow(value: f64, exponent: f64) -> f64 {
+/// Regularized RMS of one band's pooled squares.
+pub(crate) fn band_rms(squares: [f64; 3], count: usize) -> [f64; 3] {
+    squares.map(|sum| safe_pow(sum / count as f64, 0.5))
+}
+
+pub(crate) fn accumulate_band(per_channel: &mut [f64; 3], rms: [f64; 3], base: bool) {
+    for c in 0..3 {
+        per_channel[c] += safe_pow(rms[c] * if base { BASE_WEIGHT[c] } else { 1.0 }, 4.0);
+    }
+}
+
+/// Pool the per-channel band sums into the score.
+pub(crate) fn finish_score(per_channel: [f64; 3]) -> Score {
+    // The epsilon requires both fourth-norm reductions to remain distinct.
+    let total: f64 = per_channel
+        .into_iter()
+        .map(|sum| safe_pow(safe_pow(sum, 0.25), 4.0))
+        .sum();
+    let distortion = safe_pow(total, 0.25) * IMAGE_INTEGRATION;
+    let deficit = if distortion <= 0.1 {
+        JOD_A * 0.1_f64.powf(JOD_EXP - 1.0) * distortion
+    } else {
+        JOD_A * distortion.powf(JOD_EXP)
+    };
+    Score {
+        jod: 10.0 - deficit,
+        distortion,
+    }
+}
+
+/// The masking-model constants every scoring path shares.
+pub(crate) fn mask_parameters() -> kernels::MaskParameters {
+    let xcm_log = [
+        [-0.18950105, -5.962151, -4.318346],
+        [2.5655594, 0.34406713, -2.7196465],
+        [3.8118372, -1.0051706, -0.51933765],
+    ];
+    kernels::MaskParameters {
+        mask_c: 10.0_f32.powf(-0.7954971),
+        dmax: 10.0_f32.powf(2.5642455),
+        mask_zero: MASK_Q.map(|q| EPSILON.powf(q)),
+        diff_zero: EPSILON.powf(MASK_P),
+        xcm: xcm_log.map(|row| row.map(|v| 2.0_f32.powf(v))),
+    }
+}
+
+pub(crate) fn safe_pow(value: f64, exponent: f64) -> f64 {
     let epsilon = EPSILON as f64;
     ((value + epsilon).powf(exponent) - epsilon.powf(exponent)).max(0.0)
 }
 
-fn mean_luminance(plane: &[f32]) -> f32 {
+pub(crate) fn mean_luminance(plane: &[f32]) -> f32 {
     (plane.iter().map(|v| v.max(0.01) as f64).sum::<f64>() / plane.len() as f64) as f32
 }
 

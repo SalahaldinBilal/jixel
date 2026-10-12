@@ -24,6 +24,9 @@ sse = []
 wasm = []
 splines = []
 
+[dependencies]
+cvvdp-lite = { path = "cvvdp-lite" }
+
 [profile.profiling]
 inherits = "release"
 debug = "full"

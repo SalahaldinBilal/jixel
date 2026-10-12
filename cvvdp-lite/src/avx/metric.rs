@@ -157,18 +157,18 @@ unsafe impl Vector for Avx2 {
     }
 }
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn contrast_avx2(data: &mut Contrast<'_>) -> usize {
-    // SAFETY: The safe wrapper validates slice lengths, domain, and AVX2 availability.
-    unsafe { vector::contrast::<Avx2>(data) }
+pub(crate) fn contrast_avx2(data: &mut Contrast<'_>) -> usize {
+    // Dispatch validates slice lengths, domain, and AVX2 availability.
+    vector::contrast::<Avx2>(data)
 }
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn pool_avx2(data: &Pool<'_>) -> (usize, [f64; 3]) {
-    // SAFETY: The safe wrapper validates slice lengths, domain, and AVX2 availability.
-    unsafe { vector::pool::<Avx2>(data) }
+pub(crate) fn pool_avx2(data: &Pool<'_>) -> (usize, [f64; 3]) {
+    // Dispatch validates slice lengths, domain, and AVX2 availability.
+    vector::pool::<Avx2>(data)
 }
 #[cfg(test)]
 #[target_feature(enable = "avx2")]
-pub(crate) unsafe fn powers_avx2(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
-    // SAFETY: The safe wrapper validates slice lengths, domain, and AVX2 availability.
-    unsafe { vector::powers::<Avx2>(input, output, exponent) }
+pub(crate) fn powers_avx2(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
+    // The test wrapper checks slice lengths, domain, and AVX2 availability.
+    vector::powers::<Avx2>(input, output, exponent)
 }

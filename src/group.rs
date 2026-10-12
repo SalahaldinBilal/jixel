@@ -28,6 +28,7 @@
  */
 #![allow(clippy::excessive_precision)]
 
+use crate::Arbiter;
 use crate::ac_context::{
     fine_block_context, fine_non_zero_context, fine_zero_density_contexts_offset,
     zero_density_context, zero_density_context_8x8,
@@ -220,9 +221,8 @@ fn rdoq_distortion_weight(window_index: usize, window_len: usize, distance: f32)
 }
 
 #[inline]
-pub(crate) fn rdoq_lambda(qf_ratio: f32) -> f32 {
-    const BASE: f32 = 1.5;
-    crate::ac_strategy::RD_LAMBDA * 0.25 * BASE * qf_ratio.clamp(0.5, 2.0)
+pub(crate) fn rdoq_lambda(arbiter: Arbiter, qf_ratio: f32) -> f32 {
+    crate::ac_strategy::RD_LAMBDA * 0.25 * arbiter.tuning().rdoq_lambda * qf_ratio.clamp(0.5, 2.0)
 }
 
 #[inline(always)]
@@ -354,8 +354,7 @@ fn rdoq_block(
     cy: usize,
     distance: f32,
     qf_hi: bool,
-    qf_ratio: f32,
-    visible: f32,
+    lambda: f32,
     restore_penalty: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
@@ -388,8 +387,7 @@ fn rdoq_block(
                 cy,
                 distance,
                 qf_hi,
-                qf_ratio,
-                visible,
+                lambda,
                 restore_penalty,
                 choices,
                 costs,
@@ -422,13 +420,11 @@ fn rdoq_block_banded<const FACTORED: bool>(
     cy: usize,
     distance: f32,
     qf_hi: bool,
-    qf_ratio: f32,
-    visible: f32,
+    lambda: f32,
     restore_penalty: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
-    let lambda = rdoq_lambda(qf_ratio) / visible;
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
@@ -749,12 +745,10 @@ fn rdoq_block_wide_oracle(
     cy: usize,
     distance: f32,
     qf_hi: bool,
-    qf_ratio: f32,
-    visible: f32,
+    lambda: f32,
     choices: &mut [u8],
     costs: &mut [Vec<f32>; 2],
 ) {
-    let lambda = rdoq_lambda(qf_ratio) / visible;
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
@@ -2228,8 +2222,8 @@ pub(crate) fn write_ac_group(
                             cy,
                             distance,
                             quant_ac as u32 > qf_threshold,
-                            quant_ac as f32 / qf_threshold.max(1) as f32,
-                            visible,
+                            rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
+                                / visible,
                             restore_penalty,
                             rdoq_choices,
                             rdoq_costs,
@@ -2532,8 +2526,8 @@ pub(crate) fn write_ac_group(
                             cy,
                             distance,
                             quant_ac as u32 > qf_threshold,
-                            quant_ac as f32 / qf_threshold.max(1) as f32,
-                            visible,
+                            rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
+                                / visible,
                             restore_penalty,
                             rdoq_choices,
                             rdoq_costs,
@@ -2637,8 +2631,8 @@ pub(crate) fn write_ac_group(
                             cy,
                             distance,
                             quant_ac as u32 > qf_threshold,
-                            quant_ac as f32 / qf_threshold.max(1) as f32,
-                            visible,
+                            rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
+                                / visible,
                             restore_penalty,
                             rdoq_choices,
                             rdoq_costs,
@@ -3180,8 +3174,7 @@ mod tests {
                     cy,
                     [1., 2., 3., 4.][case % 4],
                     case % 2 == 0,
-                    [0.5, 1.0, 1.2, 2.0][case % 4],
-                    1.0,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.0, 1.2, 2.0][case % 4]),
                     1.0,
                     choices,
                     costs,
@@ -3294,8 +3287,7 @@ mod tests {
                     cy,
                     [1., 2., 3., 4.][case % 4],
                     case % 2 == 0,
-                    [0.5, 1.0, 1.2, 2.0][case % 4],
-                    1.0,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.0, 1.2, 2.0][case % 4]),
                     1.0,
                     choices,
                     costs,
@@ -3318,8 +3310,7 @@ mod tests {
                 cy,
                 [1., 2., 3., 4.][case % 4],
                 case % 2 == 0,
-                [0.5, 1.0, 1.2, 2.0][case % 4],
-                1.0,
+                super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.0, 1.2, 2.0][case % 4]),
                 1.0,
                 &mut fresh_choices,
                 &mut fresh_costs,
@@ -3435,8 +3426,7 @@ mod tests {
                     cy,
                     4.,
                     false,
-                    1.,
-                    1.,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.),
                     &mut reference_choices,
                     &mut reference_costs,
                 );
@@ -3458,8 +3448,7 @@ mod tests {
                     cy,
                     4.,
                     false,
-                    1.,
-                    1.,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.),
                     1.0,
                     &mut choices,
                     &mut costs,
@@ -3573,8 +3562,8 @@ mod tests {
                         cy,
                         [0.3, 2., 4., 8.][case % 4],
                         case % 2 == 0,
-                        [0.5, 1.2][case % 2],
-                        [1., 0.125][case % 2],
+                        super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.2][case % 2])
+                            / [1., 0.125][case % 2],
                         [1., 2.][case / shapes.len() % 2],
                         choices,
                         costs,
@@ -3640,8 +3629,27 @@ mod tests {
                     super::rdoq_block_banded::<false>
                 };
                 refine(
-                    1., 1, false, &prices, scan, &source, &inv_qm, 1., block, raw, strategy, 1, 17,
-                    2, 1, 1., false, 1., 1., 2., choices, costs,
+                    1.,
+                    1,
+                    false,
+                    &prices,
+                    scan,
+                    &source,
+                    &inv_qm,
+                    1.,
+                    block,
+                    raw,
+                    strategy,
+                    1,
+                    17,
+                    2,
+                    1,
+                    1.,
+                    false,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.),
+                    2.,
+                    choices,
+                    costs,
                 );
             };
             run(false, &mut expected, &mut choices0, &mut costs0);
@@ -3651,7 +3659,7 @@ mod tests {
             for (&a, &b) in costs0.iter().flatten().zip(costs1.iter().flatten()) {
                 assert_eq!(a.to_bits(), b.to_bits());
             }
-            let rate = 2. * super::rdoq_lambda(1.);
+            let rate = 2. * super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.);
             let minus = (ideal - super::dequantized_level(-1)).powi(2)
                 + rate * prices.token_bits(Token::new(0, pack_signed(-1)));
             let plus = (ideal - super::dequantized_level(1)).powi(2)

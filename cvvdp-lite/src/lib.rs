@@ -56,6 +56,7 @@
 mod avx;
 mod blur;
 mod image;
+mod incremental;
 #[allow(unsafe_code)]
 mod kernels;
 mod model;
@@ -69,6 +70,7 @@ mod sse;
 mod tables;
 
 pub use image::RgbImage;
+pub use incremental::{Checkpoint, IncrementalState, Rect};
 pub use kernels::Backend;
 pub use model::{BandScore, CvvdpLite, Display, Evaluator, PreparedReference, Score, Workspace};
 

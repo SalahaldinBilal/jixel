@@ -252,6 +252,25 @@ pub enum Speed {
     ExtraSlow,
 }
 
+/// The perceptual metric whose preferences settle the **lossy** encoder's
+/// decisions where metrics disagree. Ignored for lossless.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum Arbiter {
+    /// SSIMULACRA2. [`Speed::ExtraSlow`] also computes it inside the encoder
+    /// to accept or reject quantizer, transform-layout and chroma-precision
+    /// candidates.
+    #[default]
+    Ssimulacra2,
+    /// ColorVideoVDP: coarser DC quantization from distance 1 up (half as much
+    /// for chroma), the mid-distance quant tables from distance 1.75 instead
+    /// of 2.25, a lighter AC trellis rate penalty and merged transforms kept
+    /// through the reconstruction rerank. [`Speed::ExtraSlow`] computes
+    /// ColorVideoVDP for a 500 nit laptop display inside the encoder to accept
+    /// or reject quantizer, transform-layout and chroma-precision candidates.
+    Cvvdp,
+}
+
 /// Decode-speed/density tradeoff for **lossless** encoding. Ignored for lossy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodingSpeed {
@@ -364,6 +383,9 @@ pub struct EncodeConfig {
     pub linear_below: f32,
     pub num_threads: usize,
     pub speed: Speed,
+    /// Metric the lossy encoder tunes for (see [`Arbiter`]). Default
+    /// [`Arbiter::Ssimulacra2`].
+    pub arbiter: Arbiter,
     /// Decode-speed/density tradeoff for lossless encoding (see
     /// [`DecodingSpeed`]). Ignored for lossy.
     pub decoding_speed: DecodingSpeed,
@@ -480,6 +502,7 @@ impl Default for EncodeConfig {
                 .unwrap_or(NonZero::new(1).unwrap())
                 .get(),
             speed: Speed::Fast,
+            arbiter: Arbiter::Ssimulacra2,
             decoding_speed: DecodingSpeed::Slow,
             lossy_modular: LossyModular::Off,
             learned_rate: true,
@@ -843,6 +866,12 @@ impl EncodeConfig {
         self
     }
 
+    /// Select the metric the lossy encoder tunes for (see [`Arbiter`]).
+    pub fn with_arbiter(mut self, arbiter: Arbiter) -> Self {
+        self.arbiter = arbiter;
+        self
+    }
+
     /// Select the encode-speed/density tradeoff (see [`Speed`]).
     /// [`Speed::Slow`] and [`Speed::ExtraSlow`] also turn on [`EncodeConfig::patches`].
     pub fn with_speed(mut self, speed: Speed) -> Self {
@@ -905,7 +934,7 @@ pub(crate) fn lossy_context(
     } else {
         config.num_threads.min(pixels.div_ceil(64 * 1024).max(1))
     };
-    let mut ctx = EncodingContext::new(config.speed, xyb, distance, num_threads);
+    let mut ctx = EncodingContext::new(config.speed, config.arbiter, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
     ctx.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
     #[cfg(feature = "splines")]

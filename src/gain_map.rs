@@ -301,7 +301,7 @@ pub(crate) struct EncodedGainMap {
 
 /// Encode the gain map attached to `base` (if any) into a `jhgm` bundle.
 ///
-/// The gain map codestream inherits the primary image's speed, thread count,
+/// The gain map codestream inherits the primary image's speed, arbiter, thread count,
 /// orientation, dark-AQ and lossy-modular settings; it never carries EXIF,
 /// XMP, an ICC profile or a nested gain map, and is never progressive.
 pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainMap>, EncodeError> {
@@ -337,6 +337,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         linear_below: 0.0,
         num_threads: base.num_threads,
         speed: base.speed,
+        arbiter: base.arbiter,
         decoding_speed: base.decoding_speed,
         lossy_modular: base.lossy_modular,
         learned_rate: base.learned_rate,

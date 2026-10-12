@@ -81,19 +81,40 @@ pub(crate) struct GaussianBlur {
     kernels: Kernels,
 }
 
+/// Normalized sigma-3 weights, center at `RADIUS`.
+pub(crate) fn kernel() -> [f32; WINDOW] {
+    let mut kernel = std::array::from_fn(|i| (-(i as f32 - RADIUS as f32).powi(2) / 18.0).exp());
+    let sum: f32 = kernel.iter().sum();
+    for value in &mut kernel {
+        *value /= sum;
+    }
+    kernel
+}
+
 impl GaussianBlur {
     pub(crate) fn new(backend: Backend) -> Self {
-        let mut kernel =
-            std::array::from_fn(|i| (-(i as f32 - RADIUS as f32).powi(2) / 18.0).exp());
-        let sum: f32 = kernel.iter().sum();
-        for value in &mut kernel {
-            *value /= sum;
-        }
         Self {
             ring: Vec::new(),
             padded: Vec::new(),
-            kernel,
+            kernel: kernel(),
             kernels: Kernels::for_backend(backend),
+        }
+    }
+
+    /// One horizontal output row from `padded` (`RADIUS` reflected samples on
+    /// each side), with the same per-sample arithmetic as `blur`.
+    pub(crate) fn horizontal_row(&self, padded: &[f32], dst: &mut [f32]) {
+        assert_eq!(padded.len(), dst.len() + 2 * RADIUS);
+        let done = (self.kernels.horizontal)(padded, &self.kernel, dst);
+        horizontal_scalar(&padded[done..], &self.kernel, &mut dst[done..]);
+    }
+
+    /// One vertical output row from its `WINDOW` source rows.
+    pub(crate) fn vertical_row(&self, rows: &BlurRows<'_>, dst: &mut [f32]) {
+        let done = (self.kernels.vertical)(rows, &self.kernel, dst);
+        if done < dst.len() {
+            let tail = rows.map(|row| &row[done..]);
+            vertical_scalar(&tail, &self.kernel, &mut dst[done..]);
         }
     }
 

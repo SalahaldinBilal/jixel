@@ -237,7 +237,7 @@ const VLQ_ACCEPT_64: f32 = 0.973;
 const VLQ_ACCEPT_64_RECT: f32 = 0.736;
 
 impl MergeTuning {
-    pub(crate) fn new(distance: f32) -> Self {
+    pub(crate) fn new(distance: f32, arbiter: crate::Arbiter) -> Self {
         let accept = |margin: Banded| 1.0 - merge_margin(distance, margin);
         let mut tuning = Self {
             bias_rect: BIAS_RECT.at(distance),
@@ -274,6 +274,9 @@ impl MergeTuning {
         }
         if distance >= MERGE_BAND_D1 {
             tuning.bias_32x32 *= BIAS_32X32_LOOSEN;
+        }
+        if !arbiter.tuning().rerank_downgrades {
+            tuning.rerank_margin = 0.0;
         }
         tuning
     }

@@ -535,7 +535,7 @@ fn positive_xyb_into(lin: [&[f32]; 3], [x, y, b]: [&mut [f32]; 3]) {
 }
 
 /// Linear RGB planes of an XYB image (the encoder's inverse opsin transform).
-fn linear_of_xyb(img: &Image3F) -> [Vec<f32>; 3] {
+pub(crate) fn linear_of_xyb(img: &Image3F) -> [Vec<f32>; 3] {
     let (w, h) = (img.xsize(), img.ysize());
     let m = crate::xyb::XybMatrix::SPEC;
     let mut out = [vec![0f32; w * h], vec![0f32; w * h], vec![0f32; w * h]];

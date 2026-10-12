@@ -2091,7 +2091,13 @@ mod tests {
     /// past MIN_PATCH_OCCURRENCES), so every group has the same count and only
     /// the tie-break can order them.
     fn glyph_ctx() -> EncodingContext {
-        EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 1.0, 1)
+        EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        )
     }
 
     fn glyph_params(min_occurrences: usize) -> GlyphParams {

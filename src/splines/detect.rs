@@ -1013,7 +1013,13 @@ mod tests {
             let polarity = map.polarity.clone();
             for threads in [1, 4] {
                 map.polarity.clone_from(&polarity);
-                let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+                let ctx = EncodingContext::new(
+                    Speed::Slow,
+                    crate::Arbiter::Ssimulacra2,
+                    XybMatrix::SPEC,
+                    3.0,
+                    threads,
+                );
                 let (mask, seeds) = ridge_mask(&ctx, &mut CoderScratch::default(), &mut map, w, h);
                 assert_eq!(mask, expected_mask);
                 assert_eq!(seeds, expected_seeds);
@@ -1023,7 +1029,13 @@ mod tests {
 
     #[test]
     fn strong_seed_tracks_weak_tails_but_does_not_start_weak_only_lines() {
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let mut scratch = Box::<CoderScratch>::default();
         let mut image = Image3F::new(128, 128);
         for y in 0..128 {
@@ -1051,7 +1063,13 @@ mod tests {
     #[test]
     fn parallel_convolution_matches_clamped_reference() {
         for threads in [1, 4] {
-            let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+            let ctx = EncodingContext::new(
+                Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                XybMatrix::SPEC,
+                3.0,
+                threads,
+            );
             let mut scratch = Box::<CoderScratch>::default();
             for (w, h) in [(1, 1), (1, 9), (9, 1), (7, 3), (16, 4), (31, 19), (64, 65)] {
                 let src: Vec<_> = (0..w * h).map(|i| (i % 37) as f32 * 0.013 - 0.2).collect();
@@ -1146,7 +1164,13 @@ mod tests {
                 );
             }
             for threads in [1, 4, 8] {
-                let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+                let ctx = EncodingContext::new(
+                    Speed::Slow,
+                    crate::Arbiter::Ssimulacra2,
+                    XybMatrix::SPEC,
+                    3.0,
+                    threads,
+                );
                 let actual = trace_components(
                     &ctx,
                     &mut CoderScratch::default(),
@@ -1187,7 +1211,13 @@ mod tests {
             .collect();
         let expected = trace_serial(&map, &mut avail.clone(), &mut order.clone(), w, h);
         assert!(expected.len() > 4);
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 4);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            4,
+        );
         let actual = trace_components(&ctx, &mut CoderScratch::default(), &map, avail, order, w, h);
         assert_eq!(actual.len(), expected.len());
         for (a, b) in actual.iter().zip(&expected) {

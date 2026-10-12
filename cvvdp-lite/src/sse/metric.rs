@@ -159,18 +159,18 @@ unsafe impl Vector for Sse2 {
     }
 }
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn contrast_sse2(data: &mut Contrast<'_>) -> usize {
-    // SAFETY: The safe wrapper validates slice lengths, domain, and SSE2 availability.
-    unsafe { vector::contrast::<Sse2>(data) }
+pub(crate) fn contrast_sse2(data: &mut Contrast<'_>) -> usize {
+    // Dispatch validates slice lengths, domain, and SSE2 availability.
+    vector::contrast::<Sse2>(data)
 }
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn pool_sse2(data: &Pool<'_>) -> (usize, [f64; 3]) {
-    // SAFETY: The safe wrapper validates slice lengths, domain, and SSE2 availability.
-    unsafe { vector::pool::<Sse2>(data) }
+pub(crate) fn pool_sse2(data: &Pool<'_>) -> (usize, [f64; 3]) {
+    // Dispatch validates slice lengths, domain, and SSE2 availability.
+    vector::pool::<Sse2>(data)
 }
 #[cfg(test)]
 #[target_feature(enable = "sse2")]
-pub(crate) unsafe fn powers_sse2(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
-    // SAFETY: The safe wrapper validates slice lengths, domain, and SSE2 availability.
-    unsafe { vector::powers::<Sse2>(input, output, exponent) }
+pub(crate) fn powers_sse2(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
+    // The test wrapper checks slice lengths, domain, and SSE2 availability.
+    vector::powers::<Sse2>(input, output, exponent)
 }

@@ -28,9 +28,16 @@
  */
 
 mod blur;
+mod image;
 mod metric;
+mod pyramid;
 
 pub(crate) use blur::{blur_horizontal_sse2, blur_vertical_sse2};
+pub(crate) use image::{dkl_bytes_sse2, dkl_linear_sse2};
 #[cfg(test)]
 pub(crate) use metric::powers_sse2;
 pub(crate) use metric::{contrast_sse2, pool_sse2};
+pub(crate) use pyramid::{
+    expand_even_sse2, expand_horizontal_sse2, expand_odd_sse2, reduce_horizontal_sse2,
+    reduce_vertical_sse2,
+};

@@ -138,23 +138,39 @@ It does not claim improved perceptual calibration over ColorVideoVDP.
 The default `neon`, `avx`, and `sse` features match the main repository's
 architecture split: NEON on AArch64, AVX2 on supported x86 CPUs, and SSE2 on
 older x86 CPUs. Each backend has its own `src/<architecture>/mod.rs`,
-`metric.rs`, and `blur.rs`. The `simd` feature remains an alias enabling all
-three. Build individual backends with `--no-default-features --features neon`
+`metric.rs`, `blur.rs`, `pyramid.rs`, and `image.rs`. The `simd` feature remains
+an alias enabling all three. Build individual backends with `--no-default-features --features neon`
 (or `avx` / `sse`). CPU features are detected and cached. Other targets
 use the scalar fallback. `Workspace::with_backend(Backend::Scalar)` explicitly
 selects libm masking powers; `--no-default-features` compiles out all intrinsics.
 Unsupported explicit backend requests return an error before entering CPU
 instructions. The existing caller's worker pool owns concurrency.
 
-SIMD accelerates contrast weighting, the separable Gaussian masking blur, and
-masked-difference pooling. NEON/SSE2 process four pixels and AVX2 eight. Kernels
+SIMD accelerates RGB-to-DKL conversion, contrast weighting, pyramid
+reduction/expansion, Gaussian masking blur, and masked-difference pooling.
+NEON/SSE2 process four pixels and AVX2 eight. Kernels
 use exact vector division, shared model equations, scalar tails, and f64
-reduction accumulators. The blur uses the main tree's center-plus-symmetric-pairs
+reduction accumulators. Pyramid loops isolate reflected/replicated borders
+from contiguous interiors; expansion processes even and odd phases separately.
+NEON uses deinterleaved reduction loads and interleaved expansion stores, while
+SSE2/AVX2 use shuffles. Pyramid kernels are selected once per workspace and
+preserve the original multiply/add order. The blur uses the main tree's center-plus-symmetric-pairs
 kernels with four independent vector accumulators, retaining the sigma-3
 13-tap kernel and exclusive reflection at both edges. Cached function pointers
 select its horizontal and vertical kernels once per workspace. Multiply/add
 order is preserved without requiring FMA. Unsafe code is confined to private
 SIMD modules and validated dispatch; other library modules deny unsafe code.
+
+RGB conversion follows the simple LUT/matrix ideas inspected in moxcms 0.9.1
+(`conversions/neon/rgb_xyz_opt.rs` and the SSE/AVX counterparts). A 12 KiB
+per-workspace table caches each byte input's contribution to the three DKL
+outputs, including display scale and black. It is refreshed only when display
+photometry changes and performs the original rounded operations in their
+original order. Small SIMD pixel blocks transpose results directly into DKL
+planes. Linear float planes use a direct SIMD matrix with finite checks and
+clipping. Interleaved float sRGB retains the exact libm transfer curve, using
+32-pixel stack blocks for its SIMD matrix. No full-image color staging or ICC
+machinery is added; the Rust crate still has no runtime dependencies.
 
 Masking powers decompose a positive float into a centered mantissa and integer
 exponent. A degree-ten binomial polynomial evaluates the mantissa power, and
@@ -221,6 +237,63 @@ The 4K workspace retains 324.5 MiB instead of 340.2 MiB; at 768×512 it retains
 15.4 MiB instead of 16.1 MiB. These measurements are local single-thread NEON
 results; other scoring stages remain the larger optimization opportunities.
 
+A subsequent pyramid profiling pass timed all `reduce` and `expand` calls
+inside cached candidates (all three channels and all spatial levels), using
+release builds, preallocated storage, and the same noisy inputs on AArch64.
+These stages consumed about 26% of candidate scoring before optimization.
+With separate border/interior phases and NEON kernels, their measured time was:
+
+| Resolution | Reduce before/after, ms | Expand before/after, ms | Combined share before/after |
+| --- | ---: | ---: | ---: |
+| 768×512 | 0.95 / 0.34 | 1.84 / 0.31 | 25.7% / 7.3% |
+| 1920×1080 | 5.69 / 2.52 | 10.12 / 2.26 | 26.0% / 8.9% |
+| 3840×2160 | 23.07 / 11.09 | 40.17 / 10.08 | 25.7% / 9.4% |
+
+Five alternating trials of 17 cached comparisons also measured full scoring: 768×512
+took 12.17 → 9.65 ms (1.26× faster). 1920×1080 took 63.80 → 50.48 ms (1.26× faster).
+3840×2160 took 263.69 → 224.94 ms (1.17× faster). Scores were unchanged in all five
+benchmark resolutions, including the odd 767×511 case. Full-score timings use
+uninstrumented binaries; differences from profiling totals reflect separate runs and
+normal machine variability.
+
+The phase and SIMD regression test checks exact equality with the previous
+loops on mixed-sign data for widths 1–69 and heights spanning tiny, odd/even,
+and vector-tail cases. Full-score tests and the no-allocation contract also
+pass. Timers were confined to a temporary profiling build; normal scoring has
+no timing hooks. Measurements are local wall-clock medians, not x86 estimates.
+
+Conversion profiling measured one `to_dkl` call per cached candidate on the
+same AArch64 release build. Times vary with input format:
+
+| Resolution | Input | Before, ms | After, ms |
+| --- | --- | ---: | ---: |
+| 768×512 | srgb8 | 0.69 | 0.31 |
+| 768×512 | linear | 1.14 | 0.29 |
+| 768×512 | srgb-f32 | 5.45 | 4.67 |
+| 1920×1080 | srgb8 | 3.58 | 1.48 |
+| 1920×1080 | linear | 5.99 | 1.36 |
+| 1920×1080 | srgb-f32 | 28.71 | 24.51 |
+| 3840×2160 | srgb8 | 14.35 | 6.11 |
+| 3840×2160 | linear | 24.22 | 5.45 |
+| 3840×2160 | srgb-f32 | 122.00 | 97.83 |
+
+Byte conversion improved roughly 2.3× and linear conversion 4–4.5×. Their
+share of scoring fell from about 8% / 13% to 3–4%. Float sRGB still spends
+about 36–38% in conversion because its transfer curve remains exact. The
+conversion tests require exact equality with the previous implementation for
+all three formats, padded and minimally sized rows, finite clipping, vector
+tails, and changing displays. Non-finite active samples still fail; non-finite
+padding is ignored. All formats and display-table refreshes allocate nothing
+inside reserved comparisons.
+
+Alternating full-score runs measured about 4–8% faster byte scoring at 1080p
+and 4K, 10–20% faster linear scoring, and 4–9% faster float sRGB scoring. A
+short 768×512 byte run was noisy; five alternating runs of 101 cached
+comparisons measured 8.30 → 7.90 ms (5.1% faster). Predictions were unchanged
+for every input format/resolution. This distinguishes conversion speed from
+whole-score speed. Profiling hooks and float-input adapters stayed in temporary
+benchmark builds, outside the library API and normal scoring path.
+
 Reproduce the benchmark with a pre-optimization `score_raw` binary if available:
 
 ```sh
@@ -248,5 +321,5 @@ the Rust crate still has zero runtime dependencies.
 Future arbiter integration should use full-frame candidates and the raw
 distortion score. A full-frame attribution map is still needed for local
 quantization decisions; independent cropped-block scores are not equivalent.
-Further optimization can target pyramid expansion and direct linear-plane
-conversion, followed by held-out ranking checks on actual Jixel reconstructions.
+Further optimization can target input conversion and masked-difference pooling,
+followed by held-out ranking checks on actual Jixel reconstructions.

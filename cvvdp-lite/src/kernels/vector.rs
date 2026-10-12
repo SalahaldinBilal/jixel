@@ -87,7 +87,7 @@ pub(super) fn power_tables() -> &'static [PowerTable; 4] {
 
 #[cfg(test)]
 #[inline(always)]
-pub(crate) unsafe fn powers<V: Vector>(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
+pub(crate) fn powers<V: Vector>(input: &[f32], output: &mut [f32], exponent: f32) -> usize {
     let done = input.len() / V::LANES * V::LANES;
     let table = PowerTable::new(exponent);
     // SAFETY: The test wrapper checks CPU availability, input domain, and lengths.
@@ -101,7 +101,7 @@ pub(crate) unsafe fn powers<V: Vector>(input: &[f32], output: &mut [f32], expone
 }
 
 #[inline(always)]
-unsafe fn pow<V: Vector>(x: V::F, table: &PowerTable) -> V::F {
+fn pow<V: Vector>(x: V::F, table: &PowerTable) -> V::F {
     // SAFETY: Positive normal inputs and enabled CPU features are guaranteed
     // by the caller. Vector::scale masks lookup indices to the table bounds.
     unsafe {
@@ -119,9 +119,9 @@ unsafe fn pow<V: Vector>(x: V::F, table: &PowerTable) -> V::F {
 }
 
 #[inline(always)]
-// CPU features are a caller precondition: this generic helper has no target
-// feature attribute of its own, so it must remain behind the unsafe ISA entry.
-pub(crate) unsafe fn contrast<V: Vector>(data: &mut Contrast<'_>) -> usize {
+// Private ISA types reach this helper through CPU-validated target-feature
+// entry points; dispatch also validates all plane lengths.
+pub(crate) fn contrast<V: Vector>(data: &mut Contrast<'_>) -> usize {
     let done = data.current[0].len() / V::LANES * V::LANES;
     // SAFETY: The safe wrapper checked all plane lengths. Each load/store
     // processes LANES initialized, non-overlapping elements before done.
@@ -152,7 +152,7 @@ pub(crate) unsafe fn contrast<V: Vector>(data: &mut Contrast<'_>) -> usize {
 }
 
 #[inline(always)]
-pub(crate) unsafe fn pool<V: Vector>(data: &Pool<'_>) -> (usize, [f64; 3]) {
+pub(crate) fn pool<V: Vector>(data: &Pool<'_>) -> (usize, [f64; 3]) {
     let done = data.current[0].len() / V::LANES * V::LANES;
     let p = data.parameters;
     let powers = power_tables();

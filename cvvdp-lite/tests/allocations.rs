@@ -125,6 +125,47 @@ fn reserved_workspace_allocates_nothing_on_first_or_repeated_candidates() {
             assert_eq!(allocations, 0, "{w}x{h} candidate unexpectedly allocated");
             assert!(score.jod.is_finite());
         }
+        let floats: Vec<f32> = pixels.iter().map(|&v| v as f32 / 255.0).collect();
+        let linear: [Vec<f32>; 3] = std::array::from_fn(|c| {
+            floats
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .map(|rgb| {
+                    let v = rgb[c];
+                    if v > 0.04045 {
+                        ((v + 0.055) / 1.055).powf(2.4)
+                    } else {
+                        v / 12.92
+                    }
+                })
+                .collect()
+        });
+        for candidate in [
+            RgbImage::srgb_f32(&floats, w, h, w * 3).unwrap(),
+            RgbImage::linear_rgb(linear.each_ref().map(Vec::as_slice), w, h, w).unwrap(),
+        ] {
+            let (score, allocations) =
+                measured(|| workspace.compare(&reference, candidate).unwrap());
+            assert_eq!(allocations, 0, "floating conversion unexpectedly allocated");
+            assert_eq!(score.jod, 10.0);
+        }
+        for peak_luminance in [80.0, 200.0] {
+            let display = Display {
+                peak_luminance,
+                ..Display::default()
+            };
+            let other = CvvdpLite::new(display)
+                .unwrap()
+                .prepare_reference(image)
+                .unwrap();
+            let (score, allocations) = measured(|| workspace.compare(&other, image).unwrap());
+            assert_eq!(
+                allocations, 0,
+                "display-table refresh unexpectedly allocated"
+            );
+            assert_eq!(score.jod, 10.0);
+        }
         assert_eq!(workspace.allocated_bytes(), bytes);
         let mut evaluator = reference.evaluator_with(workspace);
         let (score, allocations) = measured(|| evaluator.compare(image).unwrap());

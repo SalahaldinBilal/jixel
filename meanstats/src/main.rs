@@ -536,7 +536,7 @@ fn main() -> Result<()> {
     }
     if with_aom {
         series.push(Series {
-            label: format!("libavif aom (AV1 s{})", tools.speed).into(),
+            label: format!("libavif aom (AV1 s{})", tools.speed),
             color: RGBColor(0xFF, 0x7F, 0x00),
             points: vec![],
         });
@@ -825,6 +825,7 @@ fn bench_jixel(
         .with_num_threads(threads)
         .with_patches(patches)
         .with_speed(Speed::ExtraSlow)
+        .with_arbiter(jixel::Arbiter::Cvvdp)
         .with_splines(true);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;

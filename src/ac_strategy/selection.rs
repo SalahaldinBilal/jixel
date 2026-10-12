@@ -428,7 +428,7 @@ fn mean_max_mixer(butteraugli_target: f32) -> f32 {
 }
 
 #[inline]
-fn aggregate_quant(max_q: u8, sum: u32, covered: usize, butteraugli_target: f32) -> u8 {
+pub(crate) fn aggregate_quant(max_q: u8, sum: u32, covered: usize, butteraugli_target: f32) -> u8 {
     if covered < 4 {
         return max_q;
     }
@@ -647,9 +647,7 @@ fn refine_quant_field(
     quant_field: &mut ImageB,
     band_scratch: &mut [AcStrategyBandScratch],
 ) {
-    if quant_refinement_steps(context.params.distance) == 0
-        || std::env::var_os("JIXEL_AQ_NOREFINE").is_some()
-    {
+    if quant_refinement_steps(context.params.distance) == 0 {
         return;
     }
     {

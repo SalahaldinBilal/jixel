@@ -254,7 +254,8 @@ fn map_sums(map: &[f32]) -> (f64, f64) {
         for lane in 0..SUM_LANES {
             let v = chunk[lane] as f64;
             s1[lane] += v;
-            s4[lane] += v * v * v * v;
+            let v_sqr = v * v;
+            s4[lane] += v_sqr * v_sqr;
         }
     }
     for (lane, &v) in tail.iter().enumerate() {
@@ -647,26 +648,6 @@ fn ssimulacra2_scales(
     (deficit as f32, map)
 }
 
-/// Study probe: SSIMULACRA2 of two 8-bit sRGB images (validation against the reference CLI).
-#[doc(hidden)]
-pub fn ssimulacra2_srgb8(a: &[u8], b: &[u8], width: usize, height: usize) -> f32 {
-    let linear = |rgb: &[u8]| -> [Vec<f32>; 3] {
-        let mut out = [
-            vec![0f32; width * height],
-            vec![0f32; width * height],
-            vec![0f32; width * height],
-        ];
-        for i in 0..width * height {
-            for c in 0..3 {
-                out[c][i] = crate::color::srgb_to_linear_f32(rgb[3 * i + c] as f32 / 255.0);
-            }
-        }
-        out
-    };
-    let (d, _) = ssimulacra2_of_linear(linear(a), linear(b), width, height);
-    100.0 - d
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -953,10 +934,8 @@ mod tests {
                         .collect();
                     let mut actual = vec![0.0; n];
                     let mut expected = vec![0.0; n];
-                    for weights in WEIGHTS
-                        .chunks_exact(6)
-                        .step_by(if n > 4099 { 6 } else { 1 })
-                    {
+                    let (weight_sets, _) = WEIGHTS.as_chunks::<6>();
+                    for weights in weight_sets.iter().step_by(if n > 4099 { 6 } else { 1 }) {
                         for m in 0..3 {
                             actual.fill(0.0);
                             expected.fill(0.0);
@@ -1057,6 +1036,35 @@ mod tests {
         let (d2, _) = ssimulacra2_deficit_and_map(&img, &worse);
         assert!(d2 > d, "{d2} <= {d}");
     }
+}
+
+/// What one `update_checkpointed` overwrote.
+#[derive(Default)]
+pub(crate) struct Ssimulacra2Checkpoint {
+    rects: Vec<(Rect, Rect)>,
+    data: Vec<f32>,
+    sums: Vec<[[(f64, f64); 3]; 3]>,
+}
+
+fn save_rows(buf: &[f32], w: usize, r: Rect, out: &mut Vec<f32>) {
+    if buf.is_empty() {
+        return;
+    }
+    for y in r.y0..r.y1 {
+        out.extend_from_slice(&buf[y * w + r.x0..y * w + r.x1]);
+    }
+}
+
+fn load_rows(buf: &mut [f32], w: usize, r: Rect, data: &[f32], mut at: usize) -> usize {
+    if buf.is_empty() {
+        return at;
+    }
+    let n = r.x1 - r.x0;
+    for y in r.y0..r.y1 {
+        buf[y * w + r.x0..y * w + r.x1].copy_from_slice(&data[at..at + n]);
+        at += n;
+    }
+    at
 }
 
 /// Incremental SSIMULACRA2 of a fixed source against a mutable reconstruction:
@@ -1424,6 +1432,76 @@ impl Ssimulacra2State {
             let region = rs.expand(RADIUS, w, h);
             self.refresh_rec_moments_and_maps(s, region);
         }
+    }
+
+    /// Per scale, the rect `update(_, r)` rewrites in the reconstruction
+    /// planes and the (blur-expanded) rect it rewrites in moments and maps.
+    fn update_rects(&self, r: Rect) -> Vec<(Rect, Rect)> {
+        let r0 = Rect {
+            x0: r.x0,
+            y0: r.y0,
+            x1: r.x1.min(self.w0),
+            y1: r.y1.min(self.h0),
+        };
+        let mut out = Vec::with_capacity(self.dims.len());
+        if r.is_empty() || self.dims.is_empty() || r0.is_empty() {
+            return out;
+        }
+        let mut rs = r0;
+        for s in 0..self.dims.len() {
+            let (w, h) = self.dims[s];
+            if s > 0 {
+                rs = rs.half(w, h);
+            }
+            out.push((rs, rs.expand(RADIUS, w, h)));
+        }
+        out
+    }
+
+    /// `update`, first saving everything it overwrites into `cp` so that
+    /// `rollback(cp)` restores the previous state exactly with copies only.
+    pub(crate) fn update_checkpointed(
+        &mut self,
+        recon: &Image3F,
+        r: Rect,
+        cp: &mut Ssimulacra2Checkpoint,
+    ) {
+        cp.data.clear();
+        cp.rects = self.update_rects(r);
+        cp.sums.clone_from(&self.sums);
+        for (s, &(rs, region)) in cp.rects.iter().enumerate() {
+            let w = self.dims[s].0;
+            for c in 0..3 {
+                save_rows(&self.lin_rec[s][c], w, rs, &mut cp.data);
+                save_rows(&self.pos_rec[s][c], w, rs, &mut cp.data);
+                for buf in [&self.mu2[s][c], &self.s22[s][c], &self.s12[s][c]] {
+                    save_rows(buf, w, region, &mut cp.data);
+                }
+                for map in &self.maps[s][c] {
+                    save_rows(map, w, region, &mut cp.data);
+                }
+            }
+        }
+        self.update(recon, r);
+    }
+
+    /// Undo the `update_checkpointed` that filled `cp`.
+    pub(crate) fn rollback(&mut self, cp: &Ssimulacra2Checkpoint) {
+        let mut at = 0usize;
+        for (s, &(rs, region)) in cp.rects.iter().enumerate() {
+            let w = self.dims[s].0;
+            for c in 0..3 {
+                at = load_rows(&mut self.lin_rec[s][c], w, rs, &cp.data, at);
+                at = load_rows(&mut self.pos_rec[s][c], w, rs, &cp.data, at);
+                at = load_rows(&mut self.mu2[s][c], w, region, &cp.data, at);
+                at = load_rows(&mut self.s22[s][c], w, region, &cp.data, at);
+                at = load_rows(&mut self.s12[s][c], w, region, &cp.data, at);
+                for m in 0..3 {
+                    at = load_rows(&mut self.maps[s][c][m], w, region, &cp.data, at);
+                }
+            }
+        }
+        self.sums.clone_from(&cp.sums);
     }
 
     /// Per-pixel linearized map in the loop's convention (mean = deficit).

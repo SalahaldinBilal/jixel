@@ -624,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn parallel_and_tilted_neighbours_stay_apart() {
+    fn parallel_and_tilted_neighbors_stay_apart() {
         let chains = [
             segment(10.0, 60.0, 20.0, 0.0),
             segment(80.0, 130.0, 24.0, 0.0),

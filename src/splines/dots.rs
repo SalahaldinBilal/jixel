@@ -144,7 +144,7 @@ fn top_hat_peaks(
     pool.steal_map(scratch, (h - 2 * BORDER).div_ceil(BAND), |band, _| {
         let ya = BORDER + band * BAND;
         let yb = (BORDER + (band + 1) * BAND).min(h - BORDER);
-        // Top-hat rows t0..t1 hold the 3x3 neighbourhoods of the peak rows;
+        // Top-hat rows t0..t1 hold the 3x3 neighborhoods of the peak rows;
         // the dilation reads eroded rows e0..e1, the erosion input rows i0..i1.
         let (t0, t1) = (ya - 1, yb + 1);
         let (e0, e1) = (t0.saturating_sub(r), (t1 + r).min(h));
@@ -406,7 +406,7 @@ pub(super) fn dot_candidates(
         .flatten()
         .collect();
     fitted.sort_unstable_by_key(|&(index, _, _)| (!peaks[index].0.abs().to_bits(), index));
-    // Star fields keep loosely fitted bright dots: neighbours and nebulae
+    // Star fields keep loosely fitted bright dots: neighbors and nebulae
     // share a star's fit window. Elsewhere such dots are non-Gaussian blobs
     // the block model over-prices, and only compact fits compete.
     let compact = |explained: &f32| *explained >= MIN_EXPLAINED;

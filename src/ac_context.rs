@@ -79,7 +79,7 @@ pub(crate) const K_NUM_ORDERS: usize = 13;
 #[rustfmt::skip]
 pub(crate) static K_STRATEGY_ORDER: [u8; K_NUM_AC_STRATEGY_CODES] = [
     0, 1, 1, 1, 2, 3, 4, 4, 5, 5, 6, 6, 1, 1,
-    1, 1, 1, 1, 7, 8, 8, 9, 9, 9, 10, 10, 10,
+    1, 1, 1, 1, 7, 8, 8, 9, 10, 10, 11, 12, 12,
 ];
 
 /// Local channel order is X, Y, B; the block context map's row order is

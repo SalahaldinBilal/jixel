@@ -563,7 +563,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coding_order_chains_neighbouring_starts() {
+    fn coding_order_chains_neighboring_starts() {
         let at = |x: i32, y: i32| QuantizedSpline {
             points: vec![Point::new(x, y), Point::new(x + 30, y)],
             dct: [[0; 32]; 4],

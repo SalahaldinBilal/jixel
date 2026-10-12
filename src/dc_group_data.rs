@@ -48,7 +48,20 @@ pub(crate) const STRATEGY_DCT64X32: u8 = 15;
 pub(crate) const STRATEGY_DCT32X64: u8 = 16;
 pub(crate) const STRATEGY_IDENTITY: u8 = 17;
 pub(crate) const STRATEGY_DCT2X2: u8 = 18;
-pub(crate) const NUM_STRATEGIES: usize = 19;
+pub(crate) const STRATEGY_DCT128X128: u8 = 19;
+/// 128 rows x 64 columns.
+pub(crate) const STRATEGY_DCT128X64: u8 = 20;
+/// 64 rows x 128 columns.
+pub(crate) const STRATEGY_DCT64X128: u8 = 21;
+pub(crate) const NUM_STRATEGIES: usize = 22;
+
+#[inline]
+pub(crate) fn is_128_strategy(strategy: u8) -> bool {
+    matches!(
+        strategy,
+        STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128
+    )
+}
 
 #[inline]
 pub(crate) fn is_gated_sub8_strategy(strategy: u8) -> bool {
@@ -76,7 +89,7 @@ pub(crate) fn is_sub8_strategy(strategy: u8) -> bool {
 /// DCT32X16=10, DCT16X32=11, AFV0..3=14..17, DCT64 family=18..20,
 /// IDENTITY=1, DCT2X2=2.
 pub(crate) static STRATEGY_CODE_LUT: [u8; NUM_STRATEGIES] = [
-    0, 6, 7, 4, 5, 3, 12, 13, 10, 11, 14, 15, 16, 17, 18, 19, 20, 1, 2,
+    0, 6, 7, 4, 5, 3, 12, 13, 10, 11, 14, 15, 16, 17, 18, 19, 20, 1, 2, 21, 22, 23,
 ];
 
 const FIRST_BLOCK_BIT: u8 = 1;
@@ -151,8 +164,9 @@ impl AcStrategyImage {
     pub(crate) fn covered_blocks_x_of(strategy: u8) -> usize {
         // {DCT: 1, DCT16X8: 1, DCT8X16: 2, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1,
         //  DCT4X8: 1, DCT8X4: 1, DCT32X16: 2, DCT16X32: 4, AFV0..3: 1}
-        static LUT: [u8; NUM_STRATEGIES] =
-            [1, 1, 2, 2, 4, 1, 1, 1, 2, 4, 1, 1, 1, 1, 8, 4, 8, 1, 1];
+        static LUT: [u8; NUM_STRATEGIES] = [
+            1, 1, 2, 2, 4, 1, 1, 1, 2, 4, 1, 1, 1, 1, 8, 4, 8, 1, 1, 16, 8, 16,
+        ];
         LUT[strategy as usize] as usize
     }
 
@@ -160,8 +174,9 @@ impl AcStrategyImage {
     pub(crate) fn covered_blocks_y_of(strategy: u8) -> usize {
         // {DCT: 1, DCT16X8: 2, DCT8X16: 1, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1,
         //  DCT4X8: 1, DCT8X4: 1, DCT32X16: 4, DCT16X32: 2, AFV0..3: 1}
-        static LUT: [u8; NUM_STRATEGIES] =
-            [1, 2, 1, 2, 4, 1, 1, 1, 4, 2, 1, 1, 1, 1, 8, 8, 4, 1, 1];
+        static LUT: [u8; NUM_STRATEGIES] = [
+            1, 2, 1, 2, 4, 1, 1, 1, 4, 2, 1, 1, 1, 1, 8, 8, 4, 1, 1, 16, 16, 8,
+        ];
         LUT[strategy as usize] as usize
     }
 
@@ -184,6 +199,12 @@ impl AcStrategyImage {
         // alignment of selection; for the 4×4 DCT32X32 it is the binding
         // constraint.
         const TILE: usize = 8;
+        if is_128_strategy(strategy) {
+            // 128px transforms span several 64px tiles; the AC group writer
+            // processes whole groups, so only the group bound applies. Keep
+            // them on their own size grid like every other merge.
+            return x.is_multiple_of(cx) && y.is_multiple_of(cy);
+        }
         if (x / TILE) != ((x + cx - 1) / TILE) {
             return false;
         }
@@ -215,6 +236,24 @@ impl AcStrategyImage {
 
         for row in rows {
             row[x..x + cx].fill(v);
+        }
+    }
+
+    /// Raw cells of a `w`x`h` region, for an exact restore.
+    pub(crate) fn save_region(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
+        (y..y + h)
+            .flat_map(|r| {
+                self.cells[r * self.xsize + x..r * self.xsize + x + w]
+                    .iter()
+                    .copied()
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_region(&mut self, x: usize, y: usize, w: usize, saved: &[u8]) {
+        for (i, row) in saved.chunks_exact(w).enumerate() {
+            let start = (y + i) * self.xsize + x;
+            self.cells[start..start + w].copy_from_slice(row);
         }
     }
 

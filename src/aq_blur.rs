@@ -89,6 +89,7 @@ fn selected_kernels() -> Kernels {
     })
 }
 
+#[cfg(test)]
 fn kernel() -> &'static [f32; WINDOW] {
     static KERNEL: OnceLock<[f32; WINDOW]> = OnceLock::new();
     KERNEL.get_or_init(|| {
@@ -122,6 +123,7 @@ pub(crate) struct GaussianBlur {
 
 impl GaussianBlur {
     /// σ = 1.5 Gaussian with edge replication.
+    #[cfg(test)]
     pub(crate) fn new(width: usize) -> Self {
         Self::with_kernel(width, *kernel(), false)
     }

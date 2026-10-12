@@ -43,7 +43,10 @@ fn horizontal<const N: usize>(src: &[f32], k: &[f32; WINDOW], dst: &mut [f32]) -
     const LANES: usize = 8;
     let center = _mm256_set1_ps(k[RADIUS]);
     let mut done = 0;
-    for (block, dst) in dst.chunks_exact_mut(N * LANES).enumerate() {
+    let (vectors, _) = dst.as_chunks_mut::<LANES>();
+    let (blocks, _) = vectors.as_chunks_mut::<N>();
+    for (block, dst) in blocks.iter_mut().enumerate() {
+        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.
@@ -84,7 +87,10 @@ fn vertical<const N: usize>(rows: &BlurRows<'_>, k: &[f32; WINDOW], dst: &mut [f
     const LANES: usize = 8;
     let center = _mm256_set1_ps(k[RADIUS]);
     let mut done = 0;
-    for (block, dst) in dst.chunks_exact_mut(N * LANES).enumerate() {
+    let (vectors, _) = dst.as_chunks_mut::<LANES>();
+    let (blocks, _) = vectors.as_chunks_mut::<N>();
+    for (block, dst) in blocks.iter_mut().enumerate() {
+        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         // Bounds are validated above; every vector fits the padded row or
         // one of the WINDOW rows, and every store fits this output chunk.

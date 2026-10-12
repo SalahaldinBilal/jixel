@@ -2177,10 +2177,17 @@ mod tests {
         let values: Vec<i32> = (-4099..=4099).chain([i32::MIN / 4, i32::MAX / 4]).collect();
         for shift in 1..=4u32 {
             let k = 1i32 << shift;
-            let mut kernels: Vec<(&str, crate::xyb::RoundLatticePow2Fn)> = vec![
+            let kernels: Vec<(&str, crate::xyb::RoundLatticePow2Fn)> = vec![
                 ("dispatch", crate::xyb::selected_round_lattice_pow2_fn()),
                 ("scalar", crate::xyb::round_lattice_pow2_scalar),
             ];
+            #[cfg(any(
+                all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"),
+                all(target_arch = "x86_64", feature = "avx"),
+                all(target_arch = "aarch64", feature = "neon"),
+                all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+            ))]
+            let mut kernels = kernels;
             #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
             if std::is_x86_feature_detected!("sse2") {
                 kernels.push(("sse2", crate::sse::round_lattice_pow2_sse2));
@@ -2191,6 +2198,8 @@ mod tests {
             }
             #[cfg(all(target_arch = "aarch64", feature = "neon"))]
             kernels.push(("neon", crate::neon::round_lattice_pow2_neon));
+            #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+            kernels.push(("wasm", crate::wasm::round_lattice_pow2_wasm));
             for (name, f) in kernels {
                 let mut out = values.clone();
                 unsafe { f(&mut out, shift) };

@@ -31,6 +31,7 @@ use crate::dct::{
     DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64,
     RESAMPLE_SCALE_16_TO_2, RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
 };
+use crate::dct128::{DCT128_SPLIT_COS, DCT128_SPLIT_SIN, INV_WC128, RESAMPLE_SCALE_128_TO_16};
 use std::arch::aarch64::*;
 use std::mem::MaybeUninit;
 
@@ -831,9 +832,20 @@ macro_rules! horizontal_idct_pass {
 /// IDCT for a natural coefficient layout `[vfreq * W + hfreq]`.
 macro_rules! inv_dct_natural_neon {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        inv_dct_natural_neon!(
+            $name,
+            $n,
+            $h,
+            $w,
+            $inv_v,
+            $inv_h,
+            MaybeUninit::<[f32; $n]>::uninit()
+        );
+    };
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path, $scratch:expr) => {
         #[target_feature(enable = "neon")]
         pub(crate) fn $name(coeff: DctInput<'_, $w, $h>, out: &mut [f32; $n]) {
-            let mut tmp_u = MaybeUninit::<[f32; $n]>::uninit();
+            let mut tmp_u = $scratch;
             let tmp_ptr = tmp_u.as_mut_ptr() as *mut f32;
             for u4 in (0..$w).step_by(4) {
                 let mut c: [float32x4_t; $h] = std::array::from_fn(|v| {
@@ -853,9 +865,20 @@ macro_rules! inv_dct_natural_neon {
 /// IDCT for a transposed coefficient layout `[hfreq * H + vfreq]`.
 macro_rules! inv_dct_transposed_neon {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        inv_dct_transposed_neon!(
+            $name,
+            $n,
+            $h,
+            $w,
+            $inv_v,
+            $inv_h,
+            MaybeUninit::<[f32; $n]>::uninit()
+        );
+    };
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path, $scratch:expr) => {
         #[target_feature(enable = "neon")]
         pub(crate) fn $name(coeff: DctInput<'_, $h, $w>, out: &mut [f32; $n]) {
-            let mut tmp_u = MaybeUninit::<[f32; $n]>::uninit();
+            let mut tmp_u = $scratch;
             let tmp_ptr = tmp_u.as_mut_ptr() as *mut f32;
             for u4 in (0..$w).step_by(4) {
                 let mut c = [vdupq_n_f32(0.0); $h];
@@ -1570,6 +1593,236 @@ pub(crate) fn dc_from_dct32x64_neon(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
         vst1q_f32(dc[20..].as_mut_ptr(), hi2);
         vst1q_f32(dc[24..].as_mut_ptr(), lo3);
         vst1q_f32(dc[28..].as_mut_ptr(), hi3);
+    }
+}
+
+// Restore the natural frequency order of the 64-point split-radix kernel.
+#[target_feature(enable = "neon")]
+fn dct1d_64_natural(c: &mut [float32x4_t; 64]) {
+    dct1d_64_s(c);
+    let split = *c;
+    for i in 0..64 {
+        c[i] = split[crate::dct128::dct64_natural_index(i)];
+    }
+}
+
+/// Split-radix DCT-II over 4 independent 128-point columns.
+#[target_feature(enable = "neon")]
+fn dct1d_128(c: &mut [float32x4_t; 128]) {
+    for i in 0..32 {
+        let bottom = c[i];
+        let top = c[127 - i];
+        let half_bottom = c[63 - i];
+        let half_top = c[64 + i];
+        let lower = vsubq_f32(bottom, top);
+        let upper = vsubq_f32(half_bottom, half_top);
+        c[i] = vaddq_f32(bottom, top);
+        c[63 - i] = vaddq_f32(half_bottom, half_top);
+        c[64 + i] = vfmaq_n_f32(
+            vmulq_n_f32(lower, DCT128_SPLIT_COS[i]),
+            upper,
+            DCT128_SPLIT_SIN[i],
+        );
+        let sin = vfmsq_n_f32(
+            vmulq_n_f32(upper, DCT128_SPLIT_COS[i]),
+            lower,
+            DCT128_SPLIT_SIN[i],
+        );
+        c[127 - i] = if i & 1 == 0 { sin } else { vnegq_f32(sin) };
+    }
+    dct1d_64_natural((&mut c[..64]).try_into().unwrap());
+    dct1d_32_s((&mut c[64..96]).try_into().unwrap());
+    dct1d_32_s((&mut c[96..]).try_into().unwrap());
+    for i in 1..32 {
+        let cos = c[64 + i];
+        let sin = if i & 1 == 0 {
+            vnegq_f32(c[128 - i])
+        } else {
+            c[128 - i]
+        };
+        c[64 + i] = vaddq_f32(cos, sin);
+        c[128 - i] = vsubq_f32(cos, sin);
+    }
+    c[64] = vmulq_n_f32(c[64], std::f32::consts::SQRT_2);
+    c[96] = vmulq_n_f32(c[96], -std::f32::consts::SQRT_2);
+    let split = *c;
+    for i in 0..64 {
+        c[2 * i] = split[i];
+        let odd = if i == 0 {
+            64
+        } else if i & 1 != 0 {
+            65 + i / 2
+        } else {
+            128 - i / 2
+        };
+        c[2 * i + 1] = split[odd];
+    }
+}
+
+// Transposed scratch makes both separable passes use contiguous SIMD loads.
+macro_rules! dct128_neon {
+    ($name:ident, $n:literal, $w:literal, $h:literal, $dct_v:path, $dct_h:path) => {
+        #[target_feature(enable = "neon")]
+        pub(crate) fn $name(input: DctInput<'_, $w, $h>, output: &mut [f32; $n]) {
+            let mut scratch = Box::<[f32; $n]>::new_uninit();
+            let dst = scratch.as_mut_ptr() as *mut f32;
+            for x in (0..$w).step_by(4) {
+                let mut c: [float32x4_t; $h] =
+                    std::array::from_fn(|y| load_strip(input.row(y)[x..].as_ptr()));
+                $dct_v(&mut c);
+                for v in (0..$h).step_by(4) {
+                    let mut tile: [float32x4_t; 4] = c[v..v + 4].try_into().unwrap();
+                    let (r0, r1, r2, r3) = transpose_4x4(tile[0], tile[1], tile[2], tile[3]);
+                    tile = [r0, r1, r2, r3];
+                    for (j, value) in tile.iter().enumerate() {
+                        unsafe { vst1q_f32(dst.add((x + j) * $h + v), *value) };
+                    }
+                }
+            }
+            // Every scratch element was written by exactly one tile above.
+            let scratch = unsafe { scratch.assume_init() };
+            let scale = 1.0 / $n as f32;
+            for v in (0..$h).step_by(4) {
+                let mut c: [float32x4_t; $w] =
+                    std::array::from_fn(|x| load_strip(scratch[x * $h + v..].as_ptr()));
+                $dct_h(&mut c);
+                if $h >= $w {
+                    for u in 0..$w {
+                        unsafe {
+                            vst1q_f32(
+                                output.as_mut_ptr().add(u * $h + v),
+                                vmulq_n_f32(c[u], scale),
+                            )
+                        };
+                    }
+                } else {
+                    for u in (0..$w).step_by(4) {
+                        let mut tile: [float32x4_t; 4] = c[u..u + 4].try_into().unwrap();
+                        let (r0, r1, r2, r3) = transpose_4x4(tile[0], tile[1], tile[2], tile[3]);
+                        tile = [r0, r1, r2, r3];
+                        for (j, value) in tile.iter().enumerate() {
+                            unsafe {
+                                vst1q_f32(
+                                    output.as_mut_ptr().add((v + j) * $w + u),
+                                    vmulq_n_f32(*value, scale),
+                                )
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+dct128_neon!(dct128x128_neon, 16384, 128, 128, dct1d_128, dct1d_128);
+dct128_neon!(dct128x64_neon, 8192, 64, 128, dct1d_128, dct1d_64_natural);
+dct128_neon!(dct64x128_neon, 8192, 128, 64, dct1d_64_natural, dct1d_128);
+
+#[target_feature(enable = "neon")]
+fn inv_dct1d_128(c: &mut [float32x4_t; 128]) {
+    let mut even: [float32x4_t; 64] = std::array::from_fn(|i| c[2 * i]);
+    let mut odd: [float32x4_t; 64] = std::array::from_fn(|i| c[2 * i + 1]);
+    for i in (1..63).rev() {
+        odd[i] = vsubq_f32(odd[i], odd[i + 1]);
+    }
+    odd[0] = vmulq_n_f32(vsubq_f32(odd[0], odd[1]), std::f32::consts::FRAC_1_SQRT_2);
+    inv_dct1d_64_s(&mut odd);
+    inv_dct1d_64_s(&mut even);
+    for i in 0..64 {
+        let o = vmulq_n_f32(odd[i], INV_WC128[i]);
+        c[i] = vmulq_n_f32(vaddq_f32(even[i], o), 0.5);
+        c[127 - i] = vmulq_n_f32(vsubq_f32(even[i], o), 0.5);
+    }
+}
+
+inv_dct_transposed_neon!(
+    inv_dct128x128_neon,
+    16384,
+    128,
+    128,
+    inv_dct1d_128,
+    inv_dct1d_128,
+    Box::<[f32; 16384]>::new_uninit()
+);
+inv_dct_transposed_neon!(
+    inv_dct128x64_neon,
+    8192,
+    128,
+    64,
+    inv_dct1d_128,
+    inv_dct1d_64_s,
+    Box::<[f32; 8192]>::new_uninit()
+);
+inv_dct_natural_neon!(
+    inv_dct64x128_neon,
+    8192,
+    64,
+    128,
+    inv_dct1d_64_s,
+    inv_dct1d_128,
+    Box::<[f32; 8192]>::new_uninit()
+);
+
+macro_rules! dc_from_dct128_neon {
+    ($name:ident, $n:literal, $rows:literal, $inv_v:path) => {
+        #[target_feature(enable = "neon")]
+        pub(crate) fn $name(coeffs: &[f32; $n], dc: &mut [f32; { $rows * 16 }]) {
+            let mut scratch = [[0.0f32; 16]; $rows];
+            for x in (0..16).step_by(4) {
+                let resample = load_strip(RESAMPLE_SCALE_128_TO_16[x..].as_ptr());
+                let mut c: [float32x4_t; $rows] = std::array::from_fn(|y| {
+                    let row_scale = if $rows == 16 {
+                        RESAMPLE_SCALE_128_TO_16[y]
+                    } else {
+                        RESAMPLE_SCALE_64_TO_8[y]
+                    };
+                    vmulq_n_f32(
+                        vmulq_f32(load_strip(coeffs[y * 128 + x..].as_ptr()), resample),
+                        ($rows * 16) as f32 * row_scale,
+                    )
+                });
+                $inv_v(&mut c);
+                for y in 0..$rows {
+                    unsafe { vst1q_f32(scratch[y].as_mut_ptr().add(x), c[y]) };
+                }
+            }
+            for y in (0..$rows).step_by(4) {
+                let mut c = [vdupq_n_f32(0.0); 16];
+                for x in (0..16).step_by(4) {
+                    let mut tile: [float32x4_t; 4] =
+                        std::array::from_fn(|j| load_strip(scratch[y + j][x..].as_ptr()));
+                    let (r0, r1, r2, r3) = transpose_4x4(tile[0], tile[1], tile[2], tile[3]);
+                    tile = [r0, r1, r2, r3];
+                    c[x..x + 4].copy_from_slice(&tile);
+                }
+                inv_dct1d_16_s(&mut c);
+                // Square and tall footprints store the transposed DC grid.
+                for x in 0..16 {
+                    unsafe { vst1q_f32(dc.as_mut_ptr().add(x * $rows + y), c[x]) };
+                }
+            }
+        }
+    };
+}
+
+dc_from_dct128_neon!(dc_from_dct128x128_neon, 16384, 16, inv_dct1d_16_s);
+dc_from_dct128_neon!(dc_from_dct128x64_neon, 8192, 8, inv_dct1d_8_s);
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dc_from_dct64x128_neon(coeffs: &[f32; 8192], dc: &mut [f32; 128]) {
+    let mut transposed = [0.0f32; 128];
+    dc_from_dct128x64_neon(coeffs, &mut transposed);
+    for y in (0..8).step_by(4) {
+        for x in (0..16).step_by(4) {
+            let mut tile: [float32x4_t; 4] =
+                std::array::from_fn(|j| load_strip(transposed[(x + j) * 8 + y..].as_ptr()));
+            let (r0, r1, r2, r3) = transpose_4x4(tile[0], tile[1], tile[2], tile[3]);
+            tile = [r0, r1, r2, r3];
+            for (j, row) in tile.iter().enumerate() {
+                unsafe { vst1q_f32(dc.as_mut_ptr().add((y + j) * 16 + x), *row) };
+            }
+        }
     }
 }
 

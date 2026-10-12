@@ -1439,59 +1439,6 @@ pub(crate) fn dc_step_wire(dc_step: [f32; 3]) -> Option<[u16; 3]> {
     })
 }
 
-/// Per-DC-group Y and B levels and the pooled DC rate in bits.
-pub(crate) type DcCandidate = (Vec<Vec<i32>>, Vec<Vec<i32>>, f64);
-
-/// Y and B DC levels of every DC group under `steps`, with the pooled
-/// gradient-coded rate in bits (the model `choose_dc_steps` ranks with).
-/// `None` without the unrounded source DC planes.
-pub(crate) fn dc_candidate_levels(
-    dc_datas: &[DcGroupData],
-    ctx: &EncodingContext,
-    scale_dc: f32,
-    ytob_dc: i32,
-    steps: [f32; 3],
-    cfl: CflFrame,
-) -> Option<DcCandidate> {
-    if dc_datas
-        .iter()
-        .any(|dc| dc.source_dc_y.is_none() || dc.source_dc_b.is_none())
-    {
-        return None;
-    }
-    let factor_y = INV_DC_QUANT[1] / steps[1] * scale_dc;
-    let factor_b = INV_DC_QUANT[2] / steps[2] * scale_dc;
-    let cfl_b = dc_cfl_factor(steps, ytob_dc, cfl);
-    let mut y_price = DcGradientPrice::default();
-    let mut b_price = DcGradientPrice::default();
-    let mut y_levels = Vec::with_capacity(dc_datas.len());
-    let mut b_levels = Vec::with_capacity(dc_datas.len());
-    for dc in dc_datas {
-        let (sy, sb) = (
-            dc.source_dc_y.as_ref().unwrap(),
-            dc.source_dc_b.as_ref().unwrap(),
-        );
-        let (w, h) = (sy.xsize(), sy.ysize());
-        let mut yl = vec![0i32; w * h];
-        let mut bl = vec![0i32; w * h];
-        for y in 0..h {
-            (ctx.quantize_dc_i32)(sy.row(y), factor_y, &mut yl[y * w..(y + 1) * w]);
-            y_price.add_row(&yl[y * w..(y + 1) * w], y == 0);
-            (ctx.quantize_dc_cfl_i32)(
-                sb.row(y),
-                &yl[y * w..(y + 1) * w],
-                factor_b,
-                cfl_b,
-                &mut bl[y * w..(y + 1) * w],
-            );
-            b_price.add_row(&bl[y * w..(y + 1) * w], y == 0);
-        }
-        y_levels.push(yl);
-        b_levels.push(bl);
-    }
-    Some((y_levels, b_levels, y_price.bits() + b_price.bits()))
-}
-
 /// Choose the frame's Y and B DC steps.
 ///
 /// A smooth region holds one value per channel. Where that value falls
@@ -2348,7 +2295,7 @@ mod tests {
 
     #[test]
     fn dc_steps_move_the_levels_under_a_flat_value() {
-        // A flat B that sits half a level from its neighbours under the
+        // A flat B that sits half a level from its neighbors under the
         // default step, with a flicker that rounds it either way.
         let flicker = |x: usize, y: usize| {
             let mut state = (x as u32 * 7919 + y as u32 * 104729) | 1;

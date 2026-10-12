@@ -26,65 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::aq_loop::{C1, C2, SsimMoments};
 use core::arch::wasm32::*;
-
-#[target_feature(enable = "simd128")]
-pub(crate) fn ssim_moments_wasm(src: &SsimMoments<'_>, l: &mut [f32], cs: &mut [f32]) -> usize {
-    src.assert_len(l.len());
-    assert_eq!(l.len(), cs.len());
-    let done = moments::<4>(src, l, cs);
-    done + moments::<1>(&src.tail(done), &mut l[done..], &mut cs[done..])
-}
-
-#[inline]
-#[target_feature(enable = "simd128")]
-fn moments<const N: usize>(src: &SsimMoments<'_>, l: &mut [f32], cs: &mut [f32]) -> usize {
-    const LANES: usize = 4;
-    let two = f32x4_splat(2.0);
-    let c1 = f32x4_splat(C1);
-    let c2 = f32x4_splat(C2);
-    let mut done = 0;
-    for (block, (l, cs)) in l
-        .chunks_exact_mut(N * LANES)
-        .zip(cs.chunks_exact_mut(N * LANES))
-        .enumerate()
-    {
-        let x = block * N * LANES;
-        for lane in 0..N {
-            // The entry point checks all lengths; loads and stores cover
-            // only complete vectors. Keep the scalar order without FMA.
-            unsafe {
-                let offset = x + lane * LANES;
-                let a = v128_load(src.mx.as_ptr().add(offset).cast());
-                let b = v128_load(src.my.as_ptr().add(offset).cast());
-                let xx = v128_load(src.sxx.as_ptr().add(offset).cast());
-                let yy = v128_load(src.syy.as_ptr().add(offset).cast());
-                let xy = v128_load(src.sxy.as_ptr().add(offset).cast());
-                let aa = f32x4_mul(a, a);
-                let bb = f32x4_mul(b, b);
-                let ab = f32x4_mul(a, b);
-                let vx = f32x4_sub(xx, aa);
-                let vy = f32x4_sub(yy, bb);
-                let cov = f32x4_sub(xy, ab);
-                let l_num = f32x4_add(f32x4_mul(f32x4_mul(two, a), b), c1);
-                let l_den = f32x4_add(f32x4_add(aa, bb), c1);
-                let cs_num = f32x4_add(f32x4_mul(two, cov), c2);
-                let cs_den = f32x4_add(f32x4_add(vx, vy), c2);
-                v128_store(
-                    l.as_mut_ptr().add(lane * LANES).cast(),
-                    f32x4_div(l_num, l_den),
-                );
-                v128_store(
-                    cs.as_mut_ptr().add(lane * LANES).cast(),
-                    f32x4_div(cs_num, cs_den),
-                );
-            }
-        }
-        done += N * LANES;
-    }
-    done
-}
 
 #[target_feature(enable = "simd128")]
 pub(crate) fn downsample_rows_wasm(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> usize {
@@ -100,7 +42,10 @@ fn downsample<const N: usize>(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> u
     const LANES: usize = 4;
     let quarter = f32x4_splat(0.25);
     let mut done = 0;
-    for (block, dst) in dst.chunks_exact_mut(N * LANES).enumerate() {
+    let (vectors, _) = dst.as_chunks_mut::<LANES>();
+    let (blocks, _) = vectors.as_chunks_mut::<N>();
+    for (block, dst) in blocks.iter_mut().enumerate() {
+        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         for lane in 0..N {
             // Each output vector consumes two input vectors from each row.

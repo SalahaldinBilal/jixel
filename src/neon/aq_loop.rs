@@ -26,59 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::aq_loop::{C1, C2, SsimMoments};
 use std::arch::aarch64::*;
-
-#[target_feature(enable = "neon")]
-pub(crate) fn ssim_moments_neon(src: &SsimMoments<'_>, l: &mut [f32], cs: &mut [f32]) -> usize {
-    src.assert_len(l.len());
-    assert_eq!(l.len(), cs.len());
-    let done = moments::<4>(src, l, cs);
-    done + moments::<1>(&src.tail(done), &mut l[done..], &mut cs[done..])
-}
-
-#[inline]
-#[target_feature(enable = "neon")]
-fn moments<const N: usize>(src: &SsimMoments<'_>, l: &mut [f32], cs: &mut [f32]) -> usize {
-    const LANES: usize = 4;
-    let two = vdupq_n_f32(2.0);
-    let c1 = vdupq_n_f32(C1);
-    let c2 = vdupq_n_f32(C2);
-    let mut done = 0;
-    for (block, (l, cs)) in l
-        .chunks_exact_mut(N * LANES)
-        .zip(cs.chunks_exact_mut(N * LANES))
-        .enumerate()
-    {
-        let x = block * N * LANES;
-        for lane in 0..N {
-            // The entry point checks all lengths; loads and stores cover
-            // only complete vectors. Keep the scalar order without FMA.
-            unsafe {
-                let offset = x + lane * LANES;
-                let a = vld1q_f32(src.mx.as_ptr().add(offset));
-                let b = vld1q_f32(src.my.as_ptr().add(offset));
-                let xx = vld1q_f32(src.sxx.as_ptr().add(offset));
-                let yy = vld1q_f32(src.syy.as_ptr().add(offset));
-                let xy = vld1q_f32(src.sxy.as_ptr().add(offset));
-                let aa = vmulq_f32(a, a);
-                let bb = vmulq_f32(b, b);
-                let ab = vmulq_f32(a, b);
-                let vx = vsubq_f32(xx, aa);
-                let vy = vsubq_f32(yy, bb);
-                let cov = vsubq_f32(xy, ab);
-                let l_num = vaddq_f32(vmulq_f32(vmulq_f32(two, a), b), c1);
-                let l_den = vaddq_f32(vaddq_f32(aa, bb), c1);
-                let cs_num = vaddq_f32(vmulq_f32(two, cov), c2);
-                let cs_den = vaddq_f32(vaddq_f32(vx, vy), c2);
-                vst1q_f32(l.as_mut_ptr().add(lane * LANES), vdivq_f32(l_num, l_den));
-                vst1q_f32(cs.as_mut_ptr().add(lane * LANES), vdivq_f32(cs_num, cs_den));
-            }
-        }
-        done += N * LANES;
-    }
-    done
-}
 
 #[target_feature(enable = "neon")]
 pub(crate) fn downsample_rows_neon(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> usize {
@@ -94,7 +42,10 @@ fn downsample<const N: usize>(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> u
     const LANES: usize = 4;
     let quarter = vdupq_n_f32(0.25);
     let mut done = 0;
-    for (block, dst) in dst.chunks_exact_mut(N * LANES).enumerate() {
+    let (vectors, _) = dst.as_chunks_mut::<LANES>();
+    let (blocks, _) = vectors.as_chunks_mut::<N>();
+    for (block, dst) in blocks.iter_mut().enumerate() {
+        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         for lane in 0..N {
             // Each output vector consumes two input vectors from each row.

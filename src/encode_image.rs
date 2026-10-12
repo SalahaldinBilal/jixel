@@ -3163,7 +3163,7 @@ mod encode_smoke_tests {
             encode_image(&rgb8(), W, H, &off).unwrap()
         );
         let mut rgba = rgba8();
-        for px in rgba.chunks_exact_mut(4) {
+        for px in rgba.as_chunks_mut::<4>().0 {
             px[3] = 128; // Partial alpha must not be premultiplied or filled.
         }
         for coding in [

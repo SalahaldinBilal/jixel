@@ -26,65 +26,10 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::aq_loop::{C1, C2, SsimMoments};
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
-
-#[target_feature(enable = "sse4.1")]
-pub(crate) fn ssim_moments_sse41(src: &SsimMoments<'_>, l: &mut [f32], cs: &mut [f32]) -> usize {
-    src.assert_len(l.len());
-    assert_eq!(l.len(), cs.len());
-    let done = moments::<4>(src, l, cs);
-    done + moments::<1>(&src.tail(done), &mut l[done..], &mut cs[done..])
-}
-
-#[inline]
-#[target_feature(enable = "sse4.1")]
-fn moments<const N: usize>(src: &SsimMoments<'_>, l: &mut [f32], cs: &mut [f32]) -> usize {
-    const LANES: usize = 4;
-    let two = _mm_set1_ps(2.0);
-    let c1 = _mm_set1_ps(C1);
-    let c2 = _mm_set1_ps(C2);
-    let mut done = 0;
-    for (block, (l, cs)) in l
-        .chunks_exact_mut(N * LANES)
-        .zip(cs.chunks_exact_mut(N * LANES))
-        .enumerate()
-    {
-        let x = block * N * LANES;
-        for lane in 0..N {
-            // The entry point checks all lengths; loads and stores cover
-            // only complete vectors. Keep the scalar order without FMA.
-            unsafe {
-                let offset = x + lane * LANES;
-                let a = _mm_loadu_ps(src.mx.as_ptr().add(offset));
-                let b = _mm_loadu_ps(src.my.as_ptr().add(offset));
-                let xx = _mm_loadu_ps(src.sxx.as_ptr().add(offset));
-                let yy = _mm_loadu_ps(src.syy.as_ptr().add(offset));
-                let xy = _mm_loadu_ps(src.sxy.as_ptr().add(offset));
-                let aa = _mm_mul_ps(a, a);
-                let bb = _mm_mul_ps(b, b);
-                let ab = _mm_mul_ps(a, b);
-                let vx = _mm_sub_ps(xx, aa);
-                let vy = _mm_sub_ps(yy, bb);
-                let cov = _mm_sub_ps(xy, ab);
-                let l_num = _mm_add_ps(_mm_mul_ps(_mm_mul_ps(two, a), b), c1);
-                let l_den = _mm_add_ps(_mm_add_ps(aa, bb), c1);
-                let cs_num = _mm_add_ps(_mm_mul_ps(two, cov), c2);
-                let cs_den = _mm_add_ps(_mm_add_ps(vx, vy), c2);
-                _mm_storeu_ps(l.as_mut_ptr().add(lane * LANES), _mm_div_ps(l_num, l_den));
-                _mm_storeu_ps(
-                    cs.as_mut_ptr().add(lane * LANES),
-                    _mm_div_ps(cs_num, cs_den),
-                );
-            }
-        }
-        done += N * LANES;
-    }
-    done
-}
 
 #[target_feature(enable = "sse4.1")]
 pub(crate) fn downsample_rows_sse41(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> usize {
@@ -100,7 +45,10 @@ fn downsample<const N: usize>(top: &[f32], bottom: &[f32], dst: &mut [f32]) -> u
     const LANES: usize = 4;
     let quarter = _mm_set1_ps(0.25);
     let mut done = 0;
-    for (block, dst) in dst.chunks_exact_mut(N * LANES).enumerate() {
+    let (vectors, _) = dst.as_chunks_mut::<LANES>();
+    let (blocks, _) = vectors.as_chunks_mut::<N>();
+    for (block, dst) in blocks.iter_mut().enumerate() {
+        let dst = dst.as_flattened_mut();
         let x = block * N * LANES;
         for lane in 0..N {
             // Each output vector consumes two input vectors from each row.

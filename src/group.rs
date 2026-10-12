@@ -36,7 +36,8 @@ use crate::dc_group_data::{
     AcStrategyImage, DcGroupData, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3,
     STRATEGY_DCT, STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
     STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
-    STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_IDENTITY,
+    STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_DCT64X128,
+    STRATEGY_DCT128X64, STRATEGY_DCT128X128, STRATEGY_IDENTITY,
 };
 use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, fmla};
 use crate::encoding_context::EncodingContext;
@@ -277,7 +278,7 @@ fn rdoq_window_len(covered_blocks: usize, large_window: bool, distance: f32) -> 
     }
 }
 
-/// A block whose source has at most this many distinct colours per 8x8 is
+/// A block whose source has at most this many distinct colors per 8x8 is
 /// graphic: flat fills with hard edges, where a coefficient the deadzone
 /// zeroed reads as a stray blip once restored.
 const RESTORE_FEW_COLORS_PER_BLOCK: usize = 24;
@@ -295,7 +296,26 @@ fn few_colors(
     limit: usize,
     seen: &mut Vec<u64>,
 ) -> bool {
+    let key_at = |rows: &[&[f32]; 3], x: usize| {
+        rows.iter().fold(0u64, |k, r| {
+            (k << 21) | (((r[x] * 1024.0) + 0.5) as i64 as u64 & 0x1f_ffff)
+        })
+    };
     seen.clear();
+    // Large footprints: the linear scan is quadratic in the color limit.
+    if limit > 64 {
+        for y in y0..y1 {
+            let rows = [
+                opsin.plane_row(0, y),
+                opsin.plane_row(1, y),
+                opsin.plane_row(2, y),
+            ];
+            seen.extend((x0..x1).map(|x| key_at(&rows, x)));
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        return seen.len() <= limit;
+    }
     seen.reserve(limit);
     for y in y0..y1 {
         let rows = [
@@ -304,9 +324,7 @@ fn few_colors(
             opsin.plane_row(2, y),
         ];
         for x in x0..x1 {
-            let key = rows.iter().fold(0u64, |k, r| {
-                (k << 21) | (((r[x] * 1024.0) + 0.5) as i64 as u64 & 0x1f_ffff)
-            });
+            let key = key_at(&rows, x);
             if !seen.contains(&key) {
                 if seen.len() == limit {
                     return false;
@@ -344,35 +362,49 @@ fn rdoq_block(
 ) {
     let covered_blocks = cx * cy;
     let window_cap = rdoq_window_len(covered_blocks, large_window, distance);
-    let legacy_limit = window_cap <= 64;
-    rdoq_block_banded(
-        channel_weight,
-        window_cap,
-        legacy_limit,
-        prices,
-        scan,
-        source,
-        inv_qm,
-        q_scaled,
-        block,
-        raw_strategy,
-        strategy_code,
-        c,
-        predicted,
-        cx,
-        cy,
-        distance,
-        qf_hi,
-        qf_ratio,
-        visible,
-        restore_penalty,
-        choices,
-        costs,
-    );
+    // The 128 family always takes the banded trellis: the full DP grows with
+    // a block's nonzero count, thousands of states over 16384 coefficients.
+    let legacy_limit = window_cap <= 64 && !crate::dc_group_data::is_128_strategy(raw_strategy);
+    // Keep the original 8x8 loop. Factoring amortizes level selection over
+    // shared count contexts in multi-block transforms. Separate instantiations
+    // remove the unused loop and its scratch from each production path.
+    macro_rules! refine {
+        ($factored:literal) => {
+            rdoq_block_banded::<$factored>(
+                channel_weight,
+                window_cap,
+                legacy_limit,
+                prices,
+                scan,
+                source,
+                inv_qm,
+                q_scaled,
+                block,
+                raw_strategy,
+                strategy_code,
+                c,
+                predicted,
+                cx,
+                cy,
+                distance,
+                qf_hi,
+                qf_ratio,
+                visible,
+                restore_penalty,
+                choices,
+                costs,
+            )
+        };
+    }
+    if covered_blocks == 1 {
+        refine!(false);
+    } else {
+        refine!(true);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn rdoq_block_banded(
+fn rdoq_block_banded<const FACTORED: bool>(
     channel_weight: f32,
     window_cap: usize,
     legacy_limit: bool,
@@ -410,6 +442,9 @@ fn rdoq_block_banded(
             | STRATEGY_DCT64X64
             | STRATEGY_DCT64X32
             | STRATEGY_DCT32X64
+            | STRATEGY_DCT128X128
+            | STRATEGY_DCT128X64
+            | STRATEGY_DCT64X128
     ) {
         return;
     }
@@ -510,43 +545,146 @@ fn rdoq_block_banded(
         let current_min = min_remaining;
         let current_max = (max_remaining + 1).min(max_nzeros);
         current_cost[..(current_max - current_min + 1) * 2].fill(f32::INFINITY);
-        for next_remaining in min_remaining.max(next_min)..=max_remaining.min(next_max) {
-            for (candidate_index, &level) in candidates[..candidate_count].iter().enumerate() {
-                let nonzero = usize::from(level != 0);
-                let remaining = next_remaining + nonzero;
-                if remaining > max_nzeros {
-                    continue;
-                }
-                let tail = next[(next_remaining - next_min) * 2 + nonzero];
-                if !tail.is_finite() {
-                    continue;
-                }
-                let distortion = candidate_distortion[candidate_index];
-                let token_cost = if remaining == 0 {
-                    [0.0; 2]
-                } else {
-                    let bits = prices.token_bits_pair(context(remaining, k, 0), pack_signed(level));
-                    // Restoring a deadzone-zeroed coefficient pays the block's
-                    // penalty.
-                    let rate = if block[idx] == 0 && level != 0 {
-                        lambda * restore_penalty
+        if !FACTORED {
+            for next_remaining in min_remaining.max(next_min)..=max_remaining.min(next_max) {
+                for (candidate_index, &level) in candidates[..candidate_count].iter().enumerate() {
+                    let nonzero = usize::from(level != 0);
+                    let remaining = next_remaining + nonzero;
+                    if remaining > max_nzeros {
+                        continue;
+                    }
+                    let tail = next[(next_remaining - next_min) * 2 + nonzero];
+                    if !tail.is_finite() {
+                        continue;
+                    }
+                    let distortion = candidate_distortion[candidate_index];
+                    let token_cost = if remaining == 0 {
+                        [0.0; 2]
                     } else {
-                        lambda
+                        let bits =
+                            prices.token_bits_pair(context(remaining, k, 0), pack_signed(level));
+                        // Restoring a deadzone-zeroed coefficient pays the block's
+                        // penalty.
+                        let rate = if block[idx] == 0 && level != 0 {
+                            lambda * restore_penalty
+                        } else {
+                            lambda
+                        };
+                        [rate * bits[0], rate * bits[1]]
                     };
-                    [rate * bits[0], rate * bits[1]]
+                    let state = (remaining - current_min) * 2;
+                    update_rdoq_state_pair(
+                        distortion,
+                        token_cost,
+                        tail,
+                        candidate_index as u8,
+                        (&mut current_cost[state..state + 2]).try_into().unwrap(),
+                        (&mut choices
+                            [window_index * stride + state..window_index * stride + state + 2])
+                            .try_into()
+                            .unwrap(),
+                    );
+                }
+            }
+        } else {
+            // Nonzero levels share a tail state. Choose their local minimum
+            // once per count context, then compare zero/nonzero transitions
+            // for each exact count; counts in one bucket cannot be merged.
+            let source_min = min_remaining.max(next_min);
+            let source_max = max_remaining.min(next_max);
+            let zero_candidate = candidates[..candidate_count].iter().position(|&q| q == 0);
+            let mut cached_context = u32::MAX;
+            let mut local_cost = [[f32::INFINITY; 2]; 5];
+            let mut nz_cost = [f32::INFINITY; 2];
+            let mut nz_before = [f32::INFINITY; 2];
+            let mut nz_choice = [u8::MAX; 2];
+            for remaining in current_min..=current_max {
+                let zero_tail = if zero_candidate.is_some()
+                    && remaining >= source_min
+                    && remaining <= source_max
+                {
+                    next[(remaining - next_min) * 2]
+                } else {
+                    f32::INFINITY
                 };
+                let nz_tail = if remaining > source_min && remaining - 1 <= source_max {
+                    next[(remaining - 1 - next_min) * 2 + 1]
+                } else {
+                    f32::INFINITY
+                };
+                if !zero_tail.is_finite() && !nz_tail.is_finite() {
+                    continue;
+                }
+                let ctx = if remaining == 0 {
+                    u32::MAX - 1
+                } else {
+                    context(remaining, k, 0)
+                };
+                if ctx != cached_context {
+                    cached_context = ctx;
+                    nz_cost = [f32::INFINITY; 2];
+                    nz_before = [f32::INFINITY; 2];
+                    nz_choice = [u8::MAX; 2];
+                    for (candidate_index, &level) in
+                        candidates[..candidate_count].iter().enumerate()
+                    {
+                        let token_cost = if remaining == 0 {
+                            [0.0; 2]
+                        } else {
+                            let bits = prices.token_bits_pair(ctx, pack_signed(level));
+                            let rate = if block[idx] == 0 && level != 0 {
+                                lambda * restore_penalty
+                            } else {
+                                lambda
+                            };
+                            [rate * bits[0], rate * bits[1]]
+                        };
+                        for prev in 0..2 {
+                            let cost = candidate_distortion[candidate_index] + token_cost[prev];
+                            local_cost[candidate_index][prev] = cost;
+                            if level != 0 && cost < nz_cost[prev] {
+                                nz_before[prev] = nz_cost[prev];
+                                nz_cost[prev] = cost;
+                                nz_choice[prev] = candidate_index as u8;
+                            }
+                        }
+                    }
+                }
                 let state = (remaining - current_min) * 2;
-                update_rdoq_state_pair(
-                    distortion,
-                    token_cost,
-                    tail,
-                    candidate_index as u8,
-                    (&mut current_cost[state..state + 2]).try_into().unwrap(),
-                    (&mut choices
-                        [window_index * stride + state..window_index * stride + state + 2])
-                        .try_into()
-                        .unwrap(),
-                );
+                let row = window_index * stride + state;
+                for prev in 0..2 {
+                    // The original source-ascending loop sees nonzero edges before
+                    // the zero edge into this destination, regardless of level order.
+                    let mut cost = if nz_tail.is_finite() {
+                        nz_cost[prev] + nz_tail
+                    } else {
+                        f32::INFINITY
+                    };
+                    let mut choice = nz_choice[prev];
+                    // Adding a large common tail can round distinct local costs to
+                    // the same f32. Recover the earliest original candidate only
+                    // when the cheapest earlier candidate can tie the winner.
+                    if cost.is_finite() && nz_before[prev] + nz_tail == cost {
+                        for i in 0..choice as usize {
+                            if candidates[i] != 0 && local_cost[i][prev] + nz_tail == cost {
+                                choice = i as u8;
+                                break;
+                            }
+                        }
+                    }
+                    if zero_tail.is_finite() {
+                        let zero = zero_candidate.unwrap();
+                        let zero_cost = local_cost[zero][prev] + zero_tail;
+                        if zero_cost < cost {
+                            cost = zero_cost;
+                            choice = zero as u8;
+                        }
+                    }
+                    current_cost[state + prev] = cost;
+                    if cost.is_finite() {
+                        choices[row + prev] = choice;
+                    }
+                }
             }
         }
         std::mem::swap(&mut current_cost, &mut next);
@@ -1286,7 +1424,7 @@ pub(crate) type ReconCapture<'a> = (
 /// Per-block memo of one AC group for the closed-loop quant field: a block's
 /// quantized coefficients, DC levels and reconstruction are a function of its
 /// field value and of the nonzero-count contexts predicted from its
-/// neighbours, so a re-encode after a one-tile change recomputes only the
+/// neighbors, so a re-encode after a one-tile change recomputes only the
 /// blocks whose key changed and tokenizes the rest from the memo.
 pub(crate) struct AcBlockCache {
     xsize_blocks: usize,
@@ -1310,6 +1448,12 @@ pub(crate) struct AcBlockCache {
     /// `cell_gen > s`.
     pub(crate) epoch: u32,
     cell_gen: Vec<u32>,
+    /// Frozen-price bits of each first block's first stream, per channel.
+    bits: Vec<[f32; 3]>,
+    /// Trial evaluation: a cached channel adds its bits to `trial_bits`
+    /// instead of copying its tokens (the group's token streams are partial).
+    pub(crate) trial: bool,
+    pub(crate) trial_bits: f64,
 }
 
 impl AcBlockCache {
@@ -1332,6 +1476,116 @@ impl AcBlockCache {
             nz_shift: vec![[0; 3]; n],
             epoch: 0,
             cell_gen: vec![0; n],
+            bits: vec![[f32::NAN; 3]; n],
+            trial: false,
+            trial_bits: 0.0,
+        }
+    }
+
+    /// Forget the blocks of a group-local block region (its transform layout
+    /// changed, which the keys do not carry).
+    pub(crate) fn invalidate(&mut self, x: usize, y: usize, w: usize, h: usize) {
+        for row in y..y + h {
+            for key in &mut self.keys {
+                key[row * self.xsize_blocks + x..row * self.xsize_blocks + x + w].fill(u32::MAX);
+            }
+        }
+    }
+
+    /// Everything the memo holds for the cells of a group-local block region,
+    /// so a trial layout there can be undone without re-encoding. The token
+    /// arenas are append-only, so the saved spans stay valid.
+    pub(crate) fn snapshot(&self, x: usize, y: usize, w: usize, h: usize) -> MemoSnapshot {
+        let mut snap = MemoSnapshot {
+            rect: (x, y, w, h),
+            ..Default::default()
+        };
+        let streams = if self.keys[0].is_empty() {
+            0
+        } else {
+            self.spans.len() / (self.keys[0].len() * 3)
+        };
+        let (pw, ph) = (self.recon.xsize(), self.recon.ysize());
+        for row in y..y + h {
+            let cells = row * self.xsize_blocks + x..row * self.xsize_blocks + x + w;
+            for c in 0..3 {
+                snap.keys.extend_from_slice(&self.keys[c][cells.clone()]);
+                snap.quantized
+                    .extend_from_slice(&self.quantized[c][cells.start * 64..cells.end * 64]);
+                snap.dc
+                    .extend_from_slice(&self.dc.plane_row(c, row)[x..x + w]);
+                snap.dc_f.extend_from_slice(&self.dc_f[c][cells.clone()]);
+            }
+            if streams > 0 {
+                snap.spans.extend_from_slice(
+                    &self.spans[cells.start * 3 * streams..cells.end * 3 * streams],
+                );
+            }
+            snap.nz_shift
+                .extend_from_slice(&self.nz_shift[cells.clone()]);
+            snap.bits.extend_from_slice(&self.bits[cells.clone()]);
+            snap.cell_gen.extend_from_slice(&self.cell_gen[cells]);
+        }
+        for c in 0..3 {
+            for py in (y * 8).min(ph)..((y + h) * 8).min(ph) {
+                snap.recon.extend_from_slice(
+                    &self.recon.plane_row(c, py)[(x * 8).min(pw)..((x + w) * 8).min(pw)],
+                );
+            }
+        }
+        snap.streams = streams;
+        snap
+    }
+
+    /// Undo everything since `snapshot` for its region (the spans layout must
+    /// not have changed in between).
+    pub(crate) fn restore(&mut self, snap: &MemoSnapshot) {
+        let (x, y, w, h) = snap.rect;
+        let streams = if self.keys[0].is_empty() {
+            0
+        } else {
+            self.spans.len() / (self.keys[0].len() * 3)
+        };
+        let (pw, ph) = (self.recon.xsize(), self.recon.ysize());
+        let (mut k, mut q, mut sp, mut n) = (0, 0, 0, 0);
+        for row in y..y + h {
+            let cells = row * self.xsize_blocks + x..row * self.xsize_blocks + x + w;
+            for c in 0..3 {
+                self.keys[c][cells.clone()].copy_from_slice(&snap.keys[k..k + w]);
+                self.quantized[c][cells.start * 64..cells.end * 64]
+                    .copy_from_slice(&snap.quantized[q..q + w * 64]);
+                self.dc.plane_row_mut(c, row)[x..x + w].copy_from_slice(&snap.dc[k..k + w]);
+                self.dc_f[c][cells.clone()].copy_from_slice(&snap.dc_f[k..k + w]);
+                k += w;
+                q += w * 64;
+            }
+            if streams > 0 && streams == snap.streams {
+                let len = w * 3 * streams;
+                self.spans[cells.start * 3 * streams..cells.end * 3 * streams]
+                    .copy_from_slice(&snap.spans[sp..sp + len]);
+                sp += len;
+            } else if streams > 0 {
+                // The span table was (re)allocated after the snapshot.
+                for key in &mut self.keys {
+                    key[cells.clone()].fill(u32::MAX);
+                }
+            }
+            self.nz_shift[cells.clone()].copy_from_slice(&snap.nz_shift[n..n + w]);
+            self.bits[cells.clone()].copy_from_slice(&snap.bits[n..n + w]);
+            // Pixels went back to the snapshot: mark them recomputed so a
+            // later sync compares (and skips equal) cells.
+            self.cell_gen[cells].fill(self.epoch);
+            n += w;
+        }
+        let mut r = 0;
+        for c in 0..3 {
+            for py in (y * 8).min(ph)..((y + h) * 8).min(ph) {
+                let row =
+                    &mut self.recon.plane_row_mut(c, py)[(x * 8).min(pw)..((x + w) * 8).min(pw)];
+                let len = row.len();
+                row.copy_from_slice(&snap.recon[r..r + len]);
+                r += len;
+            }
         }
     }
 
@@ -1389,20 +1643,36 @@ impl AcBlockCache {
     }
 }
 
+/// See [`AcBlockCache::snapshot`].
+#[derive(Default)]
+pub(crate) struct MemoSnapshot {
+    rect: (usize, usize, usize, usize),
+    streams: usize,
+    keys: Vec<u32>,
+    quantized: Vec<i32>,
+    dc: Vec<i16>,
+    dc_f: Vec<f32>,
+    spans: Vec<(u32, u32)>,
+    nz_shift: Vec<[u8; 3]>,
+    bits: Vec<[f32; 3]>,
+    cell_gen: Vec<u32>,
+    recon: Vec<f32>,
+}
+
 pub(crate) struct AcGroupScratch {
-    coeffs: HeapMatrix<f32, 3, 4096>,
-    quantized: HeapMatrix<i32, 3, 4096>,
-    source_y: Box<[f32; 4096]>,
-    block: Box<[i32; 4096]>,
+    coeffs: HeapMatrix<f32, 3, 16384>,
+    quantized: HeapMatrix<i32, 3, 16384>,
+    source_y: Box<[f32; 16384]>,
+    block: Box<[i32; 16384]>,
     rdoq_choices: Box<[u8; RDOQ_MAX_CHOICES]>,
     rdoq_costs: HeapMatrix<f32, 2, RDOQ_MAX_STRIDE>,
     /// Edge-replicated pixels of a footprint that crosses the image edge.
-    gather: Box<[f32; 4096]>,
+    gather: Box<[f32; 16384]>,
     /// Distinct source colors, reused across RDOQ blocks and groups.
     few_color_keys: Vec<u64>,
     /// Y coefficient error and its pixel-domain image for the recon capture.
-    recon_err: Box<[f32; 4096]>,
-    recon_pix: Box<[f32; 4096]>,
+    recon_err: Box<[f32; 16384]>,
+    recon_pix: Box<[f32; 16384]>,
 }
 
 impl Default for AcGroupScratch {
@@ -1532,7 +1802,7 @@ pub(crate) fn write_ac_group(
 
             // ---- Block memo ----
             // Per channel: a block's channel is a function of the field value,
-            // the nonzero contexts predicted from its neighbours, Y's context
+            // the nonzero contexts predicted from its neighbors, Y's context
             // for the CfL residuals and the channel's qm scale.
             let lby = global_by - qorigin_y;
             let predicted_ctx: [u8; 3] = std::array::from_fn(|c| {
@@ -1700,6 +1970,18 @@ pub(crate) fn write_ac_group(
                             let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
                             (ctx.afv3)(DctInput::new(input, stride), dst);
                         }
+                        STRATEGY_DCT128X128 => {
+                            let dst = coeffs[c].first_chunk_mut::<16384>().unwrap();
+                            (ctx.dct128x128)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT128X64 => {
+                            let dst = coeffs[c].first_chunk_mut::<8192>().unwrap();
+                            (ctx.dct128x64)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT64X128 => {
+                            let dst = coeffs[c].first_chunk_mut::<8192>().unwrap();
+                            (ctx.dct64x128)(DctInput::new(input, stride), dst);
+                        }
                         _ => unreachable!("invalid raw strategy {}", raw_strategy),
                     }
                 }
@@ -1707,7 +1989,7 @@ pub(crate) fn write_ac_group(
                 // For DCT8, DC = coeffs[0]. For multi-block, use DCFromLowestFrequencies.
                 // dc_vals[c] holds up to 4 DC values (DCT16X16 = 2×2 covered blocks);
                 // indexing is didx = iy * cov_x + ix.
-                let mut dc_vals = [[0.0f32; 64]; 3];
+                let mut dc_vals = [[0.0f32; 256]; 3];
                 match raw_strategy {
                     STRATEGY_DCT
                     | STRATEGY_IDENTITY
@@ -1752,7 +2034,7 @@ pub(crate) fn write_ac_group(
                     STRATEGY_DCT64X64 => {
                         for c in 0..3 {
                             let cb: &[f32; 4096] = coeffs[c].first_chunk::<4096>().unwrap();
-                            (ctx.dc_from_dct64x64)(cb, &mut dc_vals[c]);
+                            (ctx.dc_from_dct64x64)(cb, dc_vals[c].first_chunk_mut::<64>().unwrap());
                         }
                     }
                     STRATEGY_DCT64X32 => {
@@ -1783,6 +2065,30 @@ pub(crate) fn write_ac_group(
                             (ctx.dc_from_dct16x32)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
                         }
                     }
+                    STRATEGY_DCT128X128 => {
+                        for c in 0..3 {
+                            (ctx.dc_from_dct128x128)(
+                                coeffs[c].first_chunk::<16384>().unwrap(),
+                                dc_vals[c].first_chunk_mut::<256>().unwrap(),
+                            );
+                        }
+                    }
+                    STRATEGY_DCT128X64 => {
+                        for c in 0..3 {
+                            (ctx.dc_from_dct128x64)(
+                                coeffs[c].first_chunk::<8192>().unwrap(),
+                                dc_vals[c].first_chunk_mut::<128>().unwrap(),
+                            );
+                        }
+                    }
+                    STRATEGY_DCT64X128 => {
+                        for c in 0..3 {
+                            (ctx.dc_from_dct64x128)(
+                                coeffs[c].first_chunk::<8192>().unwrap(),
+                                dc_vals[c].first_chunk_mut::<128>().unwrap(),
+                            );
+                        }
+                    }
                     _ => unreachable!(),
                 }
 
@@ -1800,7 +2106,7 @@ pub(crate) fn write_ac_group(
                 }
                 // DC for storage (per covered block, using pre-swap cov_x/cov_y).
                 let covered_dc = cov_x * cov_y;
-                let mut y_dc_q = [0i16; 64];
+                let mut y_dc_q = [0i16; 256];
                 if let Some(m) = memo.as_deref().filter(|_| hit[1]) {
                     for iy in 0..cov_y {
                         y_dc_q[iy * cov_x..(iy + 1) * cov_x]
@@ -1850,6 +2156,10 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
                 STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
                 STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
+                STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => (
+                    matrices.inv_matrix_128(raw_strategy, 1),
+                    matrices.matrix_128(raw_strategy, 1),
+                ),
                 STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => {
                     (&matrices.inv_matrix_64x32(1)[..], &matrices.matrix_64x32(1)[..])
                 }
@@ -2013,8 +2323,8 @@ pub(crate) fn write_ac_group(
                     );
                 }
                 // ---- Extract post-CfL X and B DC ----
-                let mut x_dc_post = [0.0f32; 64];
-                let mut b_dc_post = [0.0f32; 64];
+                let mut x_dc_post = [0.0f32; 256];
+                let mut b_dc_post = [0.0f32; 256];
                 match raw_strategy {
                     STRATEGY_DCT
                     | STRATEGY_IDENTITY
@@ -2053,8 +2363,8 @@ pub(crate) fn write_ac_group(
                     STRATEGY_DCT64X64 => {
                         let xb: &[f32; 4096] = coeffs[0].first_chunk::<4096>().unwrap();
                         let bb: &[f32; 4096] = coeffs[2].first_chunk::<4096>().unwrap();
-                        (ctx.dc_from_dct64x64)(xb, &mut x_dc_post);
-                        (ctx.dc_from_dct64x64)(bb, &mut b_dc_post);
+                        (ctx.dc_from_dct64x64)(xb, x_dc_post.first_chunk_mut::<64>().unwrap());
+                        (ctx.dc_from_dct64x64)(bb, b_dc_post.first_chunk_mut::<64>().unwrap());
                     }
                     STRATEGY_DCT64X32 => {
                         let xb: &[f32; 2048] = coeffs[0].first_chunk::<2048>().unwrap();
@@ -2080,6 +2390,36 @@ pub(crate) fn write_ac_group(
                         (ctx.dc_from_dct16x32)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
                         (ctx.dc_from_dct16x32)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
                     }
+                    STRATEGY_DCT128X128 => {
+                        (ctx.dc_from_dct128x128)(
+                            coeffs[0].first_chunk::<16384>().unwrap(),
+                            x_dc_post.first_chunk_mut::<256>().unwrap(),
+                        );
+                        (ctx.dc_from_dct128x128)(
+                            coeffs[2].first_chunk::<16384>().unwrap(),
+                            b_dc_post.first_chunk_mut::<256>().unwrap(),
+                        );
+                    }
+                    STRATEGY_DCT128X64 => {
+                        (ctx.dc_from_dct128x64)(
+                            coeffs[0].first_chunk::<8192>().unwrap(),
+                            x_dc_post.first_chunk_mut::<128>().unwrap(),
+                        );
+                        (ctx.dc_from_dct128x64)(
+                            coeffs[2].first_chunk::<8192>().unwrap(),
+                            b_dc_post.first_chunk_mut::<128>().unwrap(),
+                        );
+                    }
+                    STRATEGY_DCT64X128 => {
+                        (ctx.dc_from_dct64x128)(
+                            coeffs[0].first_chunk::<8192>().unwrap(),
+                            x_dc_post.first_chunk_mut::<128>().unwrap(),
+                        );
+                        (ctx.dc_from_dct64x128)(
+                            coeffs[2].first_chunk::<8192>().unwrap(),
+                            b_dc_post.first_chunk_mut::<128>().unwrap(),
+                        );
+                    }
                     _ => unreachable!(),
                 }
 
@@ -2104,11 +2444,14 @@ pub(crate) fn write_ac_group(
                     STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(0)[..],
                     STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(0)[..],
                     STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(0)[..],
+                    STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => {
+                        matrices.inv_matrix_128(raw_strategy, 0)
+                    }
                     STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(0)[..],
                     STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(0)[..],
                     _ => &matrices.inv_matrix_16x8(0)[..],
                 };
-                let mut chroma_dc_q = [0i16; 64];
+                let mut chroma_dc_q = [0i16; 256];
                 if !hit[0] {
                     if cfl_factor_x != 0.0 {
                         (ctx.quantize_dc_cfl)(
@@ -2221,6 +2564,9 @@ pub(crate) fn write_ac_group(
                     STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(2)[..],
                     STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(2)[..],
                     STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(2)[..],
+                    STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => {
+                        matrices.inv_matrix_128(raw_strategy, 2)
+                    }
                     STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(2)[..],
                     STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(2)[..],
                     _ => &matrices.inv_matrix_16x8(2)[..],
@@ -2419,6 +2765,8 @@ pub(crate) fn write_ac_group(
                 16 => 4,
                 32 => 5,
                 64 => 6,
+                128 => 7,
+                256 => 8,
                 _ => unreachable!("invalid covered_blocks {}", covered_blocks),
             };
             for &c in &[1usize, 0, 2] {
@@ -2427,6 +2775,14 @@ pub(crate) fn write_ac_group(
                     && hit[c]
                     && let Some(m) = memo.as_deref_mut()
                 {
+                    if m.trial && m.bits[bi][c].is_finite() {
+                        m.trial_bits += f64::from(m.bits[bi][c]);
+                        for iy in 0..cov_y {
+                            num_nzeros[0].plane_row_mut(c, nz_by + iy)[bx..bx + cov_x]
+                                .fill(m.nz_shift[bi][c]);
+                        }
+                        continue;
+                    }
                     for s in 0..streams {
                         let (start, len) = m.spans[(bi * 3 + c) * streams + s];
                         let (start, len) = (start as usize, len as usize);
@@ -2615,6 +2971,11 @@ pub(crate) fn write_ac_group(
                             &alternative_out[s - out.len()]
                         };
                         let new_tokens = &src[stream_starts[s]..];
+                        if s == 0 {
+                            m.bits[bi][c] = rdoq_prices.map_or(f32::NAN, |p| {
+                                new_tokens.iter().map(|&k| p.token_bits(k)).sum()
+                            });
+                        }
                         let arena = &mut m.tokens[s];
                         m.spans[(bi * 3 + c) * streams + s] =
                             (arena.len() as u32, new_tokens.len() as u32);
@@ -2635,10 +2996,10 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn few_colors_counts_distinct_source_colours() {
+    fn few_colors_counts_distinct_source_colors() {
         use crate::image::Image3F;
         let mut xyb = Image3F::new(16, 8);
-        // Left 8x8: two flat halves (2 colours). Right 8x8: a ramp.
+        // Left 8x8: two flat halves (2 colors). Right 8x8: a ramp.
         for c in 0..3 {
             for y in 0..8 {
                 let row = xyb.plane_row_mut(c, y);
@@ -2915,7 +3276,7 @@ mod tests {
             let mut fresh_choices = super::heap_array(u8::MAX);
             let mut fresh_costs = Box::new([[f32::INFINITY; super::RDOQ_MAX_STRIDE]; 2]);
             let run = |block: &mut [i32], choices: &mut _, costs: &mut _, cap: usize| {
-                super::rdoq_block_banded(
+                super::rdoq_block_banded::<true>(
                     super::rdoq_channel_weights(coding)[c],
                     cap,
                     false,
@@ -3079,7 +3440,7 @@ mod tests {
                     &mut reference_choices,
                     &mut reference_costs,
                 );
-                super::rdoq_block_banded(
+                super::rdoq_block_banded::<true>(
                     1.,
                     cap,
                     legacy_limit,
@@ -3112,6 +3473,202 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn factored_rdoq_preserves_cost_bits_choices_and_restore_penalties() {
+        use crate::dc_group_data::STRATEGY_CODE_LUT;
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+
+        let tokens: Vec<_> = (0..16_384)
+            .map(|i| {
+                let context = i % 4;
+                let value = if i % 7 < context + 1 {
+                    0
+                } else {
+                    (i / 4) % 601
+                };
+                Token::new(context, value)
+            })
+            .collect();
+        let mut code = build_entropy_code_no_cluster(&tokens, 4, &mut Vec::new());
+        code.context_map = (0..crate::ac_context::K_NUM_FINE_AC_CONTEXTS)
+            .map(|i| ((i / 2 + i % 2) % 4) as u8)
+            .collect();
+        let prices = FrozenTokenPrices::new(&code);
+        let orders = crate::coeff_order::CoeffOrders::natural();
+        let mut choices0 = super::heap_array(0xA5u8);
+        let mut choices1 = super::heap_array(0xA5u8);
+        let mut costs0 = Box::new([[f32::NAN; super::RDOQ_MAX_STRIDE]; 2]);
+        let mut costs1 = costs0.clone();
+        let mut seed = 173u32;
+        let mut random = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed
+        };
+        let shapes = [
+            (super::STRATEGY_DCT, 1, 1),
+            (super::STRATEGY_DCT16X8, 2, 1),
+            (super::STRATEGY_DCT16X16, 2, 2),
+            (super::STRATEGY_DCT32X16, 4, 2),
+            (super::STRATEGY_DCT32X32, 4, 4),
+            (super::STRATEGY_DCT64X32, 8, 4),
+            (super::STRATEGY_DCT64X64, 8, 8),
+            (super::STRATEGY_DCT128X64, 16, 8),
+            (super::STRATEGY_DCT128X128, 16, 16),
+        ];
+        let mut changed = 0;
+        for case in 0..144 {
+            let (raw, cx, cy) = shapes[case % shapes.len()];
+            let strategy = STRATEGY_CODE_LUT[raw as usize];
+            let c = case / shapes.len() % 3;
+            let size = cx * cy * 64;
+            let mut scan = orders.scan_for(strategy, c).to_vec();
+            if case % 2 == 0 {
+                for i in cx * cy..size {
+                    let j = cx * cy + random() as usize % (size - cx * cy);
+                    scan.swap(i, j);
+                }
+            }
+            let inv_qm: Vec<_> = (0..size).map(|i| 0.75 + (i % 9) as f32 / 16.).collect();
+            let source: Vec<f32> = (0..size)
+                .map(|_| {
+                    let r = random();
+                    if r % 10 < (case / shapes.len() % 10) as u32 {
+                        0.
+                    } else if case % 7 == 0 {
+                        (r % 4001) as f32 / 8. - 250.
+                    } else {
+                        (r % 1024) as f32 / 128. - 4.
+                    }
+                })
+                .collect();
+            let original: Vec<i32> = source.iter().map(|v| v.round() as i32).collect();
+            for cap in [64, 256, 1024] {
+                let mut expected = original.clone();
+                let mut actual = original.clone();
+                let run = |factored, block: &mut [i32], choices: &mut _, costs: &mut _| {
+                    let refine = if factored {
+                        super::rdoq_block_banded::<true>
+                    } else {
+                        super::rdoq_block_banded::<false>
+                    };
+                    refine(
+                        [0.3, 1., 0.6][c],
+                        cap,
+                        false,
+                        &prices,
+                        &scan,
+                        &source,
+                        &inv_qm,
+                        [0.75, 1.5][case % 2],
+                        block,
+                        raw,
+                        strategy,
+                        c,
+                        (case % 256) as u8,
+                        cx,
+                        cy,
+                        [0.3, 2., 4., 8.][case % 4],
+                        case % 2 == 0,
+                        [0.5, 1.2][case % 2],
+                        [1., 0.125][case % 2],
+                        [1., 2.][case / shapes.len() % 2],
+                        choices,
+                        costs,
+                    );
+                };
+                run(false, &mut expected, &mut choices0, &mut costs0);
+                run(true, &mut actual, &mut choices1, &mut costs1);
+                assert_eq!(actual, expected, "coefficients, case={case}, cap={cap}");
+                assert_eq!(
+                    choices0.as_slice(),
+                    choices1.as_slice(),
+                    "choices, case={case}, cap={cap}"
+                );
+                for (&a, &b) in costs0.iter().flatten().zip(costs1.iter().flatten()) {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "cost bits, case={case}, cap={cap}"
+                    );
+                }
+                changed += usize::from(actual != original);
+            }
+        }
+        assert!(changed > 100, "must exercise changed blocks: {changed}");
+    }
+
+    #[test]
+    fn factored_rdoq_preserves_tail_rounding_ties() {
+        use crate::dc_group_data::STRATEGY_CODE_LUT;
+        use crate::entropy::{
+            FrozenTokenPrices, Token, build_entropy_code_no_cluster, pack_signed,
+        };
+
+        let mut tokens = vec![Token::new(0, 0); 1000];
+        tokens.extend((0..100).flat_map(|_| [Token::new(0, 1), Token::new(0, 2)]));
+        let mut code = build_entropy_code_no_cluster(&tokens, 1, &mut Vec::new());
+        code.context_map = vec![0; crate::ac_context::K_NUM_FINE_AC_CONTEXTS];
+        let prices = FrozenTokenPrices::new(&code);
+        let orders = crate::coeff_order::CoeffOrders::natural();
+        let raw = super::STRATEGY_DCT16X8;
+        let strategy = STRATEGY_CODE_LUT[raw as usize];
+        let scan = orders.scan_for(strategy, 1);
+        let inv_qm = [1.; 128];
+        let mut collapsed = 0;
+        for i in 1..100 {
+            let ideal = i as f32 * 1e-8;
+            let mut source = [0.; 128];
+            source[scan[2] as usize] = ideal;
+            let mut expected = [0; 128];
+            for &idx in &scan[3..54] {
+                source[idx as usize] = 1.;
+                expected[idx as usize] = 1;
+            }
+            let mut actual = expected;
+            let mut choices0 = super::heap_array(0xA5);
+            let mut choices1 = super::heap_array(0xA5);
+            let mut costs0 = Box::new([[f32::NAN; super::RDOQ_MAX_STRIDE]; 2]);
+            let mut costs1 = costs0.clone();
+            let run = |factored, block: &mut [i32], choices: &mut _, costs: &mut _| {
+                let refine = if factored {
+                    super::rdoq_block_banded::<true>
+                } else {
+                    super::rdoq_block_banded::<false>
+                };
+                refine(
+                    1., 1, false, &prices, scan, &source, &inv_qm, 1., block, raw, strategy, 1, 17,
+                    2, 1, 1., false, 1., 1., 2., choices, costs,
+                );
+            };
+            run(false, &mut expected, &mut choices0, &mut costs0);
+            run(true, &mut actual, &mut choices1, &mut costs1);
+            assert_eq!(actual, expected);
+            assert_eq!(choices0.as_slice(), choices1.as_slice());
+            for (&a, &b) in costs0.iter().flatten().zip(costs1.iter().flatten()) {
+                assert_eq!(a.to_bits(), b.to_bits());
+            }
+            let rate = 2. * super::rdoq_lambda(1.);
+            let minus = (ideal - super::dequantized_level(-1)).powi(2)
+                + rate * prices.token_bits(Token::new(0, pack_signed(-1)));
+            let plus = (ideal - super::dequantized_level(1)).powi(2)
+                + rate * prices.token_bits(Token::new(0, pack_signed(1)));
+            let tail = costs0[0][1];
+            if plus < minus && plus + tail == minus + tail {
+                collapsed += 1;
+                // Local +1 is cheaper, but the original loop sees -1 first
+                // and keeps it when their totals round to the same f32.
+                assert_eq!(choices1[2], 1);
+                assert_eq!(choices1[3], 1);
+            }
+        }
+        assert!(
+            collapsed > 0,
+            "must exercise distinct local costs with equal totals"
+        );
     }
 
     fn check_dc_quantizers(methods: QuantizeDcMethods) {

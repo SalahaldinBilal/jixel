@@ -309,6 +309,9 @@ pub(crate) struct IdctMethods {
     pub(crate) idct64x64: DctFn<64, 64, 4096>,
     pub(crate) idct64x32: DctFn<64, 32, 2048>,
     pub(crate) idct32x64: DctFn<64, 32, 2048>,
+    pub(crate) idct128x128: DctFn<128, 128, 16384>,
+    pub(crate) idct128x64: DctFn<128, 64, 8192>,
+    pub(crate) idct64x128: DctFn<128, 64, 8192>,
 }
 
 impl IdctMethods {
@@ -326,6 +329,9 @@ impl IdctMethods {
             idct64x64: inv_dct64x64,
             idct64x32: inv_dct64x32,
             idct32x64: inv_dct32x64,
+            idct128x128: crate::dct128::inv_dct128x128,
+            idct128x64: crate::dct128::inv_dct128x64,
+            idct64x128: crate::dct128::inv_dct64x128,
         }
     }
 }
@@ -352,6 +358,9 @@ fn select_idct_methods() -> IdctMethods {
             idct64x64: |input, output| unsafe { crate::avx::inv_dct64x64_avx2(input, output) },
             idct64x32: |input, output| unsafe { crate::avx::inv_dct64x32_avx2(input, output) },
             idct32x64: |input, output| unsafe { crate::avx::inv_dct32x64_avx2(input, output) },
+            idct128x128: |input, output| unsafe { crate::avx::inv_dct128x128_avx2(input, output) },
+            idct128x64: |input, output| unsafe { crate::avx::inv_dct128x64_avx2(input, output) },
+            idct64x128: |input, output| unsafe { crate::avx::inv_dct64x128_avx2(input, output) },
         };
     }
 
@@ -374,6 +383,9 @@ fn select_idct_methods() -> IdctMethods {
             idct64x64: |input, output| unsafe { crate::neon::inv_dct64x64_neon(input, output) },
             idct64x32: |input, output| unsafe { crate::neon::inv_dct64x32_neon(input, output) },
             idct32x64: |input, output| unsafe { crate::neon::inv_dct32x64_neon(input, output) },
+            idct128x128: |input, output| unsafe { crate::neon::inv_dct128x128_neon(input, output) },
+            idct128x64: |input, output| unsafe { crate::neon::inv_dct128x64_neon(input, output) },
+            idct64x128: |input, output| unsafe { crate::neon::inv_dct64x128_neon(input, output) },
         };
     }
 
@@ -386,6 +398,9 @@ fn select_idct_methods() -> IdctMethods {
             inv_dct2x2_8x8: |input, output| unsafe {
                 crate::wasm::inv_dct2x2_8x8_wasm(input, output)
             },
+            idct128x128: crate::wasm::inv_dct128x128_wasm,
+            idct128x64: crate::wasm::inv_dct128x64_wasm,
+            idct64x128: crate::wasm::inv_dct64x128_wasm,
             ..IdctMethods::scalar()
         };
     }
@@ -1256,7 +1271,7 @@ fn inv_dct1d_4(buf: &mut [f32; 4]) {
 }
 
 #[inline(always)]
-fn inv_dct1d_8(buf: &mut [f32]) {
+pub(crate) fn inv_dct1d_8(buf: &mut [f32]) {
     const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
     let mut t = [0.0f32; 8];
     for i in 0..4 {
@@ -1278,7 +1293,7 @@ fn inv_dct1d_8(buf: &mut [f32]) {
 }
 
 #[inline(always)]
-fn inv_dct1d_16(buf: &mut [f32; 16]) {
+pub(crate) fn inv_dct1d_16(buf: &mut [f32; 16]) {
     const IS2: f32 = std::f32::consts::FRAC_1_SQRT_2;
     let mut t = [0.0f32; 16];
     for i in 0..8 {
@@ -1555,6 +1570,10 @@ pub(crate) type DcFromDct64x64Fn = fn(&[f32; 4096], &mut [f32; 64]);
 pub(crate) type DcFromDct64x32Fn = fn(&[f32; 2048], &mut [f32; 32]);
 pub(crate) type DcFromDct32x64Fn = fn(&[f32; 2048], &mut [f32; 32]);
 
+pub(crate) type DcFromDct128x128Fn = fn(&[f32; 16384], &mut [f32; 256]);
+pub(crate) type DcFromDct128x64Fn = fn(&[f32; 8192], &mut [f32; 128]);
+pub(crate) type DcFromDct64x128Fn = fn(&[f32; 8192], &mut [f32; 128]);
+
 #[derive(Clone, Copy)]
 pub(crate) struct DcFromDctMethods {
     pub(crate) dct32x32: DcFromDct32x32Fn,
@@ -1563,6 +1582,9 @@ pub(crate) struct DcFromDctMethods {
     pub(crate) dct64x64: DcFromDct64x64Fn,
     pub(crate) dct64x32: DcFromDct64x32Fn,
     pub(crate) dct32x64: DcFromDct32x64Fn,
+    pub(crate) dct128x128: DcFromDct128x128Fn,
+    pub(crate) dct128x64: DcFromDct128x64Fn,
+    pub(crate) dct64x128: DcFromDct64x128Fn,
 }
 
 static DC_FROM_DCT_METHODS: OnceLock<DcFromDctMethods> = OnceLock::new();
@@ -1577,6 +1599,9 @@ fn select_dc_from_dct_methods() -> DcFromDctMethods {
             dct64x64: |coeffs, dc| unsafe { crate::neon::dc_from_dct64x64_neon(coeffs, dc) },
             dct64x32: |coeffs, dc| unsafe { crate::neon::dc_from_dct64x32_neon(coeffs, dc) },
             dct32x64: |coeffs, dc| unsafe { crate::neon::dc_from_dct32x64_neon(coeffs, dc) },
+            dct128x128: |coeffs, dc| unsafe { crate::neon::dc_from_dct128x128_neon(coeffs, dc) },
+            dct128x64: |coeffs, dc| unsafe { crate::neon::dc_from_dct128x64_neon(coeffs, dc) },
+            dct64x128: |coeffs, dc| unsafe { crate::neon::dc_from_dct64x128_neon(coeffs, dc) },
         }
     }
 
@@ -1590,10 +1615,30 @@ fn select_dc_from_dct_methods() -> DcFromDctMethods {
                 dct64x64: |coeffs, dc| unsafe { crate::avx::dc_from_dct64x64_avx2(coeffs, dc) },
                 dct64x32: |coeffs, dc| unsafe { crate::avx::dc_from_dct64x32_avx2(coeffs, dc) },
                 dct32x64: |coeffs, dc| unsafe { crate::avx::dc_from_dct32x64_avx2(coeffs, dc) },
+                dct128x128: |coeffs, dc| unsafe { crate::avx::dc_from_dct128x128_avx2(coeffs, dc) },
+                dct128x64: |coeffs, dc| unsafe { crate::avx::dc_from_dct128x64_avx2(coeffs, dc) },
+                dct64x128: |coeffs, dc| unsafe { crate::avx::dc_from_dct64x128_avx2(coeffs, dc) },
             };
         }
     }
-    #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
+    #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
+    {
+        DcFromDctMethods {
+            dct32x32: dc_from_dct32x32,
+            dct32x16: dc_from_dct32x16,
+            dct16x32: dc_from_dct16x32,
+            dct64x64: dc_from_dct64x64,
+            dct64x32: dc_from_dct64x32,
+            dct32x64: dc_from_dct32x64,
+            dct128x128: crate::wasm::dc_from_dct128x128_wasm,
+            dct128x64: crate::wasm::dc_from_dct128x64_wasm,
+            dct64x128: crate::wasm::dc_from_dct64x128_wasm,
+        }
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
     DcFromDctMethods {
         dct32x32: dc_from_dct32x32,
         dct32x16: dc_from_dct32x16,
@@ -1601,6 +1646,9 @@ fn select_dc_from_dct_methods() -> DcFromDctMethods {
         dct64x64: dc_from_dct64x64,
         dct64x32: dc_from_dct64x32,
         dct32x64: dc_from_dct32x64,
+        dct128x128: crate::dct128::dc_from_dct128x128,
+        dct128x64: crate::dct128::dc_from_dct128x64,
+        dct64x128: crate::dct128::dc_from_dct64x128,
     }
 }
 
@@ -1982,7 +2030,7 @@ pub(crate) fn dct1d_64(buf: &mut [f32; 64]) {
     }
 }
 
-fn inv_dct1d_64(buf: &mut [f32; 64]) {
+pub(crate) fn inv_dct1d_64(buf: &mut [f32; 64]) {
     let mut tmp = [0.0f32; 64];
     for i in 0..32 {
         tmp[i] = buf[2 * i];

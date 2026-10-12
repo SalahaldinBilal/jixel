@@ -37,9 +37,6 @@
 mod ac_context;
 mod ac_strategy;
 mod adaptive_quant;
-mod ssimulacra2;
-#[doc(hidden)]
-pub use ssimulacra2::ssimulacra2_srgb8;
 mod afv;
 mod aq_blur;
 mod aq_loop;
@@ -57,6 +54,7 @@ mod dc_group_data;
 mod dc_ops;
 mod dc_tree;
 mod dct;
+mod dct128;
 mod effort;
 mod encode_image;
 mod encoding_context;
@@ -89,6 +87,7 @@ mod splines;
 mod squeeze;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
 mod sse;
+mod ssimulacra2;
 mod static_entropy_codes;
 mod thread_pool;
 mod util;

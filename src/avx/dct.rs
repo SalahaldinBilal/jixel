@@ -30,6 +30,7 @@ use crate::dct::{
     DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64,
     RESAMPLE_SCALE_16_TO_2, RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
 };
+use crate::dct128::{DCT128_SPLIT_COS, DCT128_SPLIT_SIN, INV_WC128, RESAMPLE_SCALE_128_TO_16};
 use std::arch::x86_64::*;
 use std::mem::MaybeUninit;
 
@@ -1059,9 +1060,20 @@ macro_rules! horizontal_idct_pass_avx2 {
 
 macro_rules! inv_dct_natural_avx2 {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        inv_dct_natural_avx2!(
+            $name,
+            $n,
+            $h,
+            $w,
+            $inv_v,
+            $inv_h,
+            MaybeUninit::<[f32; $n]>::uninit()
+        );
+    };
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path, $scratch:expr) => {
         #[target_feature(enable = "avx2,fma")]
         pub(crate) fn $name(coeff: DctInput<'_, $w, $h>, out: &mut [f32; $n]) {
-            let mut scratch_uninit = MaybeUninit::<[f32; $n]>::uninit();
+            let mut scratch_uninit = $scratch;
             let dst = scratch_uninit.as_mut_ptr() as *mut f32;
             let scale = _mm256_set1_ps($n as f32);
             for u8 in (0..$w).step_by(8) {
@@ -1081,9 +1093,20 @@ macro_rules! inv_dct_natural_avx2 {
 
 macro_rules! inv_dct_transposed_avx2 {
     ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path) => {
+        inv_dct_transposed_avx2!(
+            $name,
+            $n,
+            $h,
+            $w,
+            $inv_v,
+            $inv_h,
+            MaybeUninit::<[f32; $n]>::uninit()
+        );
+    };
+    ($name:ident, $n:literal, $h:literal, $w:literal, $inv_v:path, $inv_h:path, $scratch:expr) => {
         #[target_feature(enable = "avx2,fma")]
         pub(crate) fn $name(coeff: DctInput<'_, $h, $w>, out: &mut [f32; $n]) {
-            let mut scratch_uninit = MaybeUninit::<[f32; $n]>::uninit();
+            let mut scratch_uninit = $scratch;
             let dst = scratch_uninit.as_mut_ptr() as *mut f32;
             let scale = _mm256_set1_ps($n as f32);
             for u8 in (0..$w).step_by(8) {
@@ -1582,6 +1605,245 @@ pub(crate) fn dc_from_dct32x64_avx2(coeffs: &[f32; 2048], dc: &mut [f32; 32]) {
     transpose_8x8(&mut rows);
     for (y, row) in rows[..4].iter().enumerate() {
         unsafe { _mm256_storeu_ps(dc[y * 8..].as_mut_ptr(), *row) };
+    }
+}
+
+// Restore the natural frequency order of the 64-point split-radix kernel.
+#[target_feature(enable = "avx2,fma")]
+fn dct1d_64_natural(c: &mut [__m256; 64]) {
+    dct1d_64_flat(c);
+    let split = *c;
+    for i in 0..64 {
+        c[i] = split[crate::dct128::dct64_natural_index(i)];
+    }
+}
+
+/// Split-radix DCT-II over 8 independent 128-point columns.
+#[target_feature(enable = "avx2,fma")]
+fn dct1d_128(c: &mut [__m256; 128]) {
+    for i in 0..32 {
+        let bottom = c[i];
+        let top = c[127 - i];
+        let half_bottom = c[63 - i];
+        let half_top = c[64 + i];
+        let lower = _mm256_sub_ps(bottom, top);
+        let upper = _mm256_sub_ps(half_bottom, half_top);
+        c[i] = _mm256_add_ps(bottom, top);
+        c[63 - i] = _mm256_add_ps(half_bottom, half_top);
+        c[64 + i] = _mm256_fmadd_ps(
+            upper,
+            _mm256_set1_ps(DCT128_SPLIT_SIN[i]),
+            _mm256_mul_ps(lower, _mm256_set1_ps(DCT128_SPLIT_COS[i])),
+        );
+        let sin = _mm256_fnmadd_ps(
+            lower,
+            _mm256_set1_ps(DCT128_SPLIT_SIN[i]),
+            _mm256_mul_ps(upper, _mm256_set1_ps(DCT128_SPLIT_COS[i])),
+        );
+        c[127 - i] = if i & 1 == 0 {
+            sin
+        } else {
+            _mm256_sub_ps(_mm256_setzero_ps(), sin)
+        };
+    }
+    dct1d_64_natural((&mut c[..64]).try_into().unwrap());
+    dct1d_32_flat((&mut c[64..96]).try_into().unwrap());
+    dct1d_32_flat((&mut c[96..]).try_into().unwrap());
+    for i in 1..32 {
+        let cos = c[64 + i];
+        let sin = if i & 1 == 0 {
+            _mm256_sub_ps(_mm256_setzero_ps(), c[128 - i])
+        } else {
+            c[128 - i]
+        };
+        c[64 + i] = _mm256_add_ps(cos, sin);
+        c[128 - i] = _mm256_sub_ps(cos, sin);
+    }
+    c[64] = _mm256_mul_ps(c[64], _mm256_set1_ps(std::f32::consts::SQRT_2));
+    c[96] = _mm256_mul_ps(c[96], _mm256_set1_ps(-std::f32::consts::SQRT_2));
+    let split = *c;
+    for i in 0..64 {
+        c[2 * i] = split[i];
+        let odd = if i == 0 {
+            64
+        } else if i & 1 != 0 {
+            65 + i / 2
+        } else {
+            128 - i / 2
+        };
+        c[2 * i + 1] = split[odd];
+    }
+}
+
+// Transposed scratch makes both separable passes use contiguous SIMD loads.
+macro_rules! dct128_avx2 {
+    ($name:ident, $n:literal, $w:literal, $h:literal, $dct_v:path, $dct_h:path) => {
+        #[target_feature(enable = "avx2,fma")]
+        pub(crate) fn $name(input: DctInput<'_, $w, $h>, output: &mut [f32; $n]) {
+            let mut scratch = Box::<[f32; $n]>::new_uninit();
+            let dst = scratch.as_mut_ptr() as *mut f32;
+            for x in (0..$w).step_by(8) {
+                let mut c: [__m256; $h] =
+                    std::array::from_fn(|y| unsafe { _mm256_loadu_ps(input.row(y)[x..].as_ptr()) });
+                $dct_v(&mut c);
+                for v in (0..$h).step_by(8) {
+                    let mut tile: [__m256; 8] = c[v..v + 8].try_into().unwrap();
+                    transpose_8x8(&mut tile);
+                    for (j, value) in tile.iter().enumerate() {
+                        unsafe { _mm256_storeu_ps(dst.add((x + j) * $h + v), *value) };
+                    }
+                }
+            }
+            // Every scratch element was written by exactly one tile above.
+            let scratch = unsafe { scratch.assume_init() };
+            let scale = 1.0 / $n as f32;
+            for v in (0..$h).step_by(8) {
+                let mut c: [__m256; $w] = std::array::from_fn(|x| unsafe {
+                    _mm256_loadu_ps(scratch[x * $h + v..].as_ptr())
+                });
+                $dct_h(&mut c);
+                if $h >= $w {
+                    for u in 0..$w {
+                        unsafe {
+                            _mm256_storeu_ps(
+                                output.as_mut_ptr().add(u * $h + v),
+                                _mm256_mul_ps(c[u], _mm256_set1_ps(scale)),
+                            )
+                        };
+                    }
+                } else {
+                    for u in (0..$w).step_by(8) {
+                        let mut tile: [__m256; 8] = c[u..u + 8].try_into().unwrap();
+                        transpose_8x8(&mut tile);
+                        for (j, value) in tile.iter().enumerate() {
+                            unsafe {
+                                _mm256_storeu_ps(
+                                    output.as_mut_ptr().add((v + j) * $w + u),
+                                    _mm256_mul_ps(*value, _mm256_set1_ps(scale)),
+                                )
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    };
+}
+
+dct128_avx2!(dct128x128_avx2, 16384, 128, 128, dct1d_128, dct1d_128);
+dct128_avx2!(dct128x64_avx2, 8192, 64, 128, dct1d_128, dct1d_64_natural);
+dct128_avx2!(dct64x128_avx2, 8192, 128, 64, dct1d_64_natural, dct1d_128);
+
+#[target_feature(enable = "avx2,fma")]
+fn inv_dct1d_128(c: &mut [__m256; 128]) {
+    let mut even: [__m256; 64] = std::array::from_fn(|i| c[2 * i]);
+    let mut odd: [__m256; 64] = std::array::from_fn(|i| c[2 * i + 1]);
+    for i in (1..63).rev() {
+        odd[i] = _mm256_sub_ps(odd[i], odd[i + 1]);
+    }
+    odd[0] = _mm256_mul_ps(
+        _mm256_sub_ps(odd[0], odd[1]),
+        _mm256_set1_ps(std::f32::consts::FRAC_1_SQRT_2),
+    );
+    inv_dct1d_64_flat(&mut odd);
+    inv_dct1d_64_flat(&mut even);
+    for i in 0..64 {
+        let o = _mm256_mul_ps(odd[i], _mm256_set1_ps(INV_WC128[i]));
+        c[i] = _mm256_mul_ps(_mm256_add_ps(even[i], o), _mm256_set1_ps(0.5));
+        c[127 - i] = _mm256_mul_ps(_mm256_sub_ps(even[i], o), _mm256_set1_ps(0.5));
+    }
+}
+
+inv_dct_transposed_avx2!(
+    inv_dct128x128_avx2,
+    16384,
+    128,
+    128,
+    inv_dct1d_128,
+    inv_dct1d_128,
+    Box::<[f32; 16384]>::new_uninit()
+);
+inv_dct_transposed_avx2!(
+    inv_dct128x64_avx2,
+    8192,
+    128,
+    64,
+    inv_dct1d_128,
+    inv_dct1d_64_flat,
+    Box::<[f32; 8192]>::new_uninit()
+);
+inv_dct_natural_avx2!(
+    inv_dct64x128_avx2,
+    8192,
+    64,
+    128,
+    inv_dct1d_64_flat,
+    inv_dct1d_128,
+    Box::<[f32; 8192]>::new_uninit()
+);
+
+macro_rules! dc_from_dct128_avx2 {
+    ($name:ident, $n:literal, $rows:literal, $inv_v:path) => {
+        #[target_feature(enable = "avx2,fma")]
+        pub(crate) fn $name(coeffs: &[f32; $n], dc: &mut [f32; { $rows * 16 }]) {
+            let mut scratch = [[0.0f32; 16]; $rows];
+            for x in (0..16).step_by(8) {
+                let resample = unsafe { _mm256_loadu_ps(RESAMPLE_SCALE_128_TO_16[x..].as_ptr()) };
+                let mut c: [__m256; $rows] = std::array::from_fn(|y| {
+                    let row_scale = if $rows == 16 {
+                        RESAMPLE_SCALE_128_TO_16[y]
+                    } else {
+                        RESAMPLE_SCALE_64_TO_8[y]
+                    };
+                    _mm256_mul_ps(
+                        _mm256_mul_ps(
+                            unsafe { _mm256_loadu_ps(coeffs[y * 128 + x..].as_ptr()) },
+                            resample,
+                        ),
+                        _mm256_set1_ps(($rows * 16) as f32 * row_scale),
+                    )
+                });
+                $inv_v(&mut c);
+                for y in 0..$rows {
+                    unsafe { _mm256_storeu_ps(scratch[y].as_mut_ptr().add(x), c[y]) };
+                }
+            }
+            for y in (0..$rows).step_by(8) {
+                let mut c = [_mm256_set1_ps(0.0); 16];
+                for x in (0..16).step_by(8) {
+                    let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
+                        _mm256_loadu_ps(scratch[y + j][x..].as_ptr())
+                    });
+                    transpose_8x8(&mut tile);
+                    c[x..x + 8].copy_from_slice(&tile);
+                }
+                inv_dct1d_16_flat(&mut c);
+                // Square and tall footprints store the transposed DC grid.
+                for x in 0..16 {
+                    unsafe { _mm256_storeu_ps(dc.as_mut_ptr().add(x * $rows + y), c[x]) };
+                }
+            }
+        }
+    };
+}
+
+dc_from_dct128_avx2!(dc_from_dct128x128_avx2, 16384, 16, inv_dct1d_16_flat);
+dc_from_dct128_avx2!(dc_from_dct128x64_avx2, 8192, 8, inv_dct1d_8_flat);
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dc_from_dct64x128_avx2(coeffs: &[f32; 8192], dc: &mut [f32; 128]) {
+    let mut transposed = [0.0f32; 128];
+    dc_from_dct128x64_avx2(coeffs, &mut transposed);
+    for y in (0..8).step_by(8) {
+        for x in (0..16).step_by(8) {
+            let mut tile: [__m256; 8] = std::array::from_fn(|j| unsafe {
+                _mm256_loadu_ps(transposed[(x + j) * 8 + y..].as_ptr())
+            });
+            transpose_8x8(&mut tile);
+            for (j, row) in tile.iter().enumerate() {
+                unsafe { _mm256_storeu_ps(dc.as_mut_ptr().add((y + j) * 16 + x), *row) };
+            }
+        }
     }
 }
 

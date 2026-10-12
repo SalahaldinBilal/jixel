@@ -112,8 +112,8 @@ impl CodingTransform {
     }
 
     /// Per-image multipliers of `table_scale`. The tables are fitted on
-    /// images whose colour G (or luma) predicts, but where red or blue
-    /// dominates, that colour carries the visible structure: in RGB on its own
+    /// images whose color G (or luma) predicts, but where red or blue
+    /// dominates, that color carries the visible structure: in RGB on its own
     /// coarser plane, in YCbCr on a luma that sees a fraction of it. Such
     /// images take finer tables there.
     pub(crate) fn plane_scale(self, coded: &crate::image::Image3F) -> [f32; 3] {
@@ -279,7 +279,7 @@ pub(crate) fn fit_cfl_frame(
 }
 
 /// Shares of the image's gradient energy (all of R, G, B; horizontal and
-/// vertical neighbour differences) carried by R and by B where that channel
+/// vertical neighbor differences) carried by R and by B where that channel
 /// dominates the pixel: above 0.15 and over 1.6x both others. `decode` maps
 /// coded triples to R, G, B.
 fn dominant_gradient_shares(
@@ -364,7 +364,6 @@ pub(crate) fn srgb_eotf(v: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EncodeConfig;
 
     /// The decoder's inverse of `ycbcr_triple` (libjxl `stage_ycbcr`).
     fn decode_ycbcr([cb, y, cr]: [f32; 3]) -> [f32; 3] {
@@ -377,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn dominant_colour_refines_its_plane() {
+    fn dominant_color_refines_its_plane() {
         // A textured channel over two flat ones, coded with `coding`.
         let textured = |coding: CodingTransform, dominant: usize| {
             let mut img = crate::image::Image3F::new(32, 32);

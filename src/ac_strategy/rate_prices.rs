@@ -131,6 +131,8 @@ pub(crate) struct RatePrices {
 }
 
 thread_local! {
+    // The emulated-TLS macro expansion is flagged despite this const initializer.
+    #[cfg_attr(target_os = "android", allow(clippy::missing_const_for_thread_local))]
     static LEVELS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
 }
 

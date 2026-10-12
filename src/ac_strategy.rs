@@ -56,7 +56,7 @@ pub(crate) use rate_prices::RatePrices;
 use rate_prices::RatePricesScope;
 
 pub(crate) use selection::{
-    Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild, fill_ac_strategy,
+    Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild, aggregate_quant, fill_ac_strategy,
 };
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;

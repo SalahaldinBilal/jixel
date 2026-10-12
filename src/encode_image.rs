@@ -257,17 +257,10 @@ pub enum Speed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum Arbiter {
-    /// SSIMULACRA2. [`Speed::ExtraSlow`] also computes it inside the encoder
-    /// to accept or reject quantizer, transform-layout and chroma-precision
-    /// candidates.
+    /// SSIMULACRA2.
     #[default]
     Ssimulacra2,
-    /// ColorVideoVDP: coarser DC quantization from distance 1 up (half as much
-    /// for chroma), the mid-distance quant tables from distance 1.75 instead
-    /// of 2.25, a lighter AC trellis rate penalty and merged transforms kept
-    /// through the reconstruction rerank. [`Speed::ExtraSlow`] computes
-    /// ColorVideoVDP for a 500 nit laptop display inside the encoder to accept
-    /// or reject quantizer, transform-layout and chroma-precision candidates.
+    /// ColorVideoVDP
     Cvvdp,
 }
 

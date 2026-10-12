@@ -1,0 +1,587 @@
+{
+  "platform": "macOS-26.6.2-arm64-arm-64bit",
+  "architecture": "arm64",
+  "threads": 1,
+  "input_image": "01.png",
+  "iterations": 7,
+  "trials": 3,
+  "optimized_binary_sha256": "eb24b8457fe3cf6e13020881a3c98eed5218a8a7bb7edb671909e10e0e95281c",
+  "cases": [
+    {
+      "width": 64,
+      "height": 64,
+      "median_candidate_ms": {
+        "optimized": 0.11512499999999999,
+        "scalar": 0.2413392857142857,
+        "baseline": 0.3919345714285714
+      },
+      "trials": {
+        "optimized": [
+          {
+            "jod": 9.972324043011989,
+            "distortion": 0.6081339872292034,
+            "prepare_ms": 0.16629200000000002,
+            "first_ms": 0.12370799999999998,
+            "candidate_ms": 0.11512499999999999,
+            "bands": 6,
+            "backend": "Neon",
+            "reserve_ms": 0.008792,
+            "workspace_bytes": 177152,
+            "reference_bytes": 132012
+          },
+          {
+            "jod": 9.972324043011989,
+            "distortion": 0.6081339872292034,
+            "prepare_ms": 0.164041,
+            "first_ms": 0.11758300000000001,
+            "candidate_ms": 0.11373814285714286,
+            "bands": 6,
+            "backend": "Neon",
+            "reserve_ms": 0.008124999999999999,
+            "workspace_bytes": 177152,
+            "reference_bytes": 132012
+          },
+          {
+            "jod": 9.972324043011989,
+            "distortion": 0.6081339872292034,
+            "prepare_ms": 0.162042,
+            "first_ms": 0.121375,
+            "candidate_ms": 0.11553571428571428,
+            "bands": 6,
+            "backend": "Neon",
+            "reserve_ms": 0.0085,
+            "workspace_bytes": 177152,
+            "reference_bytes": 132012
+          }
+        ],
+        "scalar": [
+          {
+            "jod": 9.97232404255847,
+            "distortion": 0.6081339979423044,
+            "prepare_ms": 0.16120800000000002,
+            "first_ms": 0.259959,
+            "candidate_ms": 0.2425952857142857,
+            "bands": 6,
+            "backend": "Scalar",
+            "reserve_ms": 0.006917,
+            "workspace_bytes": 177152,
+            "reference_bytes": 132012
+          },
+          {
+            "jod": 9.97232404255847,
+            "distortion": 0.6081339979423044,
+            "prepare_ms": 0.168875,
+            "first_ms": 0.261125,
+            "candidate_ms": 0.2413392857142857,
+            "bands": 6,
+            "backend": "Scalar",
+            "reserve_ms": 0.008957999999999999,
+            "workspace_bytes": 177152,
+            "reference_bytes": 132012
+          },
+          {
+            "jod": 9.97232404255847,
+            "distortion": 0.6081339979423044,
+            "prepare_ms": 0.159541,
+            "first_ms": 0.252708,
+            "candidate_ms": 0.23572028571428572,
+            "bands": 6,
+            "backend": "Scalar",
+            "reserve_ms": 0.007833,
+            "workspace_bytes": 177152,
+            "reference_bytes": 132012
+          }
+        ],
+        "baseline": [
+          {
+            "jod": 9.972324042711637,
+            "distortion": 0.6081339943241445,
+            "prepare_ms": 0.230583,
+            "first_ms": 0.419083,
+            "candidate_ms": 0.4202262857142857,
+            "bands": 6
+          },
+          {
+            "jod": 9.972324042711637,
+            "distortion": 0.6081339943241445,
+            "prepare_ms": 0.16158399999999998,
+            "first_ms": 0.405709,
+            "candidate_ms": 0.3919345714285714,
+            "bands": 6
+          },
+          {
+            "jod": 9.972324042711637,
+            "distortion": 0.6081339943241445,
+            "prepare_ms": 0.161,
+            "first_ms": 0.412834,
+            "candidate_ms": 0.38878571428571423,
+            "bands": 6
+          }
+        ]
+      },
+      "speedup": 3.404426244765007,
+      "max_baseline_jod_error": 3.0035174347631255e-10
+    },
+    {
+      "width": 767,
+      "height": 511,
+      "median_candidate_ms": {
+        "optimized": 10.427660714285716,
+        "scalar": 26.212428571428575,
+        "baseline": 40.05570242857142
+      },
+      "trials": {
+        "optimized": [
+          {
+            "jod": 9.9767050974066,
+            "distortion": 0.5052914504744007,
+            "prepare_ms": 14.271917,
+            "first_ms": 10.459167,
+            "candidate_ms": 10.48369642857143,
+            "bands": 8,
+            "backend": "Neon",
+            "reserve_ms": 0.36404200000000003,
+            "workspace_bytes": 16860964,
+            "reference_bytes": 12553092
+          },
+          {
+            "jod": 9.9767050974066,
+            "distortion": 0.5052914504744007,
+            "prepare_ms": 13.966667000000001,
+            "first_ms": 10.42875,
+            "candidate_ms": 10.427660714285716,
+            "bands": 8,
+            "backend": "Neon",
+            "reserve_ms": 0.37074999999999997,
+            "workspace_bytes": 16860964,
+            "reference_bytes": 12553092
+          },
+          {
+            "jod": 9.9767050974066,
+            "distortion": 0.5052914504744007,
+            "prepare_ms": 14.095999999999998,
+            "first_ms": 10.435082999999999,
+            "candidate_ms": 10.420136857142856,
+            "bands": 8,
+            "backend": "Neon",
+            "reserve_ms": 0.34049999999999997,
+            "workspace_bytes": 16860964,
+            "reference_bytes": 12553092
+          }
+        ],
+        "scalar": [
+          {
+            "jod": 9.97670509740713,
+            "distortion": 0.5052914504620308,
+            "prepare_ms": 14.115792,
+            "first_ms": 26.695834,
+            "candidate_ms": 26.37631557142857,
+            "bands": 8,
+            "backend": "Scalar",
+            "reserve_ms": 0.351875,
+            "workspace_bytes": 16860964,
+            "reference_bytes": 12553092
+          },
+          {
+            "jod": 9.97670509740713,
+            "distortion": 0.5052914504620308,
+            "prepare_ms": 14.006917000000001,
+            "first_ms": 26.708458,
+            "candidate_ms": 26.101755999999998,
+            "bands": 8,
+            "backend": "Scalar",
+            "reserve_ms": 0.3325,
+            "workspace_bytes": 16860964,
+            "reference_bytes": 12553092
+          },
+          {
+            "jod": 9.97670509740713,
+            "distortion": 0.5052914504620308,
+            "prepare_ms": 13.993834,
+            "first_ms": 26.853915999999998,
+            "candidate_ms": 26.212428571428575,
+            "bands": 8,
+            "backend": "Scalar",
+            "reserve_ms": 0.362125,
+            "workspace_bytes": 16860964,
+            "reference_bytes": 12553092
+          }
+        ],
+        "baseline": [
+          {
+            "jod": 9.97670509740702,
+            "distortion": 0.5052914504645811,
+            "prepare_ms": 13.537749999999999,
+            "first_ms": 40.806542,
+            "candidate_ms": 39.569154714285716,
+            "bands": 8
+          },
+          {
+            "jod": 9.97670509740702,
+            "distortion": 0.5052914504645811,
+            "prepare_ms": 13.596167,
+            "first_ms": 40.779042000000004,
+            "candidate_ms": 40.27540485714285,
+            "bands": 8
+          },
+          {
+            "jod": 9.97670509740702,
+            "distortion": 0.5052914504645811,
+            "prepare_ms": 13.684125,
+            "first_ms": 41.122834,
+            "candidate_ms": 40.05570242857142,
+            "bands": 8
+          }
+        ]
+      },
+      "speedup": 3.8412932225245684,
+      "max_baseline_jod_error": 4.2099657093785936e-13
+    },
+    {
+      "width": 768,
+      "height": 512,
+      "median_candidate_ms": {
+        "optimized": 10.39731542857143,
+        "scalar": 26.37654171428571,
+        "baseline": 39.930119
+      },
+      "trials": {
+        "optimized": [
+          {
+            "jod": 9.97688563640227,
+            "distortion": 0.501082758439948,
+            "prepare_ms": 14.0385,
+            "first_ms": 10.615542,
+            "candidate_ms": 10.388886999999999,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 0.35562499999999997,
+            "workspace_bytes": 16912128,
+            "reference_bytes": 12584316
+          },
+          {
+            "jod": 9.97688563640227,
+            "distortion": 0.501082758439948,
+            "prepare_ms": 14.206541,
+            "first_ms": 10.861167,
+            "candidate_ms": 10.39731542857143,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 0.52125,
+            "workspace_bytes": 16912128,
+            "reference_bytes": 12584316
+          },
+          {
+            "jod": 9.97688563640227,
+            "distortion": 0.501082758439948,
+            "prepare_ms": 14.183582999999999,
+            "first_ms": 10.548833,
+            "candidate_ms": 10.404601142857143,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 0.379083,
+            "workspace_bytes": 16912128,
+            "reference_bytes": 12584316
+          }
+        ],
+        "scalar": [
+          {
+            "jod": 9.976885636401512,
+            "distortion": 0.5010827584576263,
+            "prepare_ms": 14.070667,
+            "first_ms": 26.734167,
+            "candidate_ms": 26.19047614285714,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 0.36616699999999996,
+            "workspace_bytes": 16912128,
+            "reference_bytes": 12584316
+          },
+          {
+            "jod": 9.976885636401512,
+            "distortion": 0.5010827584576263,
+            "prepare_ms": 14.273625,
+            "first_ms": 27.459708,
+            "candidate_ms": 26.401327428571427,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 0.389458,
+            "workspace_bytes": 16912128,
+            "reference_bytes": 12584316
+          },
+          {
+            "jod": 9.976885636401512,
+            "distortion": 0.5010827584576263,
+            "prepare_ms": 14.194167,
+            "first_ms": 26.691708000000002,
+            "candidate_ms": 26.37654171428571,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 0.383542,
+            "workspace_bytes": 16912128,
+            "reference_bytes": 12584316
+          }
+        ],
+        "baseline": [
+          {
+            "jod": 9.976885636400883,
+            "distortion": 0.5010827584723027,
+            "prepare_ms": 13.644207999999999,
+            "first_ms": 41.212792,
+            "candidate_ms": 39.737928571428576,
+            "bands": 9
+          },
+          {
+            "jod": 9.976885636400883,
+            "distortion": 0.5010827584723027,
+            "prepare_ms": 13.62475,
+            "first_ms": 40.713375000000006,
+            "candidate_ms": 40.38295828571428,
+            "bands": 9
+          },
+          {
+            "jod": 9.976885636400883,
+            "distortion": 0.5010827584723027,
+            "prepare_ms": 13.534041,
+            "first_ms": 40.741459,
+            "candidate_ms": 39.930119,
+            "bands": 9
+          }
+        ]
+      },
+      "speedup": 3.840425855531279,
+      "max_baseline_jod_error": 1.3873346915715956e-12
+    },
+    {
+      "width": 1920,
+      "height": 1080,
+      "median_candidate_ms": {
+        "optimized": 60.79183328571429,
+        "scalar": 151.68719042857143,
+        "baseline": 231.24902385714284
+      },
+      "trials": {
+        "optimized": [
+          {
+            "jod": 9.976388324050397,
+            "distortion": 0.5126819186136411,
+            "prepare_ms": 75.05375000000001,
+            "first_ms": 57.445917,
+            "candidate_ms": 56.45549414285714,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 1.843542,
+            "workspace_bytes": 89173248,
+            "reference_bytes": 66358284
+          },
+          {
+            "jod": 9.976388324050397,
+            "distortion": 0.5126819186136411,
+            "prepare_ms": 78.2175,
+            "first_ms": 69.724042,
+            "candidate_ms": 60.79183328571429,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 2.0230420000000002,
+            "workspace_bytes": 89173248,
+            "reference_bytes": 66358284
+          },
+          {
+            "jod": 9.976388324050397,
+            "distortion": 0.5126819186136411,
+            "prepare_ms": 86.13620900000001,
+            "first_ms": 63.328458000000005,
+            "candidate_ms": 61.001821428571425,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 2.174417,
+            "workspace_bytes": 89173248,
+            "reference_bytes": 66358284
+          }
+        ],
+        "scalar": [
+          {
+            "jod": 9.976388324048143,
+            "distortion": 0.5126819186662428,
+            "prepare_ms": 75.521708,
+            "first_ms": 143.64625,
+            "candidate_ms": 143.31796428571428,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 1.710958,
+            "workspace_bytes": 89173248,
+            "reference_bytes": 66358284
+          },
+          {
+            "jod": 9.976388324048143,
+            "distortion": 0.5126819186662428,
+            "prepare_ms": 76.455084,
+            "first_ms": 167.807208,
+            "candidate_ms": 153.3423392857143,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 1.872292,
+            "workspace_bytes": 89173248,
+            "reference_bytes": 66358284
+          },
+          {
+            "jod": 9.976388324048143,
+            "distortion": 0.5126819186662428,
+            "prepare_ms": 81.83770899999999,
+            "first_ms": 167.227709,
+            "candidate_ms": 151.68719042857143,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 2.3064999999999998,
+            "workspace_bytes": 89173248,
+            "reference_bytes": 66358284
+          }
+        ],
+        "baseline": [
+          {
+            "jod": 9.976388324047884,
+            "distortion": 0.5126819186722988,
+            "prepare_ms": 73.597667,
+            "first_ms": 215.985958,
+            "candidate_ms": 231.24902385714284,
+            "bands": 9
+          },
+          {
+            "jod": 9.976388324047884,
+            "distortion": 0.5126819186722988,
+            "prepare_ms": 78.39500000000001,
+            "first_ms": 219.692792,
+            "candidate_ms": 215.23591657142856,
+            "bands": 9
+          },
+          {
+            "jod": 9.976388324047884,
+            "distortion": 0.5126819186722988,
+            "prepare_ms": 83.24266700000001,
+            "first_ms": 242.49837499999998,
+            "candidate_ms": 232.41126185714288,
+            "bands": 9
+          }
+        ]
+      },
+      "speedup": 3.8039488424423773,
+      "max_baseline_jod_error": 2.5135449277513544e-12
+    },
+    {
+      "width": 3840,
+      "height": 2160,
+      "median_candidate_ms": {
+        "optimized": 329.004875,
+        "scalar": 639.0755120000001,
+        "baseline": 1056.8575357142856
+      },
+      "trials": {
+        "optimized": [
+          {
+            "jod": 9.97634150406543,
+            "distortion": 0.5137748840137304,
+            "prepare_ms": 372.785375,
+            "first_ms": 254.592959,
+            "candidate_ms": 254.64263085714288,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 10.804333,
+            "workspace_bytes": 356675328,
+            "reference_bytes": 265421784
+          },
+          {
+            "jod": 9.97634150406543,
+            "distortion": 0.5137748840137304,
+            "prepare_ms": 328.788667,
+            "first_ms": 253.61137499999998,
+            "candidate_ms": 480.102375,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 7.978416999999999,
+            "workspace_bytes": 356675328,
+            "reference_bytes": 265421784
+          },
+          {
+            "jod": 9.97634150406543,
+            "distortion": 0.5137748840137304,
+            "prepare_ms": 435.66741599999995,
+            "first_ms": 441.779875,
+            "candidate_ms": 329.004875,
+            "bands": 9,
+            "backend": "Neon",
+            "reserve_ms": 9.3215,
+            "workspace_bytes": 356675328,
+            "reference_bytes": 265421784
+          }
+        ],
+        "scalar": [
+          {
+            "jod": 9.976341504065209,
+            "distortion": 0.5137748840189069,
+            "prepare_ms": 355.47825,
+            "first_ms": 666.968125,
+            "candidate_ms": 638.5627738571428,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 8.911000000000001,
+            "workspace_bytes": 356675328,
+            "reference_bytes": 265421784
+          },
+          {
+            "jod": 9.976341504065209,
+            "distortion": 0.5137748840189069,
+            "prepare_ms": 391.055834,
+            "first_ms": 702.6978750000001,
+            "candidate_ms": 664.760869142857,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 10.922958,
+            "workspace_bytes": 356675328,
+            "reference_bytes": 265421784
+          },
+          {
+            "jod": 9.976341504065209,
+            "distortion": 0.5137748840189069,
+            "prepare_ms": 368.402792,
+            "first_ms": 684.7232090000001,
+            "candidate_ms": 639.0755120000001,
+            "bands": 9,
+            "backend": "Scalar",
+            "reserve_ms": 8.705458,
+            "workspace_bytes": 356675328,
+            "reference_bytes": 265421784
+          }
+        ],
+        "baseline": [
+          {
+            "jod": 9.976341504065193,
+            "distortion": 0.5137748840192651,
+            "prepare_ms": 337.152542,
+            "first_ms": 1009.6218749999999,
+            "candidate_ms": 1086.2024345714285,
+            "bands": 9
+          },
+          {
+            "jod": 9.976341504065193,
+            "distortion": 0.5137748840192651,
+            "prepare_ms": 357.525708,
+            "first_ms": 997.689375,
+            "candidate_ms": 1056.8575357142856,
+            "bands": 9
+          },
+          {
+            "jod": 9.976341504065193,
+            "distortion": 0.5137748840192651,
+            "prepare_ms": 331.169333,
+            "first_ms": 913.872333,
+            "candidate_ms": 892.9969524285715,
+            "bands": 9
+          }
+        ]
+      },
+      "speedup": 3.21228533684884,
+      "max_baseline_jod_error": 2.3803181647963356e-13
+    }
+  ],
+  "baseline_binary_sha256": "97a8e4b22a81f83d4036f883e23f7799c898b3d57c8552cbba78825e2915db8a"
+}

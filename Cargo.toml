@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "stats", "tuner", "meanstats"]
+members = ["app", "stats", "tuner", "meanstats", "cvvdp-lite"]
 
 [package]
 name = "jixel"

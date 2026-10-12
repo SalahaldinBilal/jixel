@@ -1,0 +1,66 @@
+//! Still-image ColorVideoVDP, using the calibrated 0.5.7 base model.
+//!
+//! This crate supports SDR sRGB and normalized linear sRGB images. Prepare a
+//! reference once, then reuse an [`Evaluator`] for encoder candidate searches.
+//! The reference owns the expensive contrast and sensitivity analysis; the
+//! evaluator reserves its working allocations and streams the test pyramid.
+//! Keep a [`Workspace`] across reference lifetimes for long-lived arbiter workers.
+//! Default SIMD dispatch supports NEON, AVX2, and SSE2, with scalar fallback.
+//! [`Backend::Scalar`] selects libm powers; SIMD powers have a tested numerical
+//! tolerance. See the README for error measurements and worker memory usage.
+//! Scores are in JOD: 10 is identical, larger is better, and negative is valid.
+//! See the crate README for upstream edge corrections and validation limits.
+//!
+//! ```
+//! use cvvdp_lite::{CvvdpLite, Display, RgbImage};
+//! let pixels = vec![128u8; 32 * 32 * 3];
+//! let image = RgbImage::srgb8(&pixels, 32, 32, 32 * 3)?;
+//! let metric = CvvdpLite::new(Display::standard_4k())?;
+//! let reference = metric.prepare_reference(image)?;
+//! let mut evaluator = reference.evaluator();
+//! assert_eq!(evaluator.compare(image)?.jod, 10.0);
+//! # Ok::<(), cvvdp_lite::Error>(())
+//! ```
+
+mod image;
+#[allow(unsafe_code)]
+mod kernels;
+mod model;
+mod pyramid;
+mod tables;
+
+pub use image::RgbImage;
+pub use kernels::Backend;
+pub use model::{BandScore, CvvdpLite, Display, Evaluator, PreparedReference, Score, Workspace};
+
+/// Invalid image layout, samples, viewing conditions, or backend selection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Error {
+    /// Width and height must be nonzero and fit addressable memory.
+    InvalidDimensions,
+    /// A stride is too short, or a buffer does not cover the last pixel.
+    InvalidLayout,
+    /// Reference and test dimensions differ.
+    DimensionMismatch,
+    /// A floating-point sample is NaN or infinite.
+    NonFiniteSample,
+    /// Display parameters are non-finite or outside their physical ranges.
+    InvalidDisplay,
+    /// The requested SIMD backend is unavailable on this CPU or build.
+    UnsupportedBackend,
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidDimensions => "image dimensions must be nonzero and fit in memory",
+            Self::InvalidLayout => "image stride or buffer length is invalid",
+            Self::DimensionMismatch => "reference and test dimensions differ",
+            Self::NonFiniteSample => "image contains a non-finite sample",
+            Self::InvalidDisplay => "display parameters are invalid",
+            Self::UnsupportedBackend => "requested SIMD backend is unavailable",
+        })
+    }
+}
+
+impl std::error::Error for Error {}

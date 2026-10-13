@@ -28,7 +28,7 @@
  */
 
 mod dc_smoothing;
-mod loop_judge;
+mod loop_arbiter;
 use dc_smoothing::{
     choose_chroma_dc_coding, compensate_b_dc, flatten_chroma_dc, skip_dc_smoothing,
 };
@@ -52,7 +52,7 @@ use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
 use crate::util::EncodeError;
-use loop_judge::LoopJudge;
+use loop_arbiter::LoopArbiter;
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM: usize = 64;
@@ -4552,6 +4552,9 @@ fn run_quant_field_loop(
     /// Marginals and slope come from plain quantization; the ratio of deficit
     /// to bits is what the trellis preserves, at a third of the cost.
     const SHIFT_RDOQ: bool = false;
+    /// The mean of the finer and coarser chords overstates the tangent of a
+    /// convex rate-distortion curve.
+    const SLOPE_SCALE: f32 = 0.85;
     const TILE_BLOCKS: usize = 4;
     const MAX_ITERS: usize = 3;
     // Candidates verified exactly per iteration; with the block memo each
@@ -4922,14 +4925,14 @@ fn run_quant_field_loop(
     let cv_judge = (ctx.arbiter == Arbiter::Cvvdp && ctx.coding.is_xyb())
         .then(|| crate::cvvdp_arbiter::CvvdpArbiter::new(opsin))
         .flatten();
-    let mut loop_state: Option<LoopJudge> = None;
+    let mut loop_state: Option<LoopArbiter> = None;
     let (mut cur_d, mut cur_map) = {
         let state = loop_state.insert(match cv_judge {
             Some(mut judge) => {
                 judge.reset(&cur.recon, &decoded_dc(&cur, distp));
-                LoopJudge::Cvvdp(Box::new(judge))
+                LoopArbiter::Cvvdp(Box::new(judge))
             }
-            None => LoopJudge::Ssimulacra2(Box::new(crate::ssimulacra2::Ssimulacra2State::new(
+            None => LoopArbiter::Ssimulacra2(Box::new(crate::ssimulacra2::Ssimulacra2State::new(
                 opsin, &cur.recon,
             ))),
         });
@@ -5079,11 +5082,12 @@ fn run_quant_field_loop(
             } else {
                 s_fine
             };
-            let slope = 0.5 * (s_fine + s_coarse);
+            let slope = SLOPE_SCALE * 0.5 * (s_fine + s_coarse);
             if !(slope.is_finite() && slope > 0.0) {
                 break;
             }
-            if let Some(judge) = loop_state.as_mut().and_then(LoopJudge::cvvdp) {
+            let mut cv_flat = false;
+            if let Some(judge) = loop_state.as_mut().and_then(LoopArbiter::cvvdp) {
                 let [cv_p, cv_f, cv_c] = [&plain, &fine, &coarse]
                     .map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)));
                 let s_fine = (cv_p - cv_f) / (r_f - r_p);
@@ -5092,10 +5096,18 @@ fn run_quant_field_loop(
                 } else {
                     s_fine
                 };
-                cv_slope = 0.5 * (s_fine + s_coarse);
-                if !(cv_slope.is_finite() && cv_slope > 0.0) {
-                    break;
-                }
+                cv_slope = SLOPE_SCALE * 0.5 * (s_fine + s_coarse);
+                cv_flat = !(cv_slope.is_finite() && cv_slope > 0.0);
+            }
+            // Near transparency ColorVideoVDP no longer separates the shifts;
+            // SSIMULACRA2 arbitrates the frame instead of the loop stopping.
+            if cv_flat {
+                cv_slope = 0.0;
+                let state = LoopArbiter::Ssimulacra2(Box::new(
+                    crate::ssimulacra2::Ssimulacra2State::new(opsin, &cur.recon),
+                ));
+                cur_d = state.deficit();
+                loop_state = Some(state);
             }
             let map_f = tile_sums(&fine_map);
             let bits_f = tile_bits(&block_bits(&fine));
@@ -5136,7 +5148,7 @@ fn run_quant_field_loop(
             break;
         }
         // Moves are ranked on SSIMULACRA2 marginals and accepted on the judge's.
-        let slope = if loop_state.as_ref().is_some_and(LoopJudge::needs_dc) {
+        let slope = if loop_state.as_ref().is_some_and(LoopArbiter::needs_dc) {
             cv_slope
         } else {
             slope
@@ -5328,7 +5340,7 @@ fn run_quant_field_loop(
         ];
         const SQUARE: Variant = (&[(STRATEGY_DCT128X128, 0, 0)], WHOLE);
 
-        let slope = if loop_state.as_ref().is_some_and(LoopJudge::needs_dc) {
+        let slope = if loop_state.as_ref().is_some_and(LoopArbiter::needs_dc) {
             cv_slope
         } else {
             cached_slope
@@ -5686,7 +5698,7 @@ fn run_quant_field_loop(
             AcStrategyImage, NUM_STRATEGIES, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16,
         };
         type Parts = Vec<(u8, usize, usize)>;
-        let cv_judged = loop_state.as_ref().is_some_and(LoopJudge::needs_dc);
+        let cv_judged = loop_state.as_ref().is_some_and(LoopArbiter::needs_dc);
         let slope = if cv_judged { cv_slope } else { cached_slope };
         let state = loop_state.as_mut().expect("loop judge");
         let mut checkpoint = state.checkpoint();
@@ -6060,14 +6072,15 @@ fn run_quant_field_loop(
     // an arm recomputes only the channel it changes.
     let mut distp_out = *distp;
     // Each arbiter races on its own metric and exchange rate.
-    let race_slope = match ctx.arbiter {
-        crate::Arbiter::Cvvdp => cv_slope,
-        _ => cached_slope,
+    let race_slope = if loop_state.as_ref().is_some_and(LoopArbiter::needs_dc) {
+        cv_slope
+    } else {
+        cached_slope
     };
     if race_slope > 0.0 && ctx.coding.is_xyb() {
         let slope = race_slope;
         let b_start = ctx.b_qm_scale();
-        let mut judge = loop_state.as_mut().and_then(LoopJudge::cvvdp);
+        let mut judge = loop_state.as_mut().and_then(LoopArbiter::cvvdp);
         let mut score = |e: &Eval| -> f32 {
             match judge.as_deref_mut() {
                 Some(judge) => judge.deficit_of(&e.recon, &decoded_dc(e, distp)),

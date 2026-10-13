@@ -30,23 +30,23 @@
 //! The exact metric the closed loop arbitrates candidates with: an
 //! incremental state following the accepted frame, on the arbiter's metric.
 
-use crate::cvvdp_arbiter::{CvvdpCheckpoint, CvvdpArbiter};
+use crate::cvvdp_arbiter::{CvvdpArbiter, CvvdpCheckpoint};
 use crate::image::Image3F;
 use crate::ssimulacra2::{Rect, Ssimulacra2Checkpoint, Ssimulacra2State};
 
-pub(super) enum LoopJudge {
+pub(crate) enum LoopArbiter {
     Ssimulacra2(Box<Ssimulacra2State>),
     Cvvdp(Box<CvvdpArbiter>),
 }
 
-pub(super) enum LoopCheckpoint {
+pub(crate) enum LoopCheckpoint {
     Ssimulacra2(Ssimulacra2Checkpoint),
     Cvvdp(CvvdpCheckpoint),
 }
 
-impl LoopJudge {
+impl LoopArbiter {
     /// Deficit of the accepted frame (smaller is better).
-    pub(super) fn deficit(&self) -> f32 {
+    pub(crate) fn deficit(&self) -> f32 {
         match self {
             Self::Ssimulacra2(s) => s.deficit(),
             Self::Cvvdp(j) => j.deficit(),
@@ -54,11 +54,11 @@ impl LoopJudge {
     }
 
     /// Whether candidates must supply their decoded DC.
-    pub(super) fn needs_dc(&self) -> bool {
+    pub(crate) fn needs_dc(&self) -> bool {
         matches!(self, Self::Cvvdp(_))
     }
 
-    pub(super) fn checkpoint(&self) -> LoopCheckpoint {
+    pub(crate) fn checkpoint(&self) -> LoopCheckpoint {
         match self {
             Self::Ssimulacra2(_) => LoopCheckpoint::Ssimulacra2(Default::default()),
             Self::Cvvdp(_) => LoopCheckpoint::Cvvdp(Default::default()),
@@ -67,7 +67,7 @@ impl LoopJudge {
 
     /// Deficit with `recon` (and its decoded DC) inside `r`, kept until
     /// `rollback(cp)`.
-    pub(super) fn update_checkpointed(
+    pub(crate) fn update_checkpointed(
         &mut self,
         recon: &Image3F,
         decoded_dc: Option<&Image3F>,
@@ -86,7 +86,7 @@ impl LoopJudge {
         }
     }
 
-    pub(super) fn rollback(&mut self, cp: &LoopCheckpoint) {
+    pub(crate) fn rollback(&mut self, cp: &LoopCheckpoint) {
         match (self, cp) {
             (Self::Ssimulacra2(s), LoopCheckpoint::Ssimulacra2(cp)) => s.rollback(cp),
             (Self::Cvvdp(j), LoopCheckpoint::Cvvdp(cp)) => j.rollback(cp),
@@ -95,14 +95,14 @@ impl LoopJudge {
     }
 
     /// The SSIMULACRA2 per-pixel map (empty for other metrics).
-    pub(super) fn map(&self) -> Vec<f32> {
+    pub(crate) fn map(&self) -> Vec<f32> {
         match self {
             Self::Ssimulacra2(s) => s.map(),
             Self::Cvvdp(_) => Vec::new(),
         }
     }
 
-    pub(super) fn cvvdp(&mut self) -> Option<&mut CvvdpArbiter> {
+    pub(crate) fn cvvdp(&mut self) -> Option<&mut CvvdpArbiter> {
         match self {
             Self::Cvvdp(j) => Some(j),
             Self::Ssimulacra2(_) => None,

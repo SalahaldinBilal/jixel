@@ -130,7 +130,7 @@ mod tests {
             ("scalar", downsample_rows_scalar),
         ];
         #[cfg(all(target_arch = "aarch64", feature = "neon"))]
-        if std::arch::is_aarch64_feature_detected!("neon") {
+        {
             kernels.push(("neon", |a, b, d| unsafe {
                 crate::neon::downsample_rows_neon(a, b, d)
             }));

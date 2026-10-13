@@ -83,7 +83,7 @@ const CVVDP_VENV_BIN: &str = concat!(
     "/../parameters_fit/.venv/bin/cvvdp"
 );
 /// Display model passed as `--display` (photometry + geometry the metric assumes).
-const CVVDP_DISPLAY: &str = "standard_4k";
+const CVVDP_DISPLAY: &str = "macbook_pro_16";
 
 // --- butteraugli: libjxl's `butteraugli_main` (on PATH), run with --pnorm 3.
 // On by default when the tool is there (it is cheap next to the encodes);
@@ -1511,7 +1511,7 @@ fn usage() -> ! {
         "usage: meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]\n\
          \x20                [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]\n\
          \x20                [--no-aom] [--no-cjxl] [--jpeg] [--cjpegli PATH]\n\
-         \x20                [--cvvdp] [--cvvdp-bin PATH] [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]\n\
+         \x20                [--cvvdp] [--cvvdp-bin PATH] [--cvvdp-display macbook_pro_16] [--cvvdp-device mps|cpu]\n\
          \x20                [--no-cvvdp] [--no-butteraugli] [--butteraugli-bin PATH] [--log]\n\
          \n  Runs jixel, cjxl (per effort) and the libavif aom AV1 reference over every\n  \
          image in FOLDER at each distance, decodes, scores SSIMULACRA2 (the butteraugli\n  \

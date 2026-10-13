@@ -54,6 +54,19 @@ pub struct Display {
 }
 
 impl Display {
+    /// Original macbook_pro_16 (our macdisplay target): 3072×1920,
+    /// 16-inch diagonal viewed from 25 inches, 500 nit, 0.37 nit black,
+    /// 250 lux and reflectivity 0.005.
+    pub fn macbook_pro_16() -> Self {
+        let peak = 500.0;
+        Self {
+            pixels_per_degree: 98.792_42,
+            peak_luminance: peak,
+            black_luminance: peak / 1_351.351_3,
+            reflected_luminance: 250.0 * 0.005 / std::f32::consts::PI,
+        }
+    }
+
     /// Original standard_4k: 30-inch 3840×2160 at 0.7472m, 200 nit,
     /// contrast 1000:1 and 250 lux, reflectivity 0.005.
     pub fn standard_4k() -> Self {

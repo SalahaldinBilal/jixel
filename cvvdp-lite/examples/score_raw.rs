@@ -34,7 +34,7 @@ use std::{error::Error, time::Instant};
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() < 5 || args.len() > 8 {
-        return Err("usage: score_raw WIDTH HEIGHT REF.rgb TEST.rgb [ITERATIONS] [4k|fhd] [auto|scalar|neon|avx2|sse2]".into());
+        return Err("usage: score_raw WIDTH HEIGHT REF.rgb TEST.rgb [ITERATIONS] [4k|fhd|macdisplay] [auto|scalar|neon|avx2|sse2]".into());
     }
     let w: usize = args[1].parse()?;
     let h: usize = args[2].parse()?;
@@ -47,7 +47,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let display = match args.get(6).map(String::as_str).unwrap_or("4k") {
         "4k" => Display::standard_4k(),
         "fhd" => Display::standard_fhd(),
-        _ => return Err("display must be 4k or fhd".into()),
+        "macdisplay" | "macbook_pro_16" => Display::macbook_pro_16(),
+        _ => return Err("display must be 4k, fhd or macdisplay".into()),
     };
     let started = Instant::now();
     let reference =

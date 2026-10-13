@@ -40,13 +40,7 @@ use cvvdp_lite::{CvvdpLite, Display, IncrementalState, PreparedReference, RgbIma
 /// A 500 nit laptop panel: bright enough that dark-region color errors stay
 /// visible, unlike the 200 nit standard displays.
 fn display() -> Display {
-    let peak = 500.0;
-    Display {
-        pixels_per_degree: 98.792_42,
-        peak_luminance: peak,
-        black_luminance: peak / 1351.351_3,
-        reflected_luminance: 250.0 * 0.005 / std::f32::consts::PI,
-    }
+    Display::macbook_pro_16()
 }
 
 /// What a candidate update overwrote.

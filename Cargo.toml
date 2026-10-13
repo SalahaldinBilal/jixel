@@ -1,5 +1,5 @@
 [workspace]
-members = ["app", "stats", "tuner", "meanstats", "cvvdp-lite"]
+members = ["app", "stats", "tuner", "meanstats"]
 
 [package]
 name = "jixel"
@@ -25,7 +25,7 @@ wasm = []
 splines = []
 
 [dependencies]
-cvvdp-lite = { path = "cvvdp-lite" }
+cvvdp-lite = "0.1.0"
 
 [profile.profiling]
 inherits = "release"

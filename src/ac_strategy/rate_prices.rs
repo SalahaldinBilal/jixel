@@ -1260,7 +1260,7 @@ mod tests {
             let positions: Vec<usize> = (0..count)
                 .map(|index| sample_position(index, count, total))
                 .collect();
-            assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+            assert!(positions.array_windows::<2>().all(|pair| pair[0] < pair[1]));
             assert!(*positions.last().unwrap() < total);
             assert!(positions[0] < total.div_ceil(count));
         }

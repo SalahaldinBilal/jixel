@@ -1243,7 +1243,7 @@ mod tests {
         meta.xmp = Some(xmp.clone());
         let out = encode_fast_lossless(&img, 10, 10, Rgb, false, &meta).unwrap();
         let at = out
-            .windows(4)
+            .array_windows::<4>()
             .position(|window| window == b"xml ")
             .expect("xml box");
         assert_eq!(&out[at + 4..], xmp.as_slice());

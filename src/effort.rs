@@ -260,7 +260,7 @@ mod tests {
             Speed::Slow,
             Speed::ExtraSlow,
         ];
-        for pair in tiers.windows(2) {
+        for pair in tiers.array_windows::<2>() {
             let (faster, slower) = (pair[0].effort().gates(), pair[1].effort().gates());
             for ((name, on), (_, slower_on)) in faster.into_iter().zip(slower) {
                 assert!(

@@ -294,7 +294,7 @@ mod tests {
     }
 
     fn has_box(bytes: &[u8], kind: &[u8; 4]) -> bool {
-        bytes.windows(4).any(|w| w == kind)
+        bytes.array_windows::<4>().any(|w| w == kind)
     }
 
     #[test]

@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+mod dc_rdo;
 mod dc_smoothing;
 mod loop_arbiter;
 use dc_smoothing::{
@@ -104,7 +105,7 @@ impl ImageDim {
 }
 
 #[derive(Clone, Copy)]
-struct DistanceParams {
+pub(crate) struct DistanceParams {
     distance: f32,
     global_scale: i32,
     quant_dc: i32,
@@ -3585,6 +3586,16 @@ fn encode_frame_core(
             dc_cfl,
             compensate_b,
             ctx.dc_rows.adjust_b,
+        )?;
+    }
+    if ctx.coding.is_xyb() && ctx.speed.effort().dc_rdoq && distance >= 3.0 {
+        dc_rdo::refine_dc_rounding(
+            &mut dc_datas,
+            &distp,
+            ytob_dc,
+            dc_cfl,
+            compensate_b,
+            &mut scratch.dc_predictor,
         )?;
     }
     let skip_dc_smoothing = skip_dc_smoothing(

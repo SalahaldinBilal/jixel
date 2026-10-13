@@ -146,14 +146,8 @@ fn dcepf_vlq_t(distance: f32) -> f32 {
 }
 
 fn quant_dc(distance: f32) -> f32 {
-    // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
-    // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
-    // coarsening buys almost no rate while banding dominates the perceptual
-    // loss on smooth content. (Below the VLQ ramp — inside it the strong EPF
-    // absorbs the banding and coarser DC pays again; see DCEPF_VLQ_D0.)
     let refine = dc_refinement(distance);
     let vlq = fmla(dcepf_vlq_t(distance), VLQ_DC_MUL - 1.0, 1.0);
-    let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
     let k_dc_quant = 1.12f32;
     let k_dc_mul = 2.9f32;
@@ -7539,12 +7533,17 @@ mod tests {
     }
 
     #[test]
-    fn ac_scale_keeps_changing_after_dc_distance_caps() {
+    fn quantization_keeps_coarsening_at_low_quality() {
         let d4 = compute_distance_params(4.0);
         let d45 = compute_distance_params(4.5);
         let d5 = compute_distance_params(5.0);
         assert!(d4.global_scale > d45.global_scale);
         assert!(d45.global_scale > d5.global_scale);
+        for distances in [3.5, 4.0, 4.5, 5.0, 6.0, 8.0, 12.0, 16.0].array_windows::<2>() {
+            let fine = compute_distance_params(distances[0]);
+            let coarse = compute_distance_params(distances[1]);
+            assert!(fine.scale_dc > coarse.scale_dc, "distances={distances:?}");
+        }
     }
 
     #[test]

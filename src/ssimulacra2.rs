@@ -940,7 +940,8 @@ mod tests {
         };
         for (a, &v) in acc.iter_mut().zip(map) {
             let v = v as f64;
-            *a += (g1 * v + g4 * v * v * v * v) as f32;
+            let v_sqr = v * v;
+            *a += (g1 * v + g4 * v_sqr * v_sqr) as f32;
         }
         w1 * s1 / n + w4 * n4
     }

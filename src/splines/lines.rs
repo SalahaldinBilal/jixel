@@ -611,7 +611,7 @@ mod tests {
         assert!(
             (points[0].x - 10.0).abs() < 1e-3 && (points[points.len() - 1].x - 200.0).abs() < 1e-3
         );
-        for pair in points.windows(2) {
+        for pair in points.array_windows::<2>() {
             assert!(
                 pair[1].x > pair[0].x,
                 "points must run monotonically along the line"

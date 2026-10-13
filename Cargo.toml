@@ -3,7 +3,7 @@ members = ["app", "stats", "tuner", "meanstats"]
 
 [package]
 name = "jixel"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "JPEG XL encoder"
 readme = "README.md"
@@ -23,6 +23,9 @@ neon = []
 sse = []
 wasm = []
 splines = []
+
+[dependencies]
+cvvdp-lite = "0.1.0"
 
 [profile.profiling]
 inherits = "release"

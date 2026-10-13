@@ -28,6 +28,7 @@
  */
 #![allow(clippy::excessive_precision)]
 
+use crate::Arbiter;
 use crate::ac_context::{
     fine_block_context, fine_non_zero_context, fine_zero_density_contexts_offset,
     zero_density_context, zero_density_context_8x8,
@@ -188,8 +189,19 @@ fn num_nonzero_except_llf(block: &[i32], cx: usize, cy: usize) -> i32 {
     count
 }
 
+/// Levels the trellis may pick for one coefficient. Without `restore` a level
+/// only keeps, steps toward zero or drops, so a coefficient the deadzone
+/// removed stays removed.
 #[inline]
-fn rdoq_candidates(ideal: f32, current: i32) -> ([i32; 5], usize) {
+fn rdoq_candidates(ideal: f32, current: i32, restore: bool) -> ([i32; 5], usize) {
+    if !restore {
+        let toward_zero = current - current.signum();
+        return match (current, toward_zero) {
+            (0, _) => ([0; 5], 1),
+            (_, 0) => ([current, 0, 0, 0, 0], 2),
+            _ => ([current, toward_zero, 0, 0, 0], 3),
+        };
+    }
     let rounded = ideal.fast_round() as i32;
     if ideal.abs() > 2.5 && (ideal - rounded as f32).abs() < 0.25 {
         return ([current; 5], 1);
@@ -220,9 +232,8 @@ fn rdoq_distortion_weight(window_index: usize, window_len: usize, distance: f32)
 }
 
 #[inline]
-pub(crate) fn rdoq_lambda(qf_ratio: f32) -> f32 {
-    const BASE: f32 = 1.5;
-    crate::ac_strategy::RD_LAMBDA * 0.25 * BASE * qf_ratio.clamp(0.5, 2.0)
+pub(crate) fn rdoq_lambda(arbiter: Arbiter, qf_ratio: f32) -> f32 {
+    crate::ac_strategy::RD_LAMBDA * 0.25 * arbiter.tuning().rdoq_lambda * qf_ratio.clamp(0.5, 2.0)
 }
 
 #[inline(always)]
@@ -267,14 +278,22 @@ fn update_rdoq_state_pair(
     }
 }
 
-fn rdoq_window_len(covered_blocks: usize, large_window: bool, distance: f32) -> usize {
+/// Trellis window over the scan, and the prefix of it whose levels may be
+/// restored; past that prefix a level only keeps, steps toward zero or drops.
+fn rdoq_window_len(covered_blocks: usize, large_window: bool, distance: f32) -> (usize, usize) {
     if large_window && covered_blocks >= 8 && distance >= 3.0 {
         // 32x16: 128, 32x32: 256, 64x32: 512, 64x64: 1024 AC positions.
         // SS2/CVVDP sweeps found the gain at coarser quality; preserve the
         // 8/16-family and high-quality quantization budgets.
-        (16 * covered_blocks).min(1024)
+        let window = (16 * covered_blocks).min(1024);
+        (window, window)
+    } else if covered_blocks == 1 {
+        (63, 20)
     } else {
-        (24 * covered_blocks).min(64)
+        (
+            (64 * covered_blocks).min(1024),
+            (24 * covered_blocks).min(256),
+        )
     }
 }
 
@@ -354,14 +373,13 @@ fn rdoq_block(
     cy: usize,
     distance: f32,
     qf_hi: bool,
-    qf_ratio: f32,
-    visible: f32,
+    lambda: f32,
     restore_penalty: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
     let covered_blocks = cx * cy;
-    let window_cap = rdoq_window_len(covered_blocks, large_window, distance);
+    let (window_cap, restore_len) = rdoq_window_len(covered_blocks, large_window, distance);
     // The 128 family always takes the banded trellis: the full DP grows with
     // a block's nonzero count, thousands of states over 16384 coefficients.
     let legacy_limit = window_cap <= 64 && !crate::dc_group_data::is_128_strategy(raw_strategy);
@@ -373,6 +391,7 @@ fn rdoq_block(
             rdoq_block_banded::<$factored>(
                 channel_weight,
                 window_cap,
+                restore_len,
                 legacy_limit,
                 prices,
                 scan,
@@ -380,7 +399,6 @@ fn rdoq_block(
                 inv_qm,
                 q_scaled,
                 block,
-                raw_strategy,
                 strategy_code,
                 c,
                 predicted,
@@ -388,8 +406,7 @@ fn rdoq_block(
                 cy,
                 distance,
                 qf_hi,
-                qf_ratio,
-                visible,
+                lambda,
                 restore_penalty,
                 choices,
                 costs,
@@ -407,6 +424,7 @@ fn rdoq_block(
 fn rdoq_block_banded<const FACTORED: bool>(
     channel_weight: f32,
     window_cap: usize,
+    restore_len: usize,
     legacy_limit: bool,
     prices: &FrozenTokenPrices,
     scan: &[u32],
@@ -414,7 +432,6 @@ fn rdoq_block_banded<const FACTORED: bool>(
     inv_qm: &[f32],
     q_scaled: f32,
     block: &mut [i32],
-    raw_strategy: u8,
     strategy_code: u8,
     c: usize,
     predicted: u8,
@@ -422,32 +439,12 @@ fn rdoq_block_banded<const FACTORED: bool>(
     cy: usize,
     distance: f32,
     qf_hi: bool,
-    qf_ratio: f32,
-    visible: f32,
+    lambda: f32,
     restore_penalty: f32,
     choices: &mut [u8; RDOQ_MAX_CHOICES],
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
-    let lambda = rdoq_lambda(qf_ratio) / visible;
     const MAX_NZERO_DELTA: usize = 6;
-    if !matches!(
-        raw_strategy,
-        STRATEGY_DCT
-            | STRATEGY_DCT16X8
-            | STRATEGY_DCT8X16
-            | STRATEGY_DCT16X16
-            | STRATEGY_DCT32X32
-            | STRATEGY_DCT32X16
-            | STRATEGY_DCT16X32
-            | STRATEGY_DCT64X64
-            | STRATEGY_DCT64X32
-            | STRATEGY_DCT32X64
-            | STRATEGY_DCT128X128
-            | STRATEGY_DCT128X64
-            | STRATEGY_DCT64X128
-    ) {
-        return;
-    }
     let covered_blocks = cx * cy;
     let search_end = block.len().min(covered_blocks + window_cap);
     let window_len = search_end - covered_blocks;
@@ -524,7 +521,8 @@ fn rdoq_block_banded<const FACTORED: bool>(
                 chroma_rdoq_weight(distance)
             }
             * rdoq_distortion_weight(window_index.min(base_window_len), base_window_len, distance);
-        let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx]);
+        let (candidates, candidate_count) =
+            rdoq_candidates(ideal, block[idx], window_index < restore_len);
         // Distortion uses the encoder's shared Y-bias approximation to decoder
         // dequantization: +-1 -> +-0.9299, q -> q - 0.145/q. X/B may signal
         // different biases; changing that approximation also needs RD retuning.
@@ -716,7 +714,8 @@ fn rdoq_block_banded<const FACTORED: bool>(
         let k = covered_blocks + window_index;
         let idx = scan[k] as usize;
         let ideal = source[idx] * inv_qm[idx] * q_scaled;
-        let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx]);
+        let (candidates, candidate_count) =
+            rdoq_candidates(ideal, block[idx], window_index < restore_len);
         original_remaining -= usize::from(block[idx] != 0);
         let row_min = suffix_nzeros + original_remaining.saturating_sub(MAX_NZERO_DELTA);
         let choice = choices[window_index * stride + (remaining - row_min) * 2 + prev] as usize;
@@ -749,12 +748,10 @@ fn rdoq_block_wide_oracle(
     cy: usize,
     distance: f32,
     qf_hi: bool,
-    qf_ratio: f32,
-    visible: f32,
+    lambda: f32,
     choices: &mut [u8],
     costs: &mut [Vec<f32>; 2],
 ) {
-    let lambda = rdoq_lambda(qf_ratio) / visible;
     const MAX_NZERO_DELTA: usize = 6;
     if !matches!(
         raw_strategy,
@@ -845,7 +842,7 @@ fn rdoq_block_wide_oracle(
                 (24 * covered_blocks).min(64),
                 distance,
             );
-        let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx]);
+        let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx], true);
         // Distortion uses the encoder's shared Y-bias approximation to decoder
         // dequantization: +-1 -> +-0.9299, q -> q - 0.145/q. X/B may signal
         // different biases; changing that approximation also needs RD retuning.
@@ -926,7 +923,7 @@ fn rdoq_block_wide_oracle(
         let k = covered_blocks + window_index;
         let idx = scan[k] as usize;
         let ideal = source[idx] * inv_qm[idx] * q_scaled;
-        let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx]);
+        let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx], true);
         let choice = choices[window_index * stride + remaining * 2 + prev] as usize;
         debug_assert!(choice < candidate_count);
         let level = candidates[choice];
@@ -2228,8 +2225,8 @@ pub(crate) fn write_ac_group(
                             cy,
                             distance,
                             quant_ac as u32 > qf_threshold,
-                            quant_ac as f32 / qf_threshold.max(1) as f32,
-                            visible,
+                            rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
+                                / visible,
                             restore_penalty,
                             rdoq_choices,
                             rdoq_costs,
@@ -2532,8 +2529,8 @@ pub(crate) fn write_ac_group(
                             cy,
                             distance,
                             quant_ac as u32 > qf_threshold,
-                            quant_ac as f32 / qf_threshold.max(1) as f32,
-                            visible,
+                            rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
+                                / visible,
                             restore_penalty,
                             rdoq_choices,
                             rdoq_costs,
@@ -2637,8 +2634,8 @@ pub(crate) fn write_ac_group(
                             cy,
                             distance,
                             quant_ac as u32 > qf_threshold,
-                            quant_ac as f32 / qf_threshold.max(1) as f32,
-                            visible,
+                            rdoq_lambda(ctx.arbiter, quant_ac as f32 / qf_threshold.max(1) as f32)
+                                / visible,
                             restore_penalty,
                             rdoq_choices,
                             rdoq_costs,
@@ -3180,8 +3177,7 @@ mod tests {
                     cy,
                     [1., 2., 3., 4.][case % 4],
                     case % 2 == 0,
-                    [0.5, 1.0, 1.2, 2.0][case % 4],
-                    1.0,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.0, 1.2, 2.0][case % 4]),
                     1.0,
                     choices,
                     costs,
@@ -3200,12 +3196,18 @@ mod tests {
     #[test]
     fn rdoq_window_policy_is_coarse_quality_and_large_transform_only() {
         for covered in [1, 2, 4, 8, 16, 32, 64] {
-            let old = (24 * covered).min(64);
-            assert_eq!(super::rdoq_window_len(covered, false, 8.), old);
-            assert_eq!(super::rdoq_window_len(covered, true, 2.999), old);
+            // Past the restoring prefix a multi-block window only lowers levels.
+            let base = if covered == 1 {
+                (63, 20)
+            } else {
+                ((64 * covered).min(1024), (24 * covered).min(256))
+            };
+            assert_eq!(super::rdoq_window_len(covered, false, 8.), base);
+            assert_eq!(super::rdoq_window_len(covered, true, 2.999), base);
+            let large = (16 * covered).min(1024);
             assert_eq!(
                 super::rdoq_window_len(covered, true, 3.),
-                if covered >= 8 { 16 * covered } else { old }
+                if covered >= 8 { (large, large) } else { base }
             );
         }
         assert!(!crate::Speed::Slow.effort().large_transform_rdoq);
@@ -3275,10 +3277,11 @@ mod tests {
             let mut actual = original.clone();
             let mut fresh_choices = super::heap_array(u8::MAX);
             let mut fresh_costs = Box::new([[f32::INFINITY; super::RDOQ_MAX_STRIDE]; 2]);
-            let run = |block: &mut [i32], choices: &mut _, costs: &mut _, cap: usize| {
+            let run = |block: &mut [i32], choices: &mut _, costs: &mut _, cap: usize, restore| {
                 super::rdoq_block_banded::<true>(
                     super::rdoq_channel_weights(coding)[c],
                     cap,
+                    restore,
                     false,
                     &prices,
                     &scan,
@@ -3286,7 +3289,6 @@ mod tests {
                     &inv_qm,
                     1.,
                     block,
-                    raw,
                     strategy,
                     c,
                     (case % 64) as u8,
@@ -3294,8 +3296,7 @@ mod tests {
                     cy,
                     [1., 2., 3., 4.][case % 4],
                     case % 2 == 0,
-                    [0.5, 1.0, 1.2, 2.0][case % 4],
-                    1.0,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.0, 1.2, 2.0][case % 4]),
                     1.0,
                     choices,
                     costs,
@@ -3318,13 +3319,14 @@ mod tests {
                 cy,
                 [1., 2., 3., 4.][case % 4],
                 case % 2 == 0,
-                [0.5, 1.0, 1.2, 2.0][case % 4],
-                1.0,
+                super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.0, 1.2, 2.0][case % 4]),
                 1.0,
                 &mut fresh_choices,
                 &mut fresh_costs,
             );
-            run(&mut actual, &mut choices, &mut costs, 64);
+            let (window, restore) =
+                super::rdoq_window_len(cx * cy, false, [1., 2., 3., 4.][case % 4]);
+            run(&mut actual, &mut choices, &mut costs, window, restore);
             assert_eq!(actual, expected, "scratch reuse in case {case}");
             changed += usize::from(actual != original);
             for cap in [128, 256, 512, 1024] {
@@ -3332,8 +3334,14 @@ mod tests {
                 actual.copy_from_slice(&original);
                 fresh_costs.fill([f32::INFINITY; super::RDOQ_MAX_STRIDE]);
                 fresh_choices.fill(u8::MAX);
-                run(&mut expected, &mut fresh_choices, &mut fresh_costs, cap);
-                run(&mut actual, &mut choices, &mut costs, cap);
+                run(
+                    &mut expected,
+                    &mut fresh_choices,
+                    &mut fresh_costs,
+                    cap,
+                    cap,
+                );
+                run(&mut actual, &mut choices, &mut costs, cap, cap);
                 assert_eq!(actual, expected, "cap={cap}, case={case}");
                 for &idx in &scan[..cx * cy] {
                     assert_eq!(
@@ -3435,13 +3443,13 @@ mod tests {
                     cy,
                     4.,
                     false,
-                    1.,
-                    1.,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.),
                     &mut reference_choices,
                     &mut reference_costs,
                 );
                 super::rdoq_block_banded::<true>(
                     1.,
+                    cap,
                     cap,
                     legacy_limit,
                     &prices,
@@ -3450,7 +3458,6 @@ mod tests {
                     &inv_qm,
                     1.,
                     &mut actual,
-                    raw,
                     strategy,
                     c,
                     17,
@@ -3458,8 +3465,7 @@ mod tests {
                     cy,
                     4.,
                     false,
-                    1.,
-                    1.,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.),
                     1.0,
                     &mut choices,
                     &mut costs,
@@ -3558,6 +3564,7 @@ mod tests {
                     refine(
                         [0.3, 1., 0.6][c],
                         cap,
+                        cap,
                         false,
                         &prices,
                         &scan,
@@ -3565,7 +3572,6 @@ mod tests {
                         &inv_qm,
                         [0.75, 1.5][case % 2],
                         block,
-                        raw,
                         strategy,
                         c,
                         (case % 256) as u8,
@@ -3573,8 +3579,8 @@ mod tests {
                         cy,
                         [0.3, 2., 4., 8.][case % 4],
                         case % 2 == 0,
-                        [0.5, 1.2][case % 2],
-                        [1., 0.125][case % 2],
+                        super::rdoq_lambda(crate::Arbiter::Ssimulacra2, [0.5, 1.2][case % 2])
+                            / [1., 0.125][case % 2],
                         [1., 2.][case / shapes.len() % 2],
                         choices,
                         costs,
@@ -3640,8 +3646,27 @@ mod tests {
                     super::rdoq_block_banded::<false>
                 };
                 refine(
-                    1., 1, false, &prices, scan, &source, &inv_qm, 1., block, raw, strategy, 1, 17,
-                    2, 1, 1., false, 1., 1., 2., choices, costs,
+                    1.,
+                    1,
+                    1,
+                    false,
+                    &prices,
+                    scan,
+                    &source,
+                    &inv_qm,
+                    1.,
+                    block,
+                    strategy,
+                    1,
+                    17,
+                    2,
+                    1,
+                    1.,
+                    false,
+                    super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.),
+                    2.,
+                    choices,
+                    costs,
                 );
             };
             run(false, &mut expected, &mut choices0, &mut costs0);
@@ -3651,7 +3676,7 @@ mod tests {
             for (&a, &b) in costs0.iter().flatten().zip(costs1.iter().flatten()) {
                 assert_eq!(a.to_bits(), b.to_bits());
             }
-            let rate = 2. * super::rdoq_lambda(1.);
+            let rate = 2. * super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.);
             let minus = (ideal - super::dequantized_level(-1)).powi(2)
                 + rate * prices.token_bits(Token::new(0, pack_signed(-1)));
             let plus = (ideal - super::dequantized_level(1)).powi(2)

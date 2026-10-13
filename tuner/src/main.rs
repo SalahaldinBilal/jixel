@@ -29,6 +29,7 @@ fn usage() -> ! {
     eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
     eprintln!("         [--dots] (experimental dot coding; requires --speed slow)");
     eprintln!("         [--patches | --no-patches] (override the speed preset)");
+    eprintln!("         [--arbiter ssimulacra2|cvvdp]");
     std::process::exit(2);
 }
 
@@ -43,6 +44,7 @@ fn main() -> ExitCode {
     let mut dots = false;
     let mut patches = None;
     let mut decoding_speed = jixel::DecodingSpeed::Slow;
+    let mut arbiter = jixel::Arbiter::Ssimulacra2;
 
     let mut i = 0;
     while i < args.len() {
@@ -75,6 +77,18 @@ fn main() -> ExitCode {
                     _ => {
                         eprintln!("invalid --speed: {v}");
                         std::process::exit(2);
+                    }
+                };
+                i += 2;
+            }
+            "--arbiter" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                arbiter = match v.as_str() {
+                    "ssimulacra2" => jixel::Arbiter::Ssimulacra2,
+                    "cvvdp" => jixel::Arbiter::Cvvdp,
+                    _ => {
+                        eprintln!("invalid --arbiter: {v}");
+                        return ExitCode::FAILURE;
                     }
                 };
                 i += 2;
@@ -148,6 +162,7 @@ fn main() -> ExitCode {
         .with_distance(distance)
         .with_num_threads(threads.max(1))
         .with_speed(speed)
+        .with_arbiter(arbiter)
         .with_decoding_speed(decoding_speed)
         .with_splines(splines)
         .with_dots(dots);

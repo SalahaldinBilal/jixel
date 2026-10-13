@@ -3087,8 +3087,13 @@ mod tests {
     #[test]
     fn quantizer_cache_excludes_rerank_only_gradient_penalties() {
         let distance = 2.5;
-        let ctx =
-            EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            distance,
+            1,
+        );
         let mut opsin = noise_opsin(16, 16, 0x1234_9876);
         for c in 0..3 {
             for y in 0..16 {
@@ -3473,7 +3478,13 @@ mod tests {
 
     #[test]
     fn hue_protection_survives_coarse_quantization_only_for_chroma_structure() {
-        let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 2.0, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            2.0,
+            1,
+        );
         let alpha = |distance| super::rerank_rgb_hue_alpha(&ctx, distance);
         for distance in [1.0, 2.0, 3.0, 4.0, 10.0] {
             assert_eq!(alpha(distance), 0.0);
@@ -3496,6 +3507,7 @@ mod tests {
         for bias in [crate::xyb::B_BIAS, 0.85] {
             let ctx = EncodingContext::new(
                 crate::Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
                 crate::yellow_opsin::matrix_for_bias(bias),
                 1.0,
                 1,
@@ -3571,7 +3583,13 @@ mod tests {
 
     #[test]
     fn boundary_error_energy_detects_artificial_block_seams() {
-        let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 1.0, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
         let mut opsin = Image3F::new(16, 8);
         let smooth = [[0.0f32; 1024]; 3];
         assert_eq!(
@@ -3613,7 +3631,13 @@ mod tests {
             crate::Speed::Fastest,
             crate::Speed::UltraFast,
         ] {
-            let ctx = EncodingContext::new(speed, crate::xyb::XybMatrix::SPEC, 0.05, 1);
+            let ctx = EncodingContext::new(
+                speed,
+                crate::Arbiter::Ssimulacra2,
+                crate::xyb::XybMatrix::SPEC,
+                0.05,
+                1,
+            );
             assert!(use_dct8_only_for_content(&ctx, 0.05));
             ctx.set_point_chroma(true);
             assert_eq!(
@@ -3738,7 +3762,13 @@ mod tests {
     /// rectangle, a sub-8x8 split, or a 64px transform.
     #[test]
     fn fast_scope_selects_squares_and_no_other_merge_shape() {
-        let ctx = EncodingContext::new(crate::Speed::Fast, crate::xyb::XybMatrix::SPEC, 1.0, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Fast,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
         let maps = ImageSB::new_fill(1, 1, 0);
         let opsin = Image3F::new(32, 32);
         let mut qf = ImageB::new_fill(4, 4, 8);
@@ -3864,7 +3894,13 @@ mod tests {
         f32,
         Vec<crate::coder_scratch::FineMergeRollback>,
     ) {
-        let ctx = EncodingContext::new(speed, crate::xyb::XybMatrix::SPEC, distance, threads);
+        let ctx = EncodingContext::new(
+            speed,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            distance,
+            threads,
+        );
         let (bw, bh) = (13usize, 11usize);
         let opsin = noise_opsin(bw * 8, bh * 8, 0x9e37_79b9);
         let maps = ImageSB::new_fill(2, 2, 0);
@@ -3937,8 +3973,13 @@ mod tests {
         // saved child layouts and 32-level costs exactly.
         for scope in [SearchScope::FULL, SearchScope::SQUARES] {
             let distance = 5.5f32;
-            let ctx =
-                EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+            let ctx = EncodingContext::new(
+                crate::Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                crate::xyb::XybMatrix::SPEC,
+                distance,
+                1,
+            );
             let (bw, bh) = (13usize, 11usize);
             let opsin = noise_opsin(bw * 8, bh * 8, 0x9e37_79b9);
             let maps = ImageSB::new_fill(2, 2, 0);
@@ -4108,7 +4149,13 @@ mod tests {
 
     #[test]
     fn upgrade_shortlist_survives_a_committed_square_and_is_order_independent() {
-        let ctx = EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let opsin = Image3F::new(16, 16);
         let maps = ImageSB::new_fill(1, 1, 0);
         let qf = ImageB::new_fill(2, 2, 6);
@@ -4235,8 +4282,13 @@ mod tests {
             (2.5, 2),
             (4.0, 2),
         ] {
-            let ctx =
-                EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+            let ctx = EncodingContext::new(
+                crate::Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                crate::xyb::XybMatrix::SPEC,
+                distance,
+                1,
+            );
             let (bw, bh) = (12usize, 12usize);
             let mut opsin = noise_opsin(bw * 8, bh * 8, 0x1234_abcd);
             // Patterns 1/2 add a one-directional ramp so that wide (16x32)
@@ -4513,8 +4565,8 @@ mod tests {
 
         // At high quality the 19% 16x16 margin rejects a 10% estimated win but
         // accepts a clear 25% one. At coarse quality the guard fades.
-        let hq = MergeTuning::new(0.3);
-        let lowq = MergeTuning::new(4.0);
+        let hq = MergeTuning::new(0.3, crate::Arbiter::Ssimulacra2);
+        let lowq = MergeTuning::new(4.0, crate::Arbiter::Ssimulacra2);
         assert!(!merge_beats_dct8(90.0, 100.0, hq.accept_16));
         assert!(merge_beats_dct8(75.0, 100.0, hq.accept_16));
         assert!(merge_beats_dct8(95.0, 100.0, lowq.accept_16));

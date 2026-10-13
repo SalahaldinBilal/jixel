@@ -864,7 +864,7 @@ fn refine(
     scratch: &mut FitScratch,
 ) -> Vec<Point<i32>> {
     let cost = |pts: &[Point<i32>], scratch: &mut FitScratch| -> f64 {
-        if pts.windows(2).any(|p| p[0] == p[1]) {
+        if pts.array_windows::<2>().any(|p| p[0] == p[1]) {
             return f64::INFINITY;
         }
         fit_at(targets, w, h, pts, sigma_n, None, Precision::Probe, scratch)
@@ -996,7 +996,7 @@ fn refine_geometric(
     let sm = smooth_chain(chain, 1.0);
     let distance = Polyline::new(ctx, &sm);
     let local_cost = |pts: &[Point<i32>], i: usize| -> f32 {
-        if pts.windows(2).any(|p| p[0] == p[1]) {
+        if pts.array_windows::<2>().any(|p| p[0] == p[1]) {
             return f32::INFINITY;
         }
         let control: Vec<Point<f32>> = pts.iter().map(|&p| p.as_f32()).collect();
@@ -1160,7 +1160,7 @@ fn expand(
         }
     }
     for (g, geometry) in geometries.iter().enumerate() {
-        if !inside(geometry, w, h) || geometry.windows(2).any(|p| p[0] == p[1]) {
+        if !inside(geometry, w, h) || geometry.array_windows::<2>().any(|p| p[0] == p[1]) {
             continue;
         }
         let Some(system) = fit_system(
@@ -1262,7 +1262,7 @@ fn fit_extension(
             continue;
         }
         let sparse = refine_geometric(ctx, &sparse, &chain.points, 2);
-        if !inside(&sparse, w, h) || sparse.windows(2).any(|p| p[0] == p[1]) {
+        if !inside(&sparse, w, h) || sparse.array_windows::<2>().any(|p| p[0] == p[1]) {
             continue;
         }
         for free in [Some((1, lean, 1)), Some((0, lean, 0))] {
@@ -1313,7 +1313,7 @@ fn fit_long_line(
         return None;
     }
     let points = refine_geometric(ctx, &points, &chain.points, 2);
-    if !inside(&points, w, h) || points.windows(2).any(|p| p[0] == p[1]) {
+    if !inside(&points, w, h) || points.array_windows::<2>().any(|p| p[0] == p[1]) {
         return None;
     }
     let predicted = SCALE_TO_SIGMA.0 * chain.scale + SCALE_TO_SIGMA.1;
@@ -1854,7 +1854,7 @@ mod tests {
         for &p in &chain[4..chain.len() - 4] {
             assert!(distance_sq_to_chain(p, &curve) <= 1.6 * 1.6);
         }
-        assert!(sparse.windows(2).all(|p| p[0] != p[1]));
+        assert!(sparse.array_windows::<2>().all(|p| p[0] != p[1]));
     }
 
     #[test]

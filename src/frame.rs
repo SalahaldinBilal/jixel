@@ -27,11 +27,14 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+mod dc_rdo;
 mod dc_smoothing;
+mod loop_arbiter;
 use dc_smoothing::{
     choose_chroma_dc_coding, compensate_b_dc, flatten_chroma_dc, skip_dc_smoothing,
 };
 
+use crate::Arbiter;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
 use crate::color_correlation::choose_ytob_dc;
@@ -50,6 +53,7 @@ use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
 use crate::util::EncodeError;
+use loop_arbiter::LoopArbiter;
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM: usize = 64;
@@ -101,7 +105,7 @@ impl ImageDim {
 }
 
 #[derive(Clone, Copy)]
-struct DistanceParams {
+pub(crate) struct DistanceParams {
     distance: f32,
     global_scale: i32,
     quant_dc: i32,
@@ -143,14 +147,8 @@ fn dcepf_vlq_t(distance: f32) -> f32 {
 }
 
 fn quant_dc(distance: f32) -> f32 {
-    // Cap the DC distance at 3.5: beyond that the DC plane holds so few bits
-    // (WP + ANS + decoder smoothing make fine DC cheap) that further DC
-    // coarsening buys almost no rate while banding dominates the perceptual
-    // loss on smooth content. (Below the VLQ ramp — inside it the strong EPF
-    // absorbs the banding and coarser DC pays again; see DCEPF_VLQ_D0.)
     let refine = dc_refinement(distance);
     let vlq = fmla(dcepf_vlq_t(distance), VLQ_DC_MUL - 1.0, 1.0);
-    let distance = distance.min(3.5);
     let k_dc_quant_pow = 0.57f32;
     let k_dc_quant = 1.12f32;
     let k_dc_mul = 2.9f32;
@@ -3590,6 +3588,16 @@ fn encode_frame_core(
             ctx.dc_rows.adjust_b,
         )?;
     }
+    if ctx.coding.is_xyb() && ctx.speed.effort().dc_rdoq && distance >= 3.0 {
+        dc_rdo::refine_dc_rounding(
+            &mut dc_datas,
+            &distp,
+            ytob_dc,
+            dc_cfl,
+            compensate_b,
+            &mut scratch.dc_predictor,
+        )?;
+    }
     let skip_dc_smoothing = skip_dc_smoothing(
         &ctx.thread_pool,
         scratch,
@@ -4549,6 +4557,9 @@ fn run_quant_field_loop(
     /// Marginals and slope come from plain quantization; the ratio of deficit
     /// to bits is what the trellis preserves, at a third of the cost.
     const SHIFT_RDOQ: bool = false;
+    /// The mean of the finer and coarser chords overstates the tangent of a
+    /// convex rate-distortion curve.
+    const SLOPE_SCALE: f32 = 0.85;
     const TILE_BLOCKS: usize = 4;
     const MAX_ITERS: usize = 3;
     // Candidates verified exactly per iteration; with the block memo each
@@ -4733,6 +4744,38 @@ fn run_quant_field_loop(
         trial: false,
         hit_bits: vec![0.0; ac_tasks.len()],
     };
+    // Decoded DC of every 8x8 block from an evaluation's levels under `dp`.
+    let decoded_dc = |e: &Eval, dp: &DistanceParams| -> Image3F {
+        use crate::quant_weights::INV_DC_QUANT;
+        let steps: [f32; 3] =
+            std::array::from_fn(|c| dp.dc_step[c] / (INV_DC_QUANT[c] * dp.scale_dc));
+        let cfl = ctx.cfl_frame();
+        let cfl_b = crate::color_correlation::dc_cfl_factor(dp.dc_step, ytob_dc, cfl);
+        let cfl_x = crate::color_correlation::dc_cfl_factor_x(dp.dc_step, cfl.base_x);
+        let mut out = Image3F::new(xb, yb);
+        for (t, q) in e.quant_dc.iter().enumerate() {
+            let Some(q) = q else { continue };
+            let (dc_idx, gx, gy) = ac_tasks[t];
+            let (dc_gx, dc_gy) = group_coords[dc_idx];
+            let bx0 = dc_gx * blocks_per_dc + gx * K_GROUP_DIM_IN_BLOCKS;
+            let by0 = dc_gy * blocks_per_dc + gy * K_GROUP_DIM_IN_BLOCKS;
+            let n = q.xsize();
+            for ly in 0..q.ysize() {
+                let [rx, ry, rb] = out.all_plane_rows_mut(by0 + ly);
+                (ctx.dc_rows.reconstruct)(
+                    std::array::from_fn(|c| &q.plane_row(c, ly)[..n]),
+                    [cfl_x, cfl_b],
+                    steps,
+                    [
+                        &mut rx[bx0..bx0 + n],
+                        &mut ry[bx0..bx0 + n],
+                        &mut rb[bx0..bx0 + n],
+                    ],
+                );
+            }
+        }
+        out
+    };
     let frame_bits = |e: &Eval| {
         prices.adaptive_bits(
             e.pending
@@ -4882,14 +4925,30 @@ fn run_quant_field_loop(
     let mut cur_bits = ref_bits;
     // The incremental state follows every accepted move exactly; built once
     // here, it also provides the reference deficit and map.
-    let mut loop_state: Option<crate::ssimulacra2::Ssimulacra2State> = None;
+    // Under the ColorVideoVDP arbiter it is also the exact metric; the
+    // marginals that rank candidates still come from SSIMULACRA2.
+    let cv_judge = (ctx.arbiter == Arbiter::Cvvdp && ctx.coding.is_xyb())
+        .then(|| crate::cvvdp_arbiter::CvvdpArbiter::new(opsin))
+        .flatten();
+    let mut loop_state: Option<LoopArbiter> = None;
     let (mut cur_d, mut cur_map) = {
-        let state = loop_state.insert(crate::ssimulacra2::Ssimulacra2State::new(opsin, &cur.recon));
+        let state = loop_state.insert(match cv_judge {
+            Some(mut judge) => {
+                judge.reset(&cur.recon, &decoded_dc(&cur, distp));
+                LoopArbiter::Cvvdp(Box::new(judge))
+            }
+            None => LoopArbiter::Ssimulacra2(Box::new(crate::ssimulacra2::Ssimulacra2State::new(
+                opsin, &cur.recon,
+            ))),
+        });
         (state.deficit(), state.map())
     };
     let mut moved = vec![0i8; n_tiles];
 
     let mut cached_slope = 0f32;
+    // Under the ColorVideoVDP arbiter its own exchange rate, from the same
+    // shift evaluations, prices every decision it arbitrates.
+    let mut cv_slope = 0f32;
     let mut cached_moves: Vec<(f32, usize, i8)> = Vec::new();
     let mut accepted_moves: Vec<(usize, i8)> = Vec::new();
     // Moves the exact arbiter already rejected are not tried again: later
@@ -5028,9 +5087,32 @@ fn run_quant_field_loop(
             } else {
                 s_fine
             };
-            let slope = 0.5 * (s_fine + s_coarse);
+            let slope = SLOPE_SCALE * 0.5 * (s_fine + s_coarse);
             if !(slope.is_finite() && slope > 0.0) {
                 break;
+            }
+            let mut cv_flat = false;
+            if let Some(judge) = loop_state.as_mut().and_then(LoopArbiter::cvvdp) {
+                let [cv_p, cv_f, cv_c] = [&plain, &fine, &coarse]
+                    .map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)));
+                let s_fine = (cv_p - cv_f) / (r_f - r_p);
+                let s_coarse = if r_p - r_c > 1e-3 {
+                    (cv_c - cv_p) / (r_p - r_c)
+                } else {
+                    s_fine
+                };
+                cv_slope = SLOPE_SCALE * 0.5 * (s_fine + s_coarse);
+                cv_flat = !(cv_slope.is_finite() && cv_slope > 0.0);
+            }
+            // Near transparency ColorVideoVDP no longer separates the shifts;
+            // SSIMULACRA2 arbitrates the frame instead of the loop stopping.
+            if cv_flat {
+                cv_slope = 0.0;
+                let state = LoopArbiter::Ssimulacra2(Box::new(
+                    crate::ssimulacra2::Ssimulacra2State::new(opsin, &cur.recon),
+                ));
+                cur_d = state.deficit();
+                loop_state = Some(state);
             }
             let map_f = tile_sums(&fine_map);
             let bits_f = tile_bits(&block_bits(&fine));
@@ -5070,12 +5152,17 @@ fn run_quant_field_loop(
         if moves.is_empty() {
             break;
         }
+        // Moves are ranked on SSIMULACRA2 marginals and accepted on the judge's.
+        let slope = if loop_state.as_ref().is_some_and(LoopArbiter::needs_dc) {
+            cv_slope
+        } else {
+            slope
+        };
         let mut j_cur = -cur_d - slope * rate_term(cur_bits);
         let mut accepted = false;
         // Evaluate the top candidates one at a time with the real metric.
         // The state follows every accepted move exactly, so it is built once.
-        let state = loop_state
-            .get_or_insert_with(|| crate::ssimulacra2::Ssimulacra2State::new(opsin, &cur.recon));
+        let state = loop_state.as_mut().expect("loop judge");
         // One scratch evaluation; the re-encoded groups' tokens and the
         // pixels of the candidate's region are copied back and forth.
         let copy_tasks =
@@ -5103,7 +5190,7 @@ fn run_quant_field_loop(
         // At most `per_group` candidates per AC group per iteration: each extra
         // candidate in a group costs another serial round (one group encode).
         let mut per_group_count = vec![0usize; ac_tasks.len()];
-        let mut aq_checkpoint = crate::ssimulacra2::Ssimulacra2Checkpoint::default();
+        let mut aq_checkpoint = state.checkpoint();
         let mut remaining: Vec<(usize, i8)> = moves
             .iter()
             .take(GREEDY)
@@ -5175,8 +5262,8 @@ fn run_quant_field_loop(
                     delta_bits += group_bits(&cand, task) - group_bits(&cur, task);
                 }
                 let d = if region.x1 > 0 {
-                    state.update_checkpointed(&cand.recon, region, &mut aq_checkpoint);
-                    state.deficit()
+                    let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
+                    state.update_checkpointed(&cand.recon, dc.as_ref(), region, &mut aq_checkpoint)
                 } else {
                     cur_d
                 };
@@ -5258,10 +5345,13 @@ fn run_quant_field_loop(
         ];
         const SQUARE: Variant = (&[(STRATEGY_DCT128X128, 0, 0)], WHOLE);
 
-        let slope = cached_slope;
-        let state = loop_state
-            .get_or_insert_with(|| crate::ssimulacra2::Ssimulacra2State::new(opsin, &cur.recon));
-        let mut checkpoint = crate::ssimulacra2::Ssimulacra2Checkpoint::default();
+        let slope = if loop_state.as_ref().is_some_and(LoopArbiter::needs_dc) {
+            cv_slope
+        } else {
+            cached_slope
+        };
+        let state = loop_state.as_mut().expect("loop judge");
+        let mut checkpoint = state.checkpoint();
         let mut cand = cur.clone();
         let mut j_cur = -cur_d - slope * rate_term(cur_bits);
         // Sites of each AC task, DC-group-local block coordinates.
@@ -5446,8 +5536,9 @@ fn run_quant_field_loop(
                 for (k, &t) in tasks.iter().enumerate() {
                     let r = dirty[k];
                     let d = if r.x1 > r.x0 {
-                        state.update_checkpointed(&cand.recon, r, &mut checkpoint);
-                        let d = state.deficit();
+                        let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
+                        let d =
+                            state.update_checkpointed(&cand.recon, dc.as_ref(), r, &mut checkpoint);
                         state.rollback(&checkpoint);
                         d
                     } else {
@@ -5521,8 +5612,8 @@ fn run_quant_field_loop(
             for ((k, &t), p) in tasks.iter().enumerate().zip(placed) {
                 let r = dirty[k];
                 let d = if r.x1 > r.x0 {
-                    state.update_checkpointed(&cand.recon, r, &mut checkpoint);
-                    state.deficit()
+                    let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
+                    state.update_checkpointed(&cand.recon, dc.as_ref(), r, &mut checkpoint)
                 } else {
                     cur_d
                 };
@@ -5612,10 +5703,10 @@ fn run_quant_field_loop(
             AcStrategyImage, NUM_STRATEGIES, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16,
         };
         type Parts = Vec<(u8, usize, usize)>;
-        let slope = cached_slope;
-        let state = loop_state
-            .get_or_insert_with(|| crate::ssimulacra2::Ssimulacra2State::new(opsin, &cur.recon));
-        let mut checkpoint = crate::ssimulacra2::Ssimulacra2Checkpoint::default();
+        let cv_judged = loop_state.as_ref().is_some_and(LoopArbiter::needs_dc);
+        let slope = if cv_judged { cv_slope } else { cached_slope };
+        let state = loop_state.as_mut().expect("loop judge");
+        let mut checkpoint = state.checkpoint();
         let mut cand = cur.clone();
         let mut j_cur = -cur_d - slope * rate_term(cur_bits);
         // Only layouts whose classes the frame already uses (matrices, orders).
@@ -5844,8 +5935,9 @@ fn run_quant_field_loop(
                 for (k, &t) in tasks.iter().enumerate() {
                     let r = dirty[k];
                     let d = if r.x1 > r.x0 {
-                        state.update_checkpointed(&cand.recon, r, &mut checkpoint);
-                        let d = state.deficit();
+                        let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
+                        let d =
+                            state.update_checkpointed(&cand.recon, dc.as_ref(), r, &mut checkpoint);
                         state.rollback(&checkpoint);
                         d
                     } else {
@@ -5898,8 +5990,8 @@ fn run_quant_field_loop(
             for ((k, &t), p) in tasks.iter().enumerate().zip(placed) {
                 let r = dirty[k];
                 let d = if r.x1 > r.x0 {
-                    state.update_checkpointed(&cand.recon, r, &mut checkpoint);
-                    state.deficit()
+                    let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
+                    state.update_checkpointed(&cand.recon, dc.as_ref(), r, &mut checkpoint)
                 } else {
                     cur_d
                 };
@@ -5984,10 +6076,23 @@ fn run_quant_field_loop(
     // priced encode; the block memo keys the chroma channels by their scale, so
     // an arm recomputes only the channel it changes.
     let mut distp_out = *distp;
-    if cached_slope > 0.0 && ctx.coding.is_xyb() {
-        let slope = cached_slope;
+    // Each arbiter races on its own metric and exchange rate.
+    let race_slope = if loop_state.as_ref().is_some_and(LoopArbiter::needs_dc) {
+        cv_slope
+    } else {
+        cached_slope
+    };
+    if race_slope > 0.0 && ctx.coding.is_xyb() {
+        let slope = race_slope;
         let b_start = ctx.b_qm_scale();
-        let arm_eval = |x: u32, b: u32, scratch: &mut CoderScratch| -> (Eval, f32, f32) {
+        let mut judge = loop_state.as_mut().and_then(LoopArbiter::cvvdp);
+        let mut score = |e: &Eval| -> f32 {
+            match judge.as_deref_mut() {
+                Some(judge) => judge.deficit_of(&e.recon, &decoded_dc(e, distp)),
+                None => metric(&e.recon).0,
+            }
+        };
+        let arm_eval = |x: u32, b: u32, scratch: &mut CoderScratch| -> (Eval, f32) {
             let mut dp = *distp;
             dp.x_qm_scale = x;
             ctx.set_b_qm_scale(b);
@@ -6014,11 +6119,11 @@ fn run_quant_field_loop(
             );
             ctx.set_b_qm_scale(b_start);
             let bits = frame_bits(&e);
-            let (d, _) = metric(&e.recon);
-            (e, bits, d)
+            (e, bits)
         };
+        let cur_score = cur_d;
         let mut best = (
-            -cur_d - slope * rate_term(cur_bits),
+            -cur_score - slope * rate_term(cur_bits),
             distp.x_qm_scale,
             b_start,
         );
@@ -6041,7 +6146,8 @@ fn run_quant_field_loop(
                     if tried.contains(&(x, b)) {
                         break;
                     }
-                    let (e, bits, d) = arm_eval(x, b, scratch);
+                    let (e, bits) = arm_eval(x, b, scratch);
+                    let d = score(&e);
                     let j = -d - slope * rate_term(bits);
                     tried.push((x, b));
                     if j > best.0 + 1e-6 {
@@ -6712,8 +6818,13 @@ mod tests {
         use crate::image::{Image3B, Image3F, Image3S, Plane, Rect};
 
         let distance = 2.0;
-        let ctx =
-            EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            distance,
+            1,
+        );
         let distp = super::compute_distance_params(distance);
         let mut image = Image3F::new(131, 137);
         for c in 0..3 {
@@ -6896,8 +7007,13 @@ mod tests {
 
         for textured in [false, true] {
             let distance = 6.0;
-            let ctx =
-                EncodingContext::new(crate::Speed::Slow, crate::xyb::XybMatrix::SPEC, distance, 1);
+            let ctx = EncodingContext::new(
+                crate::Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                crate::xyb::XybMatrix::SPEC,
+                distance,
+                1,
+            );
             let mut scratch = CoderScratch::default();
             let distp = super::compute_distance_params(distance);
             let mut source = Image3F::new(512, 256);
@@ -6973,12 +7089,12 @@ mod tests {
         use crate::quant_weights::{DequantMatrices, MatrixHeaderCost};
         for distance in [0.5, 1.5, 2.5, 4.0, 8.0] {
             for matrices in [
-                DequantMatrices::new(distance),
-                DequantMatrices::new_pair_b(distance),
-                DequantMatrices::new_saturated(distance),
-                DequantMatrices::new_x_heavy(distance),
-                DequantMatrices::new_saturated_pair_b(distance),
-                DequantMatrices::new_fast(distance),
+                DequantMatrices::new(distance, crate::Arbiter::Ssimulacra2),
+                DequantMatrices::new_pair_b(distance, crate::Arbiter::Ssimulacra2),
+                DequantMatrices::new_saturated(distance, crate::Arbiter::Ssimulacra2),
+                DequantMatrices::new_x_heavy(distance, crate::Arbiter::Ssimulacra2),
+                DequantMatrices::new_saturated_pair_b(distance, crate::Arbiter::Ssimulacra2),
+                DequantMatrices::new_fast(distance, crate::Arbiter::Ssimulacra2),
             ] {
                 let header = MatrixHeaderCost::new(matrices);
                 for mask in 0..512u16 {
@@ -7107,7 +7223,13 @@ mod tests {
             sharp_energy: 0.15,
         };
         for distance in [0.03, 0.15, 0.25, 0.295, 0.2989, 0.299, 0.2999, 0.3, 0.3001] {
-            let ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, distance, 1);
+            let ctx = EncodingContext::new(
+                Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                xyb::XybMatrix::SPEC,
+                distance,
+                1,
+            );
             let distp = compute_distance_params(distance);
             super::apply_point_chroma_policy(&ctx, &distp, content, false);
             assert_eq!(
@@ -7116,11 +7238,20 @@ mod tests {
                 "d={distance}"
             );
             assert_eq!(ctx.b_qm_scale(), 3, "d={distance}");
-            assert!(std::ptr::eq(ctx.matrices(), DequantMatrices::new(0.3)));
+            assert!(std::ptr::eq(
+                ctx.matrices(),
+                DequantMatrices::new(0.3, crate::Arbiter::Ssimulacra2)
+            ));
         }
         // Existing mid-band protection and the upper cutoff stay intact.
         for (distance, x_scale, b_scale) in [(1.25, 4, 3), (2.249, 4, 3), (2.25, 3, 2)] {
-            let ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, distance, 1);
+            let ctx = EncodingContext::new(
+                Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                xyb::XybMatrix::SPEC,
+                distance,
+                1,
+            );
             let distp = compute_distance_params(distance);
             let matrices = ctx.matrices();
             super::apply_point_chroma_policy(&ctx, &distp, content, false);
@@ -7135,7 +7266,13 @@ mod tests {
             (Speed::Slow, false, true, true),
             (Speed::Slow, false, false, false),
         ] {
-            let ctx = EncodingContext::new(speed, xyb::XybMatrix::SPEC, 0.295, 1);
+            let ctx = EncodingContext::new(
+                speed,
+                crate::Arbiter::Ssimulacra2,
+                xyb::XybMatrix::SPEC,
+                0.295,
+                1,
+            );
             ctx.set_x_heavy(x_heavy);
             let matrices = ctx.matrices();
             let stats = if detected {
@@ -7407,12 +7544,17 @@ mod tests {
     }
 
     #[test]
-    fn ac_scale_keeps_changing_after_dc_distance_caps() {
+    fn quantization_keeps_coarsening_at_low_quality() {
         let d4 = compute_distance_params(4.0);
         let d45 = compute_distance_params(4.5);
         let d5 = compute_distance_params(5.0);
         assert!(d4.global_scale > d45.global_scale);
         assert!(d45.global_scale > d5.global_scale);
+        for distances in [3.5, 4.0, 4.5, 5.0, 6.0, 8.0, 12.0, 16.0].array_windows::<2>() {
+            let fine = compute_distance_params(distances[0]);
+            let coarse = compute_distance_params(distances[1]);
+            assert!(fine.scale_dc > coarse.scale_dc, "distances={distances:?}");
+        }
     }
 
     #[test]

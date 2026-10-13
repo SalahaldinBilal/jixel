@@ -83,7 +83,7 @@ const CVVDP_VENV_BIN: &str = concat!(
     "/../parameters_fit/.venv/bin/cvvdp"
 );
 /// Display model passed as `--display` (photometry + geometry the metric assumes).
-const CVVDP_DISPLAY: &str = "standard_4k";
+const CVVDP_DISPLAY: &str = "macbook_pro_16";
 
 // --- butteraugli: libjxl's `butteraugli_main` (on PATH), run with --pnorm 3.
 // On by default when the tool is there (it is cheap next to the encodes);
@@ -536,7 +536,7 @@ fn main() -> Result<()> {
     }
     if with_aom {
         series.push(Series {
-            label: format!("libavif aom (AV1 s{})", tools.speed).into(),
+            label: format!("libavif aom (AV1 s{})", tools.speed),
             color: RGBColor(0xFF, 0x7F, 0x00),
             points: vec![],
         });
@@ -825,6 +825,7 @@ fn bench_jixel(
         .with_num_threads(threads)
         .with_patches(patches)
         .with_speed(Speed::ExtraSlow)
+        .with_arbiter(jixel::Arbiter::Ssimulacra2)
         .with_splines(true);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;
@@ -1510,7 +1511,7 @@ fn usage() -> ! {
         "usage: meanstats FOLDER [--distances 0.5,1,2,3] [--efforts 7,9] [--threads N] [--out DIR]\n\
          \x20                [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--avif-yuv 444]\n\
          \x20                [--no-aom] [--no-cjxl] [--jpeg] [--cjpegli PATH]\n\
-         \x20                [--cvvdp] [--cvvdp-bin PATH] [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]\n\
+         \x20                [--cvvdp] [--cvvdp-bin PATH] [--cvvdp-display macbook_pro_16] [--cvvdp-device mps|cpu]\n\
          \x20                [--no-cvvdp] [--no-butteraugli] [--butteraugli-bin PATH] [--log]\n\
          \n  Runs jixel, cjxl (per effort) and the libavif aom AV1 reference over every\n  \
          image in FOLDER at each distance, decodes, scores SSIMULACRA2 (the butteraugli\n  \

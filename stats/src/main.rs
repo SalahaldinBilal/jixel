@@ -59,7 +59,7 @@ const CVVDP_VENV_BIN: &str = concat!(
     "/../parameters_fit/.venv/bin/cvvdp"
 );
 /// Display model passed as `--display` (photometry + geometry the metric assumes).
-const CVVDP_DISPLAY: &str = "standard_4k";
+const CVVDP_DISPLAY: &str = "macbook_pro_16";
 
 // --- AV1 reference: SYSTEM libavif (aom) for both encode and decode (on PATH). ---
 const SYS_AVIFENC: &str = "avifenc";
@@ -446,6 +446,7 @@ fn main() -> Result<()> {
     let mut butteraugli_bin = BUTTERAUGLI_BIN.to_string();
     let mut with_butteraugli = true;
     let mut with_cvvdp = false;
+    let mut arbiter = jixel::Arbiter::Ssimulacra2;
     let mut cvvdp_bin: Option<String> = None;
     let mut cvvdp_display = CVVDP_DISPLAY.to_string();
     let mut cvvdp_device: Option<String> = None;
@@ -529,6 +530,14 @@ fn main() -> Result<()> {
                 with_butteraugli = false;
                 i += 1;
             }
+            "--arbiter" => {
+                arbiter = match value!().as_str() {
+                    "cvvdp" => jixel::Arbiter::Cvvdp,
+                    "ssimulacra2" => jixel::Arbiter::Ssimulacra2,
+                    other => bail!("bad --arbiter {other} (expected cvvdp or ssimulacra2)"),
+                };
+                i += 2;
+            }
             "--cvvdp" => {
                 with_cvvdp = true;
                 i += 1;
@@ -599,7 +608,7 @@ fn main() -> Result<()> {
     if images.is_empty() {
         bail!(
             "usage: stats IMAGE.png [more.png ...] [--out DIR] [--distances 0.5,1,2] \
-             [--efforts 7,9]\n  AVIF (aom AV1 reference, system libavif): \
+             [--efforts 7,9] [--arbiter ssimulacra2|cvvdp]\n  AVIF (aom AV1 reference, system libavif): \
              [--avifenc PATH] [--avifdec PATH] [--aom-speed 6] [--no-aom]\n  \
              AVIF (maroontree AV2): [--maroontree PATH] [--avm-avifdec PATH] \
              [--av2-speed slow|medium|fast] [--no-av2]\n  \
@@ -611,7 +620,7 @@ fn main() -> Result<()> {
              metrics: SSIMULACRA2 always; butteraugli (libjxl) too when available: \
              [--butteraugli] [--butteraugli-bin PATH] [--no-butteraugli]; \
              ColorVideoVDP (opt-in): [--cvvdp] [--cvvdp-bin PATH] \
-             [--cvvdp-display standard_4k] [--cvvdp-device mps|cpu]\n  \
+             [--cvvdp-display macbook_pro_16] [--cvvdp-device mps|cpu]\n  \
              charts: [--log] also writes *_log.png with a log rate axis (and log \
              butteraugli axis)"
         );
@@ -741,12 +750,12 @@ fn main() -> Result<()> {
 
         // jixel series.
         let mut jixel = Series {
-            label: "jixel".into(),
+            label: format!("jixel ({arbiter:?})"),
             color: RGBColor(0xE5, 0x3E, 0x3E),
             points: vec![],
         };
         for &d in &distances {
-            let p = bench_jixel(&orig_rgb, w, h, d, &sc, &tmp, stem, npx, nthreads)?;
+            let p = bench_jixel(&orig_rgb, w, h, d, &sc, &tmp, stem, npx, nthreads, arbiter)?;
             println!(
                 "  jixel            d={d:<4} {:>9} B  {:.3} bpp  {}",
                 p.bytes,
@@ -994,10 +1003,12 @@ fn bench_jixel(
     stem: &str,
     npx: f64,
     nthreads: usize,
+    arbiter: jixel::Arbiter,
 ) -> Result<Point> {
     let cfg = jixel::EncodeConfig::default()
         .with_distance(d)
         .with_num_threads(nthreads)
+        .with_arbiter(arbiter)
         .with_speed(Speed::ExtraSlow)
         .with_splines(false)
         .with_dots(false)

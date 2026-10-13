@@ -72,6 +72,8 @@ effort_gates! {
     cfl_ycbcr_rdo,
     /// Weighted DC predictor with per-context gradient fallback.
     dc_predictor_search,
+    /// Chroma DC rounding with frozen residual prices and a pooled rate check.
+    dc_rdoq,
     /// Per-image learned DC context tree raced against the static tree.
     dc_learned_tree,
     /// Per-cluster hybrid-uint config selection.
@@ -203,6 +205,7 @@ const MEDIUM: Effort = Effort {
     ac_ctx_plan: false,
     ma_dc_tree: false,
     chroma_dc_squeeze: false,
+    dc_rdoq: false,
     dc_x_cfl: false,
     ans_refine: false,
     lossy_modular_auto: false,
@@ -260,7 +263,7 @@ mod tests {
             Speed::Slow,
             Speed::ExtraSlow,
         ];
-        for pair in tiers.windows(2) {
+        for pair in tiers.array_windows::<2>() {
             let (faster, slower) = (pair[0].effort().gates(), pair[1].effort().gates());
             for ((name, on), (_, slower_on)) in faster.into_iter().zip(slower) {
                 assert!(

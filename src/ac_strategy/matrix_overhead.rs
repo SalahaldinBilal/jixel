@@ -346,6 +346,7 @@ mod tests {
         let run = |threads| {
             let ctx = EncodingContext::new(
                 crate::Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
                 crate::xyb::XybMatrix::SPEC,
                 distance,
                 threads,

@@ -57,6 +57,8 @@ pub(crate) struct EncodingContext {
     pub(crate) speed: Speed,
     /// Lossy arm selection from the public config
     pub(crate) lossy_modular: crate::LossyModular,
+    /// Metric the lossy decisions are tuned for (see [`crate::Arbiter`]).
+    pub(crate) arbiter: crate::Arbiter,
     /// Experimental spline coding (see `EncodeConfig::splines`).
     #[cfg(feature = "splines")]
     pub(crate) splines: bool,
@@ -349,6 +351,7 @@ impl EncodingContext {
             DequantMatrices::new_plain(
                 self.plain_distance,
                 self.speed.effort().rectangles,
+                self.arbiter,
                 self.coding,
                 self.coding.plane_scale(coded),
             )
@@ -421,6 +424,7 @@ impl EncodingContext {
 
     pub(crate) fn new(
         speed: Speed,
+        arbiter: crate::Arbiter,
         xyb: xyb::XybMatrix,
         distance: f32,
         num_threads: usize,
@@ -430,14 +434,15 @@ impl EncodingContext {
         let afv = afv::selected_afv_methods();
         let effort = speed.effort();
         let base_matrices = if effort.rectangles {
-            DequantMatrices::new(distance)
+            DequantMatrices::new(distance, arbiter)
         } else {
-            DequantMatrices::new_fast(distance)
+            DequantMatrices::new_fast(distance, arbiter)
         };
         Self {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             lossy_modular: crate::LossyModular::Off,
+            arbiter,
             #[cfg(feature = "splines")]
             splines: false,
             #[cfg(feature = "splines")]
@@ -457,23 +462,25 @@ impl EncodingContext {
             extra_squeeze_distance: 0.0,
             extra_learned_trees: false,
             channel_weights: channel_weights_for_bias(xyb.fwd[8], distance),
-            merge: ac_strategy::MergeTuning::new(distance),
+            merge: ac_strategy::MergeTuning::new(distance, arbiter),
             learned_rate: false,
             base_matrices,
             point_chroma_hq_matrices: (effort.chroma_policy
                 && distance < crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE)
-                .then(|| DequantMatrices::new(crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE)),
-            sat_matrices: DequantMatrices::new_saturated(distance),
+                .then(|| {
+                    DequantMatrices::new(crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE, arbiter)
+                }),
+            sat_matrices: DequantMatrices::new_saturated(distance, arbiter),
             pair_b_matrices: if effort.chroma_policy {
-                DequantMatrices::new_pair_b(distance)
+                DequantMatrices::new_pair_b(distance, arbiter)
             } else {
                 base_matrices
             },
-            sat_pair_b_matrices: DequantMatrices::new_saturated_pair_b(distance),
+            sat_pair_b_matrices: DequantMatrices::new_saturated_pair_b(distance, arbiter),
             x_heavy_matrices: if effort.chroma_policy {
-                DequantMatrices::new_x_heavy(distance)
+                DequantMatrices::new_x_heavy(distance, arbiter)
             } else {
-                DequantMatrices::new(0.0)
+                DequantMatrices::new(0.0, arbiter)
             },
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
             point_chroma: std::sync::atomic::AtomicBool::new(false),
@@ -563,7 +570,13 @@ impl EncodingContext {
 impl Default for EncodingContext {
     #[inline]
     fn default() -> Self {
-        Self::new(Speed::Fast, xyb::XybMatrix::SPEC, 1.0, 1)
+        Self::new(
+            Speed::Fast,
+            crate::Arbiter::Ssimulacra2,
+            xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        )
     }
 }
 
@@ -575,13 +588,19 @@ mod tests {
     fn point_chroma_tables_preserve_existing_class_precedence() {
         use super::{DequantMatrices, EncodingContext, Speed, xyb};
         for distance in [0.295, 0.299, 0.3, 1.25, 2.25] {
-            let ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, distance, 1);
+            let ctx = EncodingContext::new(
+                Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                xyb::XybMatrix::SPEC,
+                distance,
+                1,
+            );
             ctx.set_chroma_heavy(true);
             ctx.set_pair_b_fine(true);
             let previous = ctx.matrices();
             ctx.set_point_chroma(true);
             let expected = if distance < 0.3 {
-                DequantMatrices::new(0.3)
+                DequantMatrices::new(0.3, crate::Arbiter::Ssimulacra2)
             } else {
                 previous
             };
@@ -589,14 +608,20 @@ mod tests {
             ctx.set_x_heavy(true);
             assert!(std::ptr::eq(
                 ctx.matrices(),
-                DequantMatrices::new_x_heavy(distance)
+                DequantMatrices::new_x_heavy(distance, crate::Arbiter::Ssimulacra2)
             ));
             assert!(ctx.point_chroma_hq_matrices().is_none());
             ctx.set_x_heavy(false);
             ctx.set_point_chroma(false);
             assert!(std::ptr::eq(ctx.matrices(), previous));
         }
-        let ctx = EncodingContext::new(Speed::Fast, xyb::XybMatrix::SPEC, 0.295, 1);
+        let ctx = EncodingContext::new(
+            Speed::Fast,
+            crate::Arbiter::Ssimulacra2,
+            xyb::XybMatrix::SPEC,
+            0.295,
+            1,
+        );
         let previous = ctx.matrices();
         ctx.set_point_chroma(true);
         assert!(std::ptr::eq(ctx.matrices(), previous));
@@ -606,22 +631,31 @@ mod tests {
     #[test]
     fn hue_tables_require_the_frame_content_gate() {
         use super::{DequantMatrices, EncodingContext, Speed, xyb};
-        let ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, 1.0, 1);
-        assert!(std::ptr::eq(ctx.matrices(), DequantMatrices::new(1.0)));
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
+        assert!(std::ptr::eq(
+            ctx.matrices(),
+            DequantMatrices::new(1.0, crate::Arbiter::Ssimulacra2)
+        ));
         ctx.set_chroma_heavy(true);
         assert!(std::ptr::eq(
             ctx.matrices(),
-            DequantMatrices::new_saturated(1.0)
+            DequantMatrices::new_saturated(1.0, crate::Arbiter::Ssimulacra2)
         ));
         ctx.set_x_heavy(true);
         assert!(std::ptr::eq(
             ctx.matrices(),
-            DequantMatrices::new_x_heavy(1.0)
+            DequantMatrices::new_x_heavy(1.0, crate::Arbiter::Ssimulacra2)
         ));
         ctx.set_x_heavy(false);
         assert!(std::ptr::eq(
             ctx.matrices(),
-            DequantMatrices::new_saturated(1.0)
+            DequantMatrices::new_saturated(1.0, crate::Arbiter::Ssimulacra2)
         ));
     }
 
@@ -644,7 +678,13 @@ mod tests {
     #[test]
     fn adaptive_matrix_updates_cached_coarse_weights() {
         use super::{EncodingContext, Speed, xyb};
-        let mut ctx = EncodingContext::new(Speed::Slow, xyb::XybMatrix::SPEC, 2.0, 1);
+        let mut ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            xyb::XybMatrix::SPEC,
+            2.0,
+            1,
+        );
         assert_eq!(ctx.channel_weights(), [0.30, 1.0, 0.28]);
         let matrix = crate::yellow_opsin::matrix_for_bias(0.90);
         ctx.set_xyb_matrix(matrix, 2.0, false);

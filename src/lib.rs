@@ -40,6 +40,7 @@ mod adaptive_quant;
 mod afv;
 mod aq_blur;
 mod aq_loop;
+mod arbiter;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod bit_writer;
@@ -50,6 +51,7 @@ mod coeff_order;
 mod color;
 mod color_correlation;
 mod color_encoding;
+mod cvvdp_arbiter;
 mod dc_group_data;
 mod dc_ops;
 mod dc_tree;
@@ -103,7 +105,7 @@ pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
 };
 pub use encode_image::{
-    DecodingSpeed, EncodeConfig, LossyModular, Speed, distance_from_quality, encode_image,
+    Arbiter, DecodingSpeed, EncodeConfig, LossyModular, Speed, distance_from_quality, encode_image,
     encode_image_10bit, encode_image_12bit, encode_image_16bit, encode_image_f16, encode_image_f32,
     encode_image_gray, encode_image_gray_10bit, encode_image_gray_12bit, encode_image_gray_16bit,
     encode_image_gray_alpha, encode_image_gray_alpha_10bit, encode_image_gray_alpha_12bit,

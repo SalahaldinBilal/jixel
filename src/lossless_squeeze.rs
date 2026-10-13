@@ -1084,7 +1084,7 @@ fn interpolate_knots(knots: &[(f32, f32)], x: f32) -> f32 {
     if x >= last.0 {
         return last.1;
     }
-    for w in knots.windows(2) {
+    for w in knots.array_windows::<2>() {
         let [(x0, y0), (x1, y1)] = [w[0], w[1]];
         if x >= x0 && x <= x1 {
             return y0 + (y1 - y0) * (x - x0) / (x1 - x0);

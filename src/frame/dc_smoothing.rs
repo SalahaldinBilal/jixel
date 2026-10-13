@@ -39,7 +39,7 @@ use crate::thread_pool::ThreadPool;
 use crate::util::{EncodeError, try_vec};
 
 impl BdcCompensation {
-    fn new(distp: &DistanceParams) -> Self {
+    pub(crate) fn new(distp: &DistanceParams) -> Self {
         use crate::quant_weights::{DC_QUANT, INV_DC_QUANT};
         Self {
             scale_b: INV_DC_QUANT[2] / distp.dc_step[2] * distp.scale_dc,

@@ -276,7 +276,13 @@ mod benchmarks {
     #[test]
     #[ignore = "manual release-mode filter timing"]
     fn filter_timing() {
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let mut scratch = Box::<CoderScratch>::default();
         let (w, h) = (1680, 1120);
         let src: Vec<_> = (0..w * h).map(|i| (i % 37) as f32 * 0.013 - 0.2).collect();

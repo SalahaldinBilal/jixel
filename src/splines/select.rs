@@ -133,9 +133,9 @@ pub(super) struct BlockModel<'a> {
 
 impl<'a> BlockModel<'a> {
     pub(super) fn new(ctx: &'a EncodingContext, distance: f32) -> Self {
-        let matrices = ctx
-            .point_chroma_hq_matrices()
-            .unwrap_or_else(|| crate::quant_weights::DequantMatrices::new(distance));
+        let matrices = ctx.point_chroma_hq_matrices().unwrap_or_else(|| {
+            crate::quant_weights::DequantMatrices::new(distance, crate::Arbiter::Ssimulacra2)
+        });
         BlockModel {
             ctx,
             inv: [
@@ -1418,7 +1418,13 @@ mod tests {
 
     #[test]
     fn dot_template_reuse_preserves_shape_protected_blocks_and_reconstruction() {
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 2.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            2.0,
+            1,
+        );
         let model = BlockModel::new(&ctx, 2.0);
         let (w, h) = (192usize, 128usize);
         let mut selected = Vec::new();
@@ -1535,7 +1541,13 @@ mod tests {
 
     #[test]
     fn width_refinement_recovers_taper_and_preserves_reconstruction() {
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 2.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            2.0,
+            1,
+        );
         let model = BlockModel::new(&ctx, 2.0);
         let (w, h) = (259, 97);
         let mut truth = QuantizedSpline {
@@ -1590,7 +1602,13 @@ mod tests {
     fn sparse_trials_match_full_render_and_rd_at_image_edges() {
         let kernels = EncodingContext::default();
         let (w, h) = (137, 91);
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let model = BlockModel::new(&ctx, 3.0);
         let mut current = Image3F::new(w, h);
         for c in 0..3 {
@@ -1710,7 +1728,13 @@ mod tests {
             } else {
                 &candidates
             };
-            let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+            let ctx = EncodingContext::new(
+                Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                XybMatrix::SPEC,
+                3.0,
+                threads,
+            );
             let mut residual = image.clone();
             let selected = rd_select(
                 &ctx,
@@ -1791,7 +1815,13 @@ mod tests {
         for forbidden in [None, Some(mask.as_slice())] {
             let mut reference: Option<(Vec<QuantizedSpline>, Image3F)> = None;
             for threads in [1, 2, 4] {
-                let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+                let ctx = EncodingContext::new(
+                    Speed::Slow,
+                    crate::Arbiter::Ssimulacra2,
+                    XybMatrix::SPEC,
+                    3.0,
+                    threads,
+                );
                 let mut actual = kept.clone();
                 let mut image = residual.clone();
                 prune_selected(
@@ -1834,7 +1864,13 @@ mod tests {
     #[test]
     fn joint_thinning_crosses_the_single_deletion_rate_barrier() {
         let kernels = crate::encoding_context::EncodingContext::default();
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let model = BlockModel::new(&ctx, 3.0);
         let mut sp = QuantizedSpline {
             points: (0..9).map(|i| Point::new(24 + i * 24, 48)).collect(),
@@ -1878,7 +1914,13 @@ mod tests {
     #[test]
     fn selected_straight_line_loses_controls_without_changing_reconstruction() {
         let kernels = crate::encoding_context::EncodingContext::default();
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let model = BlockModel::new(&ctx, 3.0);
         let mut sp = QuantizedSpline {
             points: (0..7).map(|i| Point::new(24 + i * 24, 48)).collect(),
@@ -1911,7 +1953,13 @@ mod tests {
     #[test]
     fn repricing_does_not_accept_duplicate_lines_against_a_stale_residual() {
         let kernels = crate::encoding_context::EncodingContext::default();
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let model = BlockModel::new(&ctx, 3.0);
         let mut image = Image3F::new(256, 256);
         let quant = vec![8.0; 32 * 32];
@@ -1987,7 +2035,13 @@ mod tests {
 
     #[test]
     fn blue_only_changes_respect_forbidden_blocks() {
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let model = BlockModel::new(&ctx, 3.0);
         let current = Image3F::new(8, 8);
         let mut trial = current.clone();
@@ -2010,7 +2064,13 @@ mod tests {
     #[test]
     fn dot_bound_covers_measured_savings_and_requires_current_costs() {
         for distance in [1.0, 4.0] {
-            let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, distance, 1);
+            let ctx = EncodingContext::new(
+                Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                XybMatrix::SPEC,
+                distance,
+                1,
+            );
             let model = BlockModel::new(&ctx, distance);
             for width in [-11, -7, 4, 11] {
                 let mut sp = QuantizedSpline {
@@ -2037,7 +2097,13 @@ mod tests {
 
     #[test]
     fn block_cost_matches_explicit_edge_replication() {
-        let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+        let ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            XybMatrix::SPEC,
+            3.0,
+            1,
+        );
         let model = BlockModel::new(&ctx, 3.0);
         for (w, h) in [(1, 1), (7, 9), (17, 19), (24, 24)] {
             let mut img = Image3F::new(w, h);
@@ -2321,7 +2387,13 @@ mod tests {
         let quant = vec![8.0; blocks_w * h.div_ceil(8)];
         let forbidden: Vec<_> = (0..quant.len()).map(|i| i / blocks_w == 30).collect();
         for mask in [None, Some(forbidden.as_slice())] {
-            let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, 1);
+            let ctx = EncodingContext::new(
+                Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                XybMatrix::SPEC,
+                3.0,
+                1,
+            );
             let mut expected_image = image.clone();
             let expected = rd_select_reference(
                 &ctx,
@@ -2335,7 +2407,13 @@ mod tests {
             .unwrap();
             assert!(expected.splines.len() >= 4 && expected.splines.len() < candidates.len());
             for threads in [2, 4, 8] {
-                let ctx = EncodingContext::new(Speed::Slow, XybMatrix::SPEC, 3.0, threads);
+                let ctx = EncodingContext::new(
+                    Speed::Slow,
+                    crate::Arbiter::Ssimulacra2,
+                    XybMatrix::SPEC,
+                    3.0,
+                    threads,
+                );
                 let mut actual_image = image.clone();
                 let actual = rd_select(
                     &ctx,

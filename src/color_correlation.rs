@@ -618,7 +618,7 @@ fn compute_cmap_tile_rdo(
 
     // The same per-bit price and channel weights as the chroma trellis, so
     // the slope search and the quantizer agree on which residuals survive.
-    let lambda = crate::group::rdoq_lambda(1.0);
+    let lambda = crate::group::rdoq_lambda(ctx.arbiter, 1.0);
     let chroma_weight = crate::group::chroma_rdoq_weight(quant.distance);
     let [weight_x, _, weight_b] = crate::group::rdoq_channel_weights(ctx.coding);
     let color_factor = ctx.cfl_frame().color_factor;

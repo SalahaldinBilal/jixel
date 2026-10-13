@@ -1573,8 +1573,8 @@ mod tests {
         let cooc = index_cooccurrence(&indices, w, h, n);
         let order = cooccurrence_chain(n, &cooc);
         let ramp: Vec<i32> = (0..n).map(|level| order[perm[level] as usize]).collect();
-        let ascending = ramp.windows(2).all(|p| p[1] == p[0] + 1);
-        let descending = ramp.windows(2).all(|p| p[1] == p[0] - 1);
+        let ascending = ramp.array_windows::<2>().all(|p| p[1] == p[0] + 1);
+        let descending = ramp.array_windows::<2>().all(|p| p[1] == p[0] - 1);
         assert!(ascending || descending, "chain order {ramp:?}");
     }
 

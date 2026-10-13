@@ -41,18 +41,26 @@ pub(crate) struct Tuning {
     pub(crate) qm_ss2_distance: f32,
     /// Let the reconstruction rerank split merged transforms back into DCT8s.
     pub(crate) rerank_downgrades: bool,
+    /// Last-band luma weight ratio of the coarse-band 16x16 table (1 = spec shape).
+    pub(crate) dct16_luma_hf: f32,
+    /// Rectangle merge bias the very-low-quality band ramps to.
+    pub(crate) vlq_bias_rect: f32,
 }
 
 const SSIMULACRA2: Tuning = Tuning {
     rdoq_lambda: 1.5,
     qm_ss2_distance: crate::quant_weights::QM_SS2_MIN_DISTANCE,
     rerank_downgrades: true,
+    dct16_luma_hf: 0.65,
+    vlq_bias_rect: 0.86,
 };
 
 const CVVDP: Tuning = Tuning {
     rdoq_lambda: 1.25,
     qm_ss2_distance: 1.75,
     rerank_downgrades: false,
+    dct16_luma_hf: 1.0,
+    vlq_bias_rect: 1.073,
 };
 
 impl Arbiter {

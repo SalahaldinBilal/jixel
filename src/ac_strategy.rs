@@ -228,7 +228,6 @@ const VLQ_MARGIN_PAIR: f32 = -0.002;
 const VLQ_MARGIN_16: f32 = 0.067;
 const VLQ_MARGIN_32_RECT: f32 = 0.363;
 const VLQ_MARGIN_32: f32 = 0.029_25;
-const VLQ_BIAS_RECT: f32 = 1.073;
 const VLQ_BIAS_16X16: f32 = 0.880;
 const VLQ_BIAS_32X32: f32 = 0.867;
 const VLQ_BIAS_RECT32: f32 = 1.180;
@@ -260,7 +259,7 @@ impl MergeTuning {
         let vlq_t = ((distance - VLQ_D0) / (VLQ_D1 - VLQ_D0)).clamp(0.0, 1.0);
         if vlq_t > 0.0 {
             let lerp = |cur: f32, vlq: f32| fmla(vlq_t, vlq - cur, cur);
-            tuning.bias_rect = lerp(tuning.bias_rect, VLQ_BIAS_RECT);
+            tuning.bias_rect = lerp(tuning.bias_rect, arbiter.tuning().vlq_bias_rect);
             tuning.bias_16x16 = lerp(tuning.bias_16x16, VLQ_BIAS_16X16);
             tuning.bias_32x32 = lerp(tuning.bias_32x32, VLQ_BIAS_32X32);
             tuning.bias_rect32 = lerp(tuning.bias_rect32, VLQ_BIAS_RECT32);

@@ -30,6 +30,14 @@ fn usage() -> ! {
     eprintln!("         [--dots] (experimental dot coding; requires --speed slow)");
     eprintln!("         [--patches | --no-patches] (override the speed preset)");
     eprintln!("         [--arbiter ssimulacra2|cvvdp]");
+    eprintln!("         [--progressive-dc] (code the DC as a progressive DC frame)");
+    eprintln!(
+        "         [--progressive-dc-levels <n>] (DC frame squeeze levels; implies --progressive-dc)"
+    );
+    eprintln!("         [--progressive-shifts <s0,s1,..>] (lossy VarDCT pass shifts, ending in 0)");
+    eprintln!(
+        "         [--group-order scanline|center-first|diagonals] (lossy VarDCT group order)"
+    );
     std::process::exit(2);
 }
 
@@ -43,6 +51,10 @@ fn main() -> ExitCode {
     let mut splines = false;
     let mut dots = false;
     let mut patches = None;
+    let mut progressive_dc = false;
+    let mut progressive_dc_levels: Option<u32> = None;
+    let mut progressive_shifts: Option<Vec<u32>> = None;
+    let mut group_order = jixel::GroupOrder::Scanline;
     let mut decoding_speed = jixel::DecodingSpeed::Slow;
     let mut arbiter = jixel::Arbiter::Ssimulacra2;
 
@@ -122,6 +134,46 @@ fn main() -> ExitCode {
                 lossless = true;
                 i += 1;
             }
+            "--progressive-dc" => {
+                progressive_dc = true;
+                i += 1;
+            }
+            "--group-order" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                group_order = match v.as_str() {
+                    "scanline" => jixel::GroupOrder::Scanline,
+                    "center-first" => jixel::GroupOrder::CenterFirst,
+                    "diagonals" => jixel::GroupOrder::Diagonals,
+                    _ => {
+                        eprintln!("invalid --group-order: {v}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                i += 2;
+            }
+            "--progressive-shifts" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                progressive_shifts = Some(
+                    v.split(',')
+                        .map(|t| {
+                            t.parse().unwrap_or_else(|_| {
+                                eprintln!("invalid --progressive-shifts: {v}");
+                                std::process::exit(2);
+                            })
+                        })
+                        .collect(),
+                );
+                i += 2;
+            }
+            "--progressive-dc-levels" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                progressive_dc_levels = Some(v.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --progressive-dc-levels: {v}");
+                    std::process::exit(2);
+                }));
+                progressive_dc = true;
+                i += 2;
+            }
             "--color-recovery" => {
                 eprintln!("--color-recovery is no longer supported");
                 return ExitCode::FAILURE;
@@ -165,7 +217,21 @@ fn main() -> ExitCode {
         .with_arbiter(arbiter)
         .with_decoding_speed(decoding_speed)
         .with_splines(splines)
-        .with_dots(dots);
+        .with_dots(dots)
+        .with_progressive_dc(progressive_dc);
+    let cfg = cfg.with_group_order(group_order);
+    let cfg = match progressive_shifts {
+        Some(shifts) => {
+            let mut cfg = cfg;
+            cfg.progressive_shifts = Some(shifts);
+            cfg
+        }
+        None => cfg,
+    };
+    let cfg = match progressive_dc_levels {
+        Some(levels) => cfg.with_progressive_dc_levels(levels),
+        None => cfg,
+    };
     let cfg = if let Some(patches) = patches {
         cfg.with_patches(patches)
     } else {

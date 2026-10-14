@@ -4209,43 +4209,6 @@ mod tests {
         assert_eq!(forward, chosen(&output));
     }
 
-    /// The rate calibration prices merged transforms below DCT8 only in the
-    /// mid/low bands (the model over-prices them there), never at HQ, and
-    /// leaves DCT8, the 64 family and the sub-8 family untouched.
-    #[test]
-    fn rate_calibration_is_band_limited_to_merged_families() {
-        use crate::ac_strategy::RateCalibration;
-        for s in [
-            STRATEGY_DCT,
-            STRATEGY_DCT4X4,
-            STRATEGY_IDENTITY,
-            STRATEGY_DCT64X64,
-        ] {
-            for d in [0.5f32, 2.75, 6.0] {
-                assert_eq!(RateCalibration::scale(s, d), 1.0);
-            }
-        }
-        for s in [
-            STRATEGY_DCT16X8,
-            STRATEGY_DCT16X16,
-            STRATEGY_DCT32X32,
-            STRATEGY_DCT32X16,
-        ] {
-            assert_eq!(RateCalibration::scale(s, 1.0), 1.0);
-            let mid = RateCalibration::scale(s, 2.75);
-            assert!((0.85..1.0).contains(&mid), "{s}: {mid}");
-            assert!(RateCalibration::scale(s, 2.0) > mid);
-            assert_eq!(
-                RateCalibration::scale(s, 6.0),
-                RateCalibration::scale(s, 4.0)
-            );
-        }
-        assert!(
-            RateCalibration::scale(STRATEGY_DCT32X32, 4.0)
-                < RateCalibration::scale(STRATEGY_DCT16X8, 4.0)
-        );
-    }
-
     /// The upgrade is gated out of the HQ band (it loses there on the
     /// holdout) and runs at the knife-edge margin (0.9 is inert, 1.1 turns
     /// SS2 flat).

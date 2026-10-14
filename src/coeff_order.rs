@@ -421,6 +421,24 @@ impl CoeffOrders {
     }
 }
 
+/// A standalone permutation (the frame TOC's): its own entropy code over the
+/// permutation contexts, then the Lehmer tokens.
+pub(crate) fn write_permutation(
+    permutation: &[u32],
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+    w: &mut crate::bit_writer::BitWriter,
+) {
+    let mut tokens: Vec<Token> = Vec::new();
+    tokenize_permutation(permutation, 0, &mut tokens);
+    let code = crate::entropy::optimize_entropy_code(&tokens, PERMUTATION_CONTEXTS, huffman_pool);
+    let code_ref = code.as_ref();
+    w.write(1, 0); // no lz77 for the permutation stream
+    crate::entropy::write_entropy_code(&code_ref, huffman_pool, w);
+    for t in &tokens {
+        crate::entropy::write_token(*t, &code_ref, w);
+    }
+}
+
 /// Write the `used_orders` field and, when any group is signaled, the shared
 /// entropy code plus every group's permutation tokens.
 pub(crate) fn write_coeff_orders(

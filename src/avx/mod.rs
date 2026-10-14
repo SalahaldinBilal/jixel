@@ -29,8 +29,6 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
-mod aq_blur;
-mod aq_loop;
 mod cfl;
 mod color;
 mod dc_ops;
@@ -46,7 +44,6 @@ mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
 mod splines;
-mod ssimulacra2;
 mod xyb;
 mod yellow_opsin;
 mod ytob;
@@ -57,8 +54,6 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
-pub(crate) use aq_blur::{blur_horizontal_avx2, blur_vertical_avx2};
-pub(crate) use aq_loop::downsample_rows_avx2;
 pub(crate) use cfl::{
     apply_cfl_avx2, cfl_rd_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2, cfl_regression_avx2,
 };
@@ -95,7 +90,6 @@ pub(crate) use quant::{
 pub(crate) use quantize_xyb::{
     quantize_xyb_channels_avx2, quantize_xyb_tile_colors_avx2, round_lattice_pow2_avx2,
 };
-pub(crate) use ssimulacra2::{ss2_contribution_avx2, ss2_expand_row_avx2};
 pub(crate) use xyb::{to_linear_rows_avx2, to_xyb_avx2_band};
 pub(crate) use yellow_opsin::sampled_b_gradient_ratio_avx2;
 pub(crate) use ytob::{accumulate_ytob_weights_avx2, fill_ytob_residuals_avx2, fill_ytob_row_avx2};

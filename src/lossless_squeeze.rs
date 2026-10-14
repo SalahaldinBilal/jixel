@@ -42,9 +42,9 @@ use super::predictor::{
 use super::rct::write_rct_transform;
 use super::{
     DeepLzScratchPool, GROUP_DIM, GroupLayout, LF_GROUP_DIM, MA_MIN_NODE_SAMPLES,
-    MA_PHOTO_CANDIDATES, MA_SPLIT_COST_BITS, build_balanced_tree_tokens_mul, group_lz_threads,
-    push_leaf_mul, push_split, sample_channel_ma, walk_channel_ma, write_frame_header_modular,
-    write_lz_groups, write_toc_entry, write_u64,
+    MA_PHOTO_CANDIDATES, MA_SPLIT_COST_BITS, MaRefPlane, build_balanced_tree_tokens_mul,
+    group_lz_threads, push_leaf_mul, push_split, sample_channel_ma, walk_channel_ma,
+    write_frame_header_modular, write_lz_groups, write_toc_entry, write_u64,
 };
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, LZ77_MAX_CONTEXTS};
@@ -56,7 +56,9 @@ const _: () = assert!(LM_MAX_CONTEXTS <= LZ77_MAX_CONTEXTS);
 use crate::encode_image::AlphaPlane;
 use crate::entropy::{Token, pack_signed};
 use crate::image::Image3Si;
-use crate::ma_tree::{LearnedTree, MaLearnParams, MaNode, MaSamples, learn_ma_tree};
+use crate::ma_tree::{
+    LearnedTree, MA_REF_CHANNELS, MaLearnParams, MaNode, MaSamples, learn_ma_tree,
+};
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
 
@@ -717,6 +719,7 @@ fn tokenize_channel_ma_mult<'a>(
     tree: &LearnedTree,
     leaf_ctx: &[u32],
     base: u32,
+    refs: &[MaRefPlane<'a>],
     out: &mut Vec<Token>,
 ) {
     walk_channel_ma(
@@ -725,7 +728,7 @@ fn tokenize_channel_ma_mult<'a>(
         gh,
         chan,
         0,
-        &[],
+        refs,
         WpParams::DEFAULT,
         false,
         |_x, _y, v, p, n, _wp_pred| {
@@ -762,10 +765,9 @@ fn emit_lm_forest(
     n_dc_slots: usize,
     num_dc_groups: usize,
 ) -> (Vec<Token>, Vec<u32>, Vec<u32>, u32) {
-    use std::collections::VecDeque;
     let n_tags = trees.len();
     let n_ac_slots = n_tags - split - n_dc_slots;
-    debug_assert!(split > 0 && n_ac_slots > 0);
+    debug_assert!(split > 0 && (n_ac_slots > 0 || n_dc_slots == 0));
     let mut nodes: Vec<MaNode> = Vec::new();
     let mut mult_of: Vec<u32> = Vec::new();
     let mut tag_base = vec![0u32; n_tags];
@@ -812,6 +814,10 @@ fn emit_lm_forest(
         acc
     };
     let global_root = build_chain(&mut nodes, &mut mult_of, &mut tag_base, 0, split);
+    if n_ac_slots == 0 {
+        // Single-group frame: everything lives in the global stream.
+        return emit_forest_bfs(&nodes, &mult_of, global_root, tag_base);
+    }
     let ac_root = build_chain(
         &mut nodes,
         &mut mult_of,
@@ -844,8 +850,18 @@ fn emit_lm_forest(
     });
     mult_of.push(1);
     let root = (nodes.len() - 1) as u32;
+    emit_forest_bfs(&nodes, &mult_of, root, tag_base)
+}
 
-    // BFS emission (matches libjxl's FIFO tree decode).
+/// BFS emission of a merged forest from `root` (matches libjxl's FIFO tree
+/// decode), stamping each leaf with its multiplier.
+fn emit_forest_bfs(
+    nodes: &[MaNode],
+    mult_of: &[u32],
+    root: u32,
+    tag_base: Vec<u32>,
+) -> (Vec<Token>, Vec<u32>, Vec<u32>, u32) {
+    use std::collections::VecDeque;
     let mut tokens = Vec::new();
     let mut leaf_ctx = vec![u32::MAX; nodes.len()];
     let mut queue: VecDeque<u32> = VecDeque::new();
@@ -901,6 +917,22 @@ fn write_frame_header_modular_xyb_regular(epf: (u32, f32), w: &mut BitWriter) {
     w.write(1, 1); // is_last
     w.write(2, 0b00); // name length = 0
     write_lm_loop_filter(epf, w);
+    w.write(2, 0b00); // no FH extensions
+}
+
+/// Modular DC frame (kDCFrame, dc_level 1) of the lossy codestream: like
+/// the regular header up to the passes, then the level, no loop filters.
+fn write_frame_header_modular_xyb_dc(w: &mut BitWriter) {
+    w.write(1, 0); // all_default = false
+    w.write(2, 0b01); // DC frame
+    w.write(1, 1); // encoding = Modular
+    write_u64(0, w); // flags
+    w.write(2, 0b00); // upsampling = 1
+    w.write(2, GroupLayout::DEFAULT.shift as u64);
+    w.write(2, 0b00); // num_passes = 1
+    w.write(2, 0b00); // dc_level = 1
+    w.write(2, 0b00); // name length = 0
+    write_lm_loop_filter((0, 0.0), w);
     w.write(2, 0b00); // no FH extensions
 }
 
@@ -1026,6 +1058,8 @@ pub(crate) struct LmQuantized {
     layout: LmLayout,
     /// Decoder EPF (iterations, modular sigma) for the frame header.
     epf: (u32, f32),
+    /// Code the pyramid as the 1:8 DC frame of a VarDCT frame.
+    dc_frame: bool,
     xsize: usize,
     ysize: usize,
 }
@@ -1217,6 +1251,7 @@ pub(crate) fn lm_quantize_plain(
         steps,
         layout,
         epf: lm_epf_schedule(layout, effective_distance),
+        dc_frame: false,
         xsize,
         ysize,
     })
@@ -1228,7 +1263,25 @@ pub(crate) fn lm_quantize(
     xyb: &crate::image::Image3F,
     effective_distance: f32,
 ) -> Option<LmQuantized> {
-    use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps, lossy_squeeze_steps};
+    let steps = crate::squeeze::lossy_squeeze_steps(xyb.xsize(), xyb.ysize(), 3);
+    lm_quantize_xyb(xyb, steps, |color, hshift, vshift| {
+        lossy_modular_q(color, hshift, vshift, effective_distance)
+    })
+    .map(|quantized| LmQuantized {
+        epf: lm_epf_schedule(LmLayout::Xyb, effective_distance),
+        ..quantized
+    })
+}
+
+/// [`lm_quantize`] over the squeeze script `steps` (optionally led by the
+/// chroma pre-squeeze), each channel at `q_of(stored color [Y, X, B-Y],
+/// hshift, vshift)`.
+fn lm_quantize_xyb(
+    xyb: &crate::image::Image3F,
+    steps: Vec<crate::squeeze::SqueezeStep>,
+    q_of: impl Fn(usize, i32, i32) -> i32,
+) -> Option<LmQuantized> {
+    use crate::squeeze::{Channel, apply_step_forward, default_squeeze_steps};
     let xsize = xyb.xsize();
     let ysize = xyb.ysize();
     let num_c = 3usize;
@@ -1237,7 +1290,6 @@ pub(crate) fn lm_quantize(
         // quantization at the wrong scale. Not this arm's job.
         return None;
     }
-    let steps = lossy_squeeze_steps(xsize, ysize, num_c);
     // With the chroma pre-squeeze, the last four channels are its residuals
     // (mapped to the chroma quantization row, like cjxl); everything before
     // them stays aligned to `num_c` blocks.
@@ -1290,7 +1342,7 @@ pub(crate) fn lm_quantize(
     };
     let mut quants: Vec<u32> = Vec::with_capacity(nb);
     for (i, ch) in channels.iter_mut().enumerate() {
-        let q = lossy_modular_q(color_of(i), ch.hshift, ch.vshift, effective_distance);
+        let q = q_of(color_of(i), ch.hshift, ch.vshift);
         quantize_channel_divide(ch, q);
         quants.push(q as u32);
     }
@@ -1299,7 +1351,8 @@ pub(crate) fn lm_quantize(
         quants,
         steps,
         layout: LmLayout::Xyb,
-        epf: lm_epf_schedule(LmLayout::Xyb, effective_distance),
+        epf: (0, 0.0),
+        dc_frame: false,
         xsize,
         ysize,
     })
@@ -1323,6 +1376,60 @@ pub(crate) fn encode_frame_lossy_modular_squeeze(
         Some(quantized) => encode_lm_frame(quantized, speed, pool, scratch, writer),
         None => false,
     }
+}
+
+/// DC-frame residual step at the finest squeeze level, in VarDCT DC steps,
+/// per stored color [Y, X, B-Y].
+const DC_FRAME_GAIN: [f32; 3] = [1.5, 2.5, 1.5];
+/// Step ratio from one squeeze level to the next coarser one.
+const DC_FRAME_LEVEL_RATIO: f32 = 0.6;
+
+/// Progressive DC: the 1:8 DC image of a VarDCT frame as its squeezed DC
+/// frame (frame type kDCFrame, dc_level 1), which the VarDCT frame then
+/// references instead of coding its own DC. Full-resolution chroma, no loop
+/// filters. `levels` keeps that many of the finest squeeze levels (clamped
+/// to at least one; `None` squeezes down to the 8x8 preview). Returns false
+/// when the image is too small to squeeze.
+pub(crate) fn encode_dc_frame(
+    dc: &crate::image::Image3F,
+    vardct_steps: [f32; 3],
+    levels: Option<u32>,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    // Stored color [Y, X, B-Y] -> the VarDCT DC step in lattice units.
+    let unit = [
+        vardct_steps[1] * LOSSY_MODULAR_XYB_SCALE[1],
+        vardct_steps[0] * LOSSY_MODULAR_XYB_SCALE[0],
+        vardct_steps[2] * LOSSY_MODULAR_XYB_SCALE[2],
+    ];
+    let q_of = |color: usize, hshift: i32, vshift: i32| -> i32 {
+        let level = (hshift + vshift - 1).max(0);
+        let q = unit[color] * DC_FRAME_GAIN[color] * DC_FRAME_LEVEL_RATIO.powi(level);
+        (q.round() as i32).max(1)
+    };
+    let levels = levels.map_or(usize::MAX, |n| n.max(1) as usize);
+    let steps = crate::squeeze::squeeze_steps_levels(dc.xsize(), dc.ysize(), 3, levels);
+    match lm_quantize_xyb(dc, steps, q_of) {
+        Some(quantized) => encode_lm_frame(
+            LmQuantized {
+                dc_frame: true,
+                ..quantized
+            },
+            speed,
+            pool,
+            scratch,
+            writer,
+        ),
+        None => false,
+    }
+}
+
+/// Whether [`encode_dc_frame`] can code a DC image of this size.
+pub(crate) fn dc_frame_supported(xsize: usize, ysize: usize) -> bool {
+    !crate::squeeze::default_squeeze_steps(xsize, ysize, 3).is_empty()
 }
 
 /// Lossy modular frame of a non-XYB codestream: the integer planes in
@@ -1359,6 +1466,7 @@ fn encode_lm_frame(
         steps,
         layout,
         epf,
+        dc_frame,
         xsize,
         ysize,
     } = quantized;
@@ -1388,7 +1496,7 @@ fn encode_lm_frame(
     let ysize_dc_groups = ysize.div_ceil(LF_GROUP_DIM);
     let num_dc_groups = xsize_dc_groups * ysize_dc_groups;
 
-    if num_ac_groups == 1 {
+    if num_ac_groups == 1 && !dc_frame {
         // Single-group frame: one section carrying everything.
         let predictors: Vec<u32> = if speed.effort().predictor_search {
             let quants_ref = &quants;
@@ -1436,7 +1544,11 @@ fn encode_lm_frame(
             tokens.extend(channel);
         }
 
-        layout.write_frame_header(epf, writer);
+        if dc_frame {
+            write_frame_header_modular_xyb_dc(writer);
+        } else {
+            layout.write_frame_header(epf, writer);
+        }
         let mut section = BitWriter::new();
         layout.write_dc_quant(&mut section);
         section.write(1, 0); // has_tree = 0 (local tree in GroupHeader)
@@ -1512,6 +1624,37 @@ fn encode_lm_frame(
         .chain(ac_slot_channels.iter().copied())
         .collect();
     let tag_quants: Vec<u32> = tag_channel.iter().map(|&c| quants[c]).collect();
+    // The DC frame's global-stream channels also see the two previous
+    // same-shaped channels (decoder reference properties, full scale).
+    let full_scale: Vec<Vec<i32>> = if dc_frame {
+        channels[..split]
+            .iter()
+            .zip(&quants)
+            .map(|(ch, &q)| ch.data.iter().map(|&v| v * q as i32).collect())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let refs_of = |c: usize| -> Vec<MaRefPlane<'_>> {
+        if full_scale.is_empty() {
+            return Vec::new();
+        }
+        let ch = &channels[c];
+        (0..c)
+            .rev()
+            .filter(|&j| {
+                let o = &channels[j];
+                (o.w, o.h, o.hshift, o.vshift) == (ch.w, ch.h, ch.hshift, ch.vshift)
+            })
+            .take(MA_REF_CHANNELS)
+            .map(|j| MaRefPlane {
+                pixels: &full_scale[j],
+                stride: channels[j].w,
+                x0: 0,
+                y0: 0,
+            })
+            .collect()
+    };
 
     let learned = {
         // Per-tag MA samples: divided values, decoder-visible channel value as the
@@ -1533,13 +1676,14 @@ fn encode_lm_frame(
             let mut samples = MaSamples::with_capacity(px / stride + 1);
             let data = &ch.data;
             let w = ch.w;
+            let refs = if t < split { refs_of(t) } else { Vec::new() };
             sample_channel_ma(
                 |y| &data[y * w..][..w],
                 ch.w,
                 ch.h,
                 chan,
                 0,
-                &[],
+                &refs,
                 WpParams::DEFAULT,
                 false,
                 stride,
@@ -1652,6 +1796,7 @@ fn encode_lm_frame(
             &learned[c],
             &leaf_ctx,
             tag_base[c],
+            &refs_of(c),
             &mut tokens,
         );
         tokens
@@ -1698,6 +1843,7 @@ fn encode_lm_frame(
                     &learned[tag],
                     &leaf_ctx,
                     tag_base[tag],
+                    &[],
                     &mut gtok,
                 );
             },
@@ -1739,7 +1885,11 @@ fn encode_lm_frame(
         &mut scratch.huffman_pool,
     );
 
-    layout.write_frame_header(epf, writer);
+    if dc_frame {
+        write_frame_header_modular_xyb_dc(writer);
+    } else {
+        layout.write_frame_header(epf, writer);
+    }
 
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
@@ -1796,6 +1946,12 @@ fn encode_lm_frame(
         &mut sections[2 + num_dc_groups..],
     );
 
+    if num_ac_groups == 1 {
+        // One TOC entry: every channel lives in the LfGlobal stream and the
+        // group streams are empty, so the decoder reads nothing past it.
+        debug_assert!(dc_group_lz.iter().chain(&ac_group_lz).all(Vec::is_empty));
+        sections.truncate(1);
+    }
     writer.write(1, 0); // no permutation
     writer.zero_pad_to_byte();
     for s in &sections {
@@ -2069,6 +2225,7 @@ impl ExtraSqueeze {
                 &trees[slot],
                 &leaf_ctx,
                 bases[slot],
+                &[],
                 &mut tokens,
             );
         }

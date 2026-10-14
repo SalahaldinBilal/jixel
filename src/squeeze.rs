@@ -110,25 +110,28 @@ pub(crate) fn fwd_h_squeeze(chin: &Channel) -> (Channel, Channel) {
     };
     for y in 0..h {
         let row = &chin.data[y * w..y * w + w];
-        for x in 0..rw {
-            let a_pix = row[2 * x];
-            let b_pix = row[2 * x + 1];
+        let (pairs, tail) = row.as_chunks::<2>();
+        let avg_row = &mut avg.data[y * ow..(y + 1) * ow];
+        let res_row = &mut res.data[y * rw..(y + 1) * rw];
+        let mut next_averages = pairs
+            .iter()
+            .skip(1)
+            .map(|&[a, b]| average(a, b))
+            .chain(tail.iter().copied());
+        let mut left = None;
+        for ((&[a_pix, b_pix], avg_out), res_out) in
+            pairs.iter().zip(avg_row.iter_mut()).zip(res_row)
+        {
             let av = average(a_pix, b_pix);
-            avg.data[y * ow + x] = av;
+            *avg_out = av;
             let diff = a_pix - b_pix;
-            let next_avg = if 2 * x + 2 < 2 * rw {
-                average(row[2 * x + 2], row[2 * x + 3])
-            } else if w & 1 == 1 {
-                row[2 * x + 2]
-            } else {
-                av
-            };
-            let left = if x > 0 { row[2 * x - 1] } else { av };
-            let tendency = smooth_tendency(left as i64, av as i64, next_avg as i64);
-            res.data[y * rw + x] = (diff as i64 - tendency) as i32;
+            let next_avg = next_averages.next().unwrap_or(av);
+            let tendency = smooth_tendency(left.unwrap_or(av) as i64, av as i64, next_avg as i64);
+            *res_out = (diff as i64 - tendency) as i32;
+            left = Some(b_pix);
         }
-        if w & 1 == 1 {
-            avg.data[y * ow + (ow - 1)] = row[2 * (ow - 1)];
+        if let Some(&last) = tail.first() {
+            *avg_row.last_mut().unwrap() = last;
         }
     }
     (avg, res)
@@ -147,27 +150,25 @@ pub(crate) fn inv_h_squeeze(avg: &Channel, res: &Channel) -> Channel {
         hshift: avg.hshift - 1,
         vshift: avg.vshift,
     };
-    for y in 0..h {
-        for x in 0..rw {
-            let av = avg.data[y * ow + x] as i64;
-            let next_avg = if x + 1 < ow {
-                avg.data[y * ow + x + 1] as i64
-            } else {
-                av
-            };
-            let left = if x > 0 {
-                out.data[y * w + 2 * x - 1] as i64
-            } else {
-                av
-            };
-            let tendency = smooth_tendency(left, av, next_avg);
-            let diff = res.data[y * rw + x] as i64 + tendency;
-            let a_pix = av + (diff / 2);
-            out.data[y * w + 2 * x] = a_pix as i32;
-            out.data[y * w + 2 * x + 1] = (a_pix - diff) as i32;
+    for (y, out_row) in out.data.chunks_exact_mut(w.max(1)).enumerate() {
+        let avg_row = &avg.data[y * ow..(y + 1) * ow];
+        let res_row = &res.data[y * rw..(y + 1) * rw];
+        let mut next_averages = avg_row.iter().skip(1);
+        let mut left = None;
+        let (pairs, _) = out_row.as_chunks_mut::<2>();
+        for ((&av, &residual), [a_pix, b_pix]) in avg_row.iter().zip(res_row).zip(pairs.iter_mut())
+        {
+            let av = i64::from(av);
+            let next_avg = next_averages.next().map_or(av, |&next| i64::from(next));
+            let tendency = smooth_tendency(left.unwrap_or(av), av, next_avg);
+            let diff = i64::from(residual) + tendency;
+            let first = av + (diff / 2);
+            *a_pix = first as i32;
+            *b_pix = (first - diff) as i32;
+            left = Some(i64::from(*b_pix));
         }
         if ow > rw {
-            out.data[y * w + (w - 1)] = avg.data[y * ow + (ow - 1)];
+            *out_row.last_mut().unwrap() = *avg_row.last().unwrap();
         }
     }
     out
@@ -257,28 +258,37 @@ pub(crate) fn inv_v_squeeze(avg: &Channel, res: &Channel) -> Channel {
         hshift: avg.hshift,
         vshift: avg.vshift - 1,
     };
-    for x in 0..w {
-        for y in 0..rh {
-            let av = avg.data[y * w + x] as i64;
-            let next_avg = if y + 1 < oh {
-                avg.data[(y + 1) * w + x] as i64
-            } else {
-                av
-            };
-            let top = if y > 0 {
-                out.data[(2 * y - 1) * w + x] as i64
-            } else {
-                av
-            };
-            let tendency = smooth_tendency(top, av, next_avg);
-            let diff = res.data[y * w + x] as i64 + tendency;
-            let a_pix = av + (diff / 2);
-            out.data[(2 * y) * w + x] = a_pix as i32;
-            out.data[(2 * y + 1) * w + x] = (a_pix - diff) as i32;
+    if w == 0 || h == 0 {
+        return out;
+    }
+    let avg_rows = avg.data.chunks_exact(w);
+    let mut next_avg_rows = avg_rows.clone().skip(1);
+    let mut top_row: Option<&[i32]> = None;
+    for ((avg_row, res_row), out_pair) in avg_rows
+        .zip(res.data.chunks_exact(w))
+        .zip(out.data.chunks_exact_mut(2 * w))
+    {
+        let next_avg_row = next_avg_rows.next().unwrap_or(avg_row);
+        let (a_row, b_row) = out_pair.split_at_mut(w);
+        let mut top_values = top_row.into_iter().flatten();
+        for (((&av, &residual), &next_avg), (a_pix, b_pix)) in avg_row
+            .iter()
+            .zip(res_row)
+            .zip(next_avg_row)
+            .zip(a_row.iter_mut().zip(b_row.iter_mut()))
+        {
+            let av = i64::from(av);
+            let top = top_values.next().map_or(av, |&top| i64::from(top));
+            let tendency = smooth_tendency(top, av, i64::from(next_avg));
+            let diff = i64::from(residual) + tendency;
+            let first = av + (diff / 2);
+            *a_pix = first as i32;
+            *b_pix = (first - diff) as i32;
         }
-        if oh > rh {
-            out.data[(h - 1) * w + x] = avg.data[(oh - 1) * w + x];
-        }
+        top_row = Some(b_row);
+    }
+    if oh > rh {
+        out.data[(h - 1) * w..h * w].copy_from_slice(&avg.data[(oh - 1) * w..oh * w]);
     }
     out
 }
@@ -375,10 +385,24 @@ pub(crate) fn lossy_squeeze_steps_chroma(
     steps
 }
 
-pub(crate) fn default_squeeze_steps(mut w: usize, mut h: usize, num_c: usize) -> Vec<SqueezeStep> {
+pub(crate) fn default_squeeze_steps(w: usize, h: usize, num_c: usize) -> Vec<SqueezeStep> {
+    squeeze_steps_levels(w, h, num_c, usize::MAX)
+}
+
+/// [`default_squeeze_steps`] cut to its `levels` finest levels; a level
+/// halves every dimension still above the preview size.
+pub(crate) fn squeeze_steps_levels(
+    mut w: usize,
+    mut h: usize,
+    num_c: usize,
+    levels: usize,
+) -> Vec<SqueezeStep> {
     let mut steps = Vec::new();
     const MAX_PREVIEW: usize = 8;
-    while w > MAX_PREVIEW || h > MAX_PREVIEW {
+    for _ in 0..levels {
+        if w <= MAX_PREVIEW && h <= MAX_PREVIEW {
+            break;
+        }
         if w > MAX_PREVIEW {
             steps.push(SqueezeStep {
                 horizontal: true,

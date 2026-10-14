@@ -26,7 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-use crate::entropy::f_log2;
+use crate::entropy::{TokenSlice, f_log2};
 
 pub(crate) const K_NON_ZERO_BUCKETS: usize = 37;
 pub(crate) const K_ZERO_DENSITY_CONTEXT_COUNT: usize = 458;
@@ -501,14 +501,15 @@ impl PlanStats {
             extra: vec![0u64; K_NUM_FINE_AC_CONTEXTS],
         }
     }
-    fn add_stream(&mut self, tokens: &[crate::entropy::Token]) {
+    fn add_stream<'a>(&mut self, tokens: impl Into<TokenSlice<'a>>) {
+        let tokens = tokens.into();
         // Subsampled: the stats only feed a proposal that a real-bits gate
         // verifies, and a 1-in-4 sample keeps this pass off the profile.
-        for t in tokens.iter().step_by(PLAN_SAMPLE_STEP) {
+        tokens.iter().step_by(PLAN_SAMPLE_STEP).for_each(|t| {
             let (sym, nbits, _) = crate::entropy::uint_encode(t.value);
             self.counts[t.context as usize * PLAN_NUM_SYMBOLS + sym as usize] += 1;
             self.extra[t.context as usize] += u64::from(nbits);
-        }
+        });
     }
     /// Cost of coding one final context made of `members` fine block contexts,
     /// summed over every sub-context slot (nonzero buckets + zero-density).
@@ -559,7 +560,8 @@ impl PlanStats {
 /// Decide the per-image block-context map from real token statistics.
 pub(crate) fn plan_block_ctx_map<'a, I>(streams: I, qf_threshold: u32) -> AcCtxPlan
 where
-    I: IntoIterator<Item = &'a [crate::entropy::Token]>,
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
 {
     let mut stats = PlanStats::new();
     for s in streams {

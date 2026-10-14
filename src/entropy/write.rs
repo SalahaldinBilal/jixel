@@ -40,7 +40,7 @@ use super::prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_symbol
 use super::token::{HybridUintConfig, Token, uint_encode, uint_encode_with_config};
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
-use crate::entropy::f_log2;
+use crate::entropy::{TokenSlice, f_log2};
 use crate::lz77_ac::{LZ77_MIN_LENGTH, LZ77_MIN_SYMBOL, lz77_length_encode};
 use crate::thread_pool::ThreadPool;
 
@@ -683,32 +683,36 @@ fn hybrid_uint_config_bits(config: HybridUintConfig, split_width: usize) -> usiz
     split_width + msb_width as usize + lsb_width as usize
 }
 
-fn build_histograms(tokens: &[Token], context_map: Option<&[u8]>, histograms: &mut [Histogram]) {
+fn build_histograms<'a>(
+    tokens: impl Into<TokenSlice<'a>>,
+    context_map: Option<&[u8]>,
+    histograms: &mut [Histogram],
+) {
     build_histograms_with(tokens, context_map, HybridUintConfig::DEFAULT, histograms);
 }
 
-fn build_histograms_with(
-    tokens: &[Token],
+fn build_histograms_with<'a>(
+    tokens: impl Into<TokenSlice<'a>>,
     context_map: Option<&[u8]>,
     config: HybridUintConfig,
     histograms: &mut [Histogram],
 ) {
-    for t in tokens {
+    tokens.into().iter().for_each(|t| {
         let (tok, _, _) = uint_encode_with_config(t.value, config);
         let context = match context_map {
             Some(m) => m[t.context as usize] as usize,
             None => t.context as usize,
         };
         histograms[context].add(tok);
-    }
+    });
 }
 
 /// Contiguous, balanced token ranges for order-independent counting. Only
 /// slice headers are copied; ANS coding still uses the original stream bounds.
 fn parallel_token_parts<'a>(
-    streams: &[&'a [Token]],
+    streams: &[TokenSlice<'a>],
     pool: Option<&ThreadPool>,
-) -> Option<Vec<Vec<&'a [Token]>>> {
+) -> Option<Vec<Vec<TokenSlice<'a>>>> {
     let threads = pool?.num_threads();
     let total: usize = streams.iter().map(|tokens| tokens.len()).sum();
     let parts = (total / 65_536).min(threads * 2);
@@ -764,7 +768,7 @@ impl CompactContextPopulations {
 /// histograms on every worker. First find each context's active alphabet, then
 /// count into packed rows. Only integer counts are reduced, in input order.
 fn parallel_context_populations(
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     num_contexts: usize,
     pool: Option<&ThreadPool>,
     scratch: &mut CoderScratch,
@@ -775,12 +779,12 @@ fn parallel_context_populations(
     let alphabets = pool.steal_map(scratch, parts.len(), |i, _| {
         let mut widths = vec![0u8; num_contexts];
         for tokens in &parts[i] {
-            for token in *tokens {
-                let symbol = symbol(token);
+            tokens.iter().for_each(|token| {
+                let symbol = symbol(&token);
                 assert!((symbol as usize) < ALPHABET_SIZE);
                 let width = &mut widths[token.context as usize];
                 *width = (*width).max(symbol as u8 + 1);
-            }
+            });
         }
         widths
     });
@@ -810,9 +814,9 @@ fn parallel_context_populations(
         let end = (start + group_size).min(parts.len());
         for part in &parts[start..end] {
             for tokens in part {
-                for token in *tokens {
-                    counts[offsets[token.context as usize] + symbol(token) as usize] += 1;
-                }
+                tokens.iter().for_each(|token| {
+                    counts[offsets[token.context as usize] + symbol(&token) as usize] += 1;
+                });
             }
         }
         counts
@@ -832,19 +836,19 @@ fn parallel_context_populations(
 }
 
 fn clustered_histograms(
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     context_map: &[u8],
     configs: &[HybridUintConfig],
     pool: Option<&ThreadPool>,
     scratch: &mut CoderScratch,
 ) -> Vec<Histogram> {
-    let count = |streams: &[&[Token]]| {
+    let count = |streams: &[TokenSlice<'_>]| {
         let mut histograms = vec![Histogram::new(); configs.len()];
         for tokens in streams {
-            for token in *tokens {
+            tokens.iter().for_each(|token| {
                 let cluster = context_map[token.context as usize] as usize;
                 histograms[cluster].add(uint_encode_with_config(token.value, configs[cluster]).0);
-            }
+            });
         }
         histograms
     };
@@ -867,7 +871,7 @@ fn clustered_histograms(
 }
 
 fn gather_hybrid_samples<const TRACK_MAX: bool>(
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     context_map: &[u8],
     counts: &[usize],
     pool: Option<&ThreadPool>,
@@ -875,17 +879,18 @@ fn gather_hybrid_samples<const TRACK_MAX: bool>(
 ) -> (HybridUintSamples, Vec<u32>) {
     let mut samples = HybridUintSamples::new(counts);
     let mut max_values = vec![0u32; counts.len()];
-    let gather = |streams: &[&[Token]], samples: &mut HybridUintSamples, max_values: &mut [u32]| {
-        for tokens in streams {
-            for token in *tokens {
-                let cluster = context_map[token.context as usize] as usize;
-                samples.push(cluster, token.value);
-                if TRACK_MAX {
-                    max_values[cluster] = max_values[cluster].max(token.value);
-                }
+    let gather =
+        |streams: &[TokenSlice<'_>], samples: &mut HybridUintSamples, max_values: &mut [u32]| {
+            for tokens in streams {
+                tokens.iter().for_each(|token| {
+                    let cluster = context_map[token.context as usize] as usize;
+                    samples.push(cluster, token.value);
+                    if TRACK_MAX {
+                        max_values[cluster] = max_values[cluster].max(token.value);
+                    }
+                });
             }
-        }
-    };
+        };
     let Some(parts) = parallel_token_parts(streams, pool) else {
         gather(streams, &mut samples, &mut max_values);
         return (samples, max_values);
@@ -894,9 +899,9 @@ fn gather_hybrid_samples<const TRACK_MAX: bool>(
     let part_counts = pool.steal_map(scratch, parts.len(), |i, _| {
         let mut counts = vec![0usize; counts.len()];
         for tokens in &parts[i] {
-            for token in *tokens {
+            tokens.iter().for_each(|token| {
                 counts[context_map[token.context as usize] as usize] += 1;
-            }
+            });
         }
         counts
     });
@@ -1078,7 +1083,8 @@ pub(crate) fn optimize_entropy_code_ac_streams<'a, I>(
     pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
-    I: IntoIterator<Item = &'a [Token]>,
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
 {
     optimize_entropy_code_ac_streams_impl(
         streams,
@@ -1113,7 +1119,8 @@ pub(crate) fn optimize_entropy_code_jpeg_ac_streams<'a, I>(
     pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
-    I: IntoIterator<Item = &'a [Token]>,
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
 {
     optimize_entropy_code_ac_streams_impl(
         streams,
@@ -1137,7 +1144,8 @@ pub(crate) fn optimize_entropy_code_ac_streams_fast<'a, I>(
     pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
-    I: IntoIterator<Item = &'a [Token]>,
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
 {
     optimize_entropy_code_ac_streams_impl(
         streams,
@@ -1472,7 +1480,7 @@ impl AnsBundleRef<'_> {
 }
 
 fn exact_ans_bundle_bits_pair(
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     num_contexts: usize,
     first: &AnsBundleRef<'_>,
     second: &AnsBundleRef<'_>,
@@ -1502,13 +1510,13 @@ fn exact_ans_bundle_bits_pair(
 }
 
 fn exact_ans_stream_bits_pair(
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     first: AnsTokenCodeRef<'_>,
     second: AnsTokenCodeRef<'_>,
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> (usize, usize) {
-    let sequential = |streams: &[&[Token]]| {
+    let sequential = |streams: &[TokenSlice<'_>]| {
         streams.iter().fold((0usize, 0usize), |acc, tokens| {
             let bits = ans_tokens_bits_pair(tokens, &first, &second);
             (acc.0 + bits.0, acc.1 + bits.1)
@@ -1536,7 +1544,7 @@ fn exact_ans_stream_bits_pair(
 
 fn refine_ans_clusters_once(
     code: &mut OwnedEntropyCode,
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> bool {
@@ -1569,14 +1577,14 @@ fn refine_ans_clusters_once(
         });
     } else {
         for tokens in streams {
-            for token in *tokens {
+            tokens.iter().for_each(|token| {
                 let context = token.context as usize;
                 let cluster = code.context_map[context] as usize;
                 let (symbol, _, _) =
                     uint_encode_with_config(token.value, code.hybrid_uint_configs[cluster]);
                 histograms[cluster].add(symbol);
                 context_histograms[context].add(symbol);
-            }
+            });
         }
     }
     let Some((candidate_histograms, candidate_map, candidate_configs)) =
@@ -1602,7 +1610,7 @@ type AnsClusterProposal = (Vec<Histogram>, Vec<u8>, Vec<HybridUintConfig>);
 
 fn accept_ans_cluster_proposal(
     code: &mut OwnedEntropyCode,
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     (candidate_histograms, candidate_map, candidate_configs): AnsClusterProposal,
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
@@ -1619,7 +1627,7 @@ fn accept_ans_cluster_proposal(
 
 fn accept_ans_cluster_proposal_precise(
     code: &mut OwnedEntropyCode,
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     (candidate_histograms, candidate_map, candidate_configs): AnsClusterProposal,
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
@@ -1703,12 +1711,13 @@ pub(crate) fn refine_ans_clusters<'a, I>(
     scratch: &mut CoderScratch,
 ) -> bool
 where
-    I: IntoIterator<Item = &'a [Token]>,
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
 {
     if code.use_prefix_code {
         return false;
     }
-    let streams: Vec<&[Token]> = streams.into_iter().collect();
+    let streams: Vec<TokenSlice<'_>> = streams.into_iter().map(Into::into).collect();
     let exhaustive = matches!(refinement, AnsRefinement::ExtraSlow);
     let refinement = if exhaustive {
         AnsRefinement::Slow
@@ -1757,12 +1766,13 @@ pub(crate) fn refine_ans_entropy_exhaustive<'a, I>(
     scratch: &mut CoderScratch,
 ) -> bool
 where
-    I: IntoIterator<Item = &'a [Token]>,
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
 {
     if code.use_prefix_code {
         return false;
     }
-    let streams: Vec<&[Token]> = streams.into_iter().collect();
+    let streams: Vec<TokenSlice<'_>> = streams.into_iter().map(Into::into).collect();
     let mut changed = refine_ans_integer_configs(code, &streams, pool, scratch);
     changed |= refine_ans_expanded_configs(code, &streams, pool, scratch);
     changed |= fill_unused_contexts(code, &streams, scratch);
@@ -1773,7 +1783,7 @@ where
 /// state costs retain the Slow bundle whenever sampling nominated a loser.
 fn refine_ans_integer_configs(
     code: &mut OwnedEntropyCode,
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> bool {
@@ -1811,7 +1821,7 @@ fn refine_ans_integer_configs(
 
 fn refine_ans_expanded_configs(
     code: &mut OwnedEntropyCode,
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> bool {
@@ -1848,7 +1858,7 @@ fn refine_ans_expanded_configs(
 /// payload bits. Adopted only when the serialized map actually shrinks.
 fn fill_unused_contexts(
     code: &mut OwnedEntropyCode,
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     scratch: &mut CoderScratch,
 ) -> bool {
     if code.orig_context_map.is_some() || code.context_map.len() <= 1 {
@@ -1856,9 +1866,9 @@ fn fill_unused_contexts(
     }
     let mut used = vec![false; code.context_map.len()];
     for tokens in streams {
-        for token in *tokens {
+        tokens.iter().for_each(|token| {
             used[token.context as usize] = true;
-        }
+        });
     }
     if used.iter().all(|&u| u) {
         return false;
@@ -1888,7 +1898,7 @@ fn fill_unused_contexts(
 
 fn refine_ans_precisions(
     code: &mut OwnedEntropyCode,
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> bool {
@@ -1951,7 +1961,7 @@ fn refine_ans_precisions(
 /// in the cluster search. Build dense populations without allocating a full
 /// 128-bin histogram for every unused AC context.
 fn propose_ans_reclustering(
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     num_contexts: usize,
     thread_pool: &ThreadPool,
     scratch: &mut CoderScratch,
@@ -1970,9 +1980,9 @@ fn propose_ans_reclustering(
         });
     } else {
         for tokens in streams {
-            for token in *tokens {
+            tokens.iter().for_each(|token| {
                 dense[token.context as usize] = 0;
-            }
+            });
         }
         for index in &mut dense {
             if *index != usize::MAX {
@@ -1984,9 +1994,9 @@ fn propose_ans_reclustering(
             return None;
         }
         for tokens in streams {
-            for token in *tokens {
+            tokens.iter().for_each(|token| {
                 histograms[dense[token.context as usize]].add(uint_encode(token.value).0);
-            }
+            });
         }
     }
     if histograms.len() <= 1 {
@@ -2045,7 +2055,7 @@ fn propose_ans_reclustering(
 
 fn propose_ans_cluster_batch(
     code: &OwnedEntropyCode,
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
 ) -> Option<AnsClusterProposal> {
     if code.hybrid_uint_configs.len() <= 1 {
         return None;
@@ -2055,13 +2065,13 @@ fn propose_ans_cluster_batch(
     let mut map = code.context_map.clone();
     let mut configs = code.hybrid_uint_configs.clone();
     for tokens in streams {
-        for token in *tokens {
+        tokens.iter().for_each(|token| {
             let context = token.context as usize;
             let cluster = map[context] as usize;
             let symbol = uint_encode_with_config(token.value, configs[cluster]).0;
             contexts[context].add(symbol);
             histograms[cluster].add(symbol);
-        }
+        });
     }
     // Pack descending frequency and ascending context ID so integer sorting
     // preserves the existing order without a separate histogram comparator.
@@ -2163,12 +2173,13 @@ fn optimize_entropy_code_ac_streams_impl<'a, I>(
     pool: Option<&ThreadPool>,
 ) -> OwnedEntropyCode
 where
-    I: IntoIterator<Item = &'a [Token]>,
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
 {
     // Collected so the tokens can be walked twice: once to cluster under the
     // default config, once to rebuild histograms under the selected per-cluster
     // configs. Only the slice headers are copied.
-    let streams: Vec<&[Token]> = streams.into_iter().collect();
+    let streams: Vec<TokenSlice<'_>> = streams.into_iter().map(Into::into).collect();
     optimize_entropy_code_ac_slices(
         &streams,
         num_contexts,
@@ -2182,7 +2193,7 @@ where
 
 // Iterator adapters only collect slice references; share the entropy setup.
 fn optimize_entropy_code_ac_slices(
-    streams: &[&[Token]],
+    streams: &[TokenSlice<'_>],
     num_contexts: usize,
     huffman_pool: &mut Vec<HuffmanNode>,
     select_configs: bool,
@@ -3220,7 +3231,7 @@ mod ans_refinement_tests {
         }
     }
 
-    fn serialized(code: &OwnedEntropyCode, streams: &[&[Token]]) -> (usize, Vec<u8>) {
+    fn serialized(code: &OwnedEntropyCode, streams: &[TokenSlice<'_>]) -> (usize, Vec<u8>) {
         let mut writer = BitWriter::new();
         write_entropy_code(&code.as_ref(), &mut Vec::new(), &mut writer);
         for tokens in streams {
@@ -3256,10 +3267,11 @@ mod ans_refinement_tests {
         // An uneven large first stream followed by small streams exercises
         // work stealing; every boundary still starts a distinct ANS state.
         let split = tokens.len() / 2;
-        let mut streams: Vec<&[Token]> = std::iter::once(&tokens[..split])
+        let mut streams: Vec<TokenSlice<'_>> = std::iter::once(&tokens[..split])
             .chain(tokens[split..].chunks(997))
+            .map(TokenSlice::from)
             .collect();
-        streams.push(&[]);
+        streams.push(TokenSlice::Wide(&[]));
         let expected = (
             serialized(&first, &streams).0,
             serialized(&second, &streams).0,
@@ -3296,7 +3308,7 @@ mod ans_refinement_tests {
             }
         }
         let mut code = code_for(&tokens, map.clone(), vec![HybridUintConfig::DEFAULT; 2]);
-        let streams: Vec<&[Token]> = tokens.chunks(1000).collect();
+        let streams: Vec<TokenSlice<'_>> = tokens.chunks(1000).map(TokenSlice::from).collect();
         let (before_bits, before_bytes) = serialized(&code, &streams);
         let header_bits = |code: &OwnedEntropyCode| {
             let mut writer = BitWriter::new();
@@ -3347,7 +3359,7 @@ mod ans_refinement_tests {
                 ));
             }
         }
-        let streams: Vec<&[Token]> = tokens.chunks(1001).collect();
+        let streams: Vec<TokenSlice<'_>> = tokens.chunks(1001).map(TokenSlice::from).collect();
         let mut expected = None;
         for threads in [1, 4] {
             let mut code = code_for(&tokens, vec![0; 7425], vec![HybridUintConfig::DEFAULT]);
@@ -3379,7 +3391,7 @@ mod ans_refinement_tests {
         let tokens: Vec<_> = (0..20_000)
             .map(|i| Token::new((i / 2) % 2, i % 2))
             .collect();
-        let streams = [tokens.as_slice()];
+        let streams = [TokenSlice::from(tokens.as_slice())];
         let mut code = code_for(&tokens, vec![0; 2], vec![HYBRID_CANDIDATES[0]]);
         let before = serialized(&code, &streams);
         assert!(!refine_ans_clusters(
@@ -3408,7 +3420,7 @@ mod ans_refinement_tests {
                 )
             })
             .collect();
-        let streams: Vec<_> = tokens.chunks(17_003).collect();
+        let streams: Vec<_> = tokens.chunks(17_003).map(TokenSlice::from).collect();
         let initial = || {
             code_for(
                 &tokens,
@@ -3450,7 +3462,7 @@ mod ans_refinement_tests {
         let pool = ThreadPool::new_lossless(1);
         let mut scratch = CoderScratch::lossless();
         for tokens in [vec![], vec![Token::new(2, 3); 1000]] {
-            let streams = [tokens.as_slice()];
+            let streams = [TokenSlice::from(tokens.as_slice())];
             let mut code = code_for(&tokens, vec![0; 7], vec![HybridUintConfig::DEFAULT]);
             let before = serialized(&code, &streams);
             for refinement in [
@@ -3484,7 +3496,7 @@ mod ans_refinement_tests {
         let tokens: Vec<_> = (0..30_000)
             .map(|i| Token::new(i % 12, (i / 12) % (2 + i % 12)))
             .collect();
-        let streams: Vec<&[Token]> = tokens.chunks(3001).collect();
+        let streams: Vec<TokenSlice<'_>> = tokens.chunks(3001).map(TokenSlice::from).collect();
         let map: Vec<_> = (0..12).map(|i| (i % 3) as u8).collect();
         let mut code = code_for(&tokens, map, vec![HybridUintConfig::DEFAULT; 3]);
         let before = serialized(&code, &streams).0;
@@ -3520,7 +3532,7 @@ mod ans_refinement_tests {
                     tokens.push(Token::new(value % 3, value));
                 }
             }
-            let streams: Vec<&[Token]> = tokens.chunks(997).collect();
+            let streams: Vec<TokenSlice<'_>> = tokens.chunks(997).map(TokenSlice::from).collect();
             let initial = code_for(&tokens, vec![0, 1, 2], vec![HybridUintConfig::DEFAULT; 3]);
             let before = serialized(&initial, &streams);
             let mut expected = None;
@@ -3808,7 +3820,8 @@ mod sampled_hybrid_tests {
                     )
                 })
                 .collect();
-            let streams = [&tokens[..17], &[], &tokens[17..65_537], &tokens[65_537..]];
+            let streams =
+                [&tokens[..17], &[], &tokens[17..65_537], &tokens[65_537..]].map(TokenSlice::from);
             for config in [
                 HybridUintConfig::DEFAULT,
                 HYBRID_CANDIDATES[0],
@@ -3864,7 +3877,7 @@ mod sampled_hybrid_tests {
             .collect();
         let pool = ThreadPool::new_lossless(12);
         let populations = parallel_context_populations(
-            &[&tokens],
+            &[TokenSlice::from(&tokens)],
             contexts,
             Some(&pool),
             &mut CoderScratch::lossless(),
@@ -3928,6 +3941,7 @@ mod sampled_hybrid_tests {
                 expected_samples.push(context_map[token.context as usize] as usize, token.value);
             }
             for streams in layouts {
+                let streams: Vec<_> = streams.into_iter().map(TokenSlice::from).collect();
                 for threads in [1, 4, 12] {
                     let pool = ThreadPool::new_lossless(threads);
                     let mut scratch = CoderScratch::lossless();

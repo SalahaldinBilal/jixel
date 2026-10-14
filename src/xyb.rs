@@ -316,6 +316,7 @@ pub(crate) fn selected_to_xyb_band_fn() -> ToXybBandFn {
     *TO_XYB_BAND_FN.get_or_init(select_to_xyb_band_fn)
 }
 
+#[cfg(test)]
 pub(crate) fn to_xyb_with_fn(
     f: ToXybBandFn,
     m: &XybMatrix,
@@ -352,6 +353,41 @@ pub(crate) fn to_xyb_with_fn(
     pool.steal_for_each_mut(scratch, &mut jobs, |_i, job, _scratch| {
         let (input, output) = job.take().unwrap();
         unsafe { f(m, input, output, w) };
+    });
+}
+
+/// Reuse the owned RGB planes for XYB. A worker stages one input row so the
+/// existing SIMD kernels read and write disjoint slices, including scalar tails.
+pub(crate) fn to_xyb_in_place_with_fn(
+    f: ToXybBandFn,
+    m: &XybMatrix,
+    image: &mut Image3F,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) {
+    let w = image.xsize();
+    let mut jobs: Vec<_> = image
+        .row_bands_mut(pool.num_threads())
+        .into_iter()
+        .map(Some)
+        .collect();
+    pool.steal_for_each_mut(scratch, &mut jobs, |_i, job, _scratch| {
+        let [r, g, b] = job.take().unwrap();
+        let mut row = vec![0.0; 3 * w];
+        let (r_in, rest) = row.split_at_mut(w);
+        let (g_in, b_in) = rest.split_at_mut(w);
+        for ((r, g), b) in r
+            .chunks_exact_mut(w)
+            .zip(g.chunks_exact_mut(w))
+            .zip(b.chunks_exact_mut(w))
+        {
+            r_in.copy_from_slice(r);
+            g_in.copy_from_slice(g);
+            b_in.copy_from_slice(b);
+            // SAFETY: dispatch selects supported CPU features. The input row
+            // is staged separately from the three non-overlapping output rows.
+            unsafe { f(m, [r_in, g_in, b_in], [r, g, b], w) };
+        }
     });
 }
 
@@ -764,6 +800,47 @@ mod tests {
             assert_eq!(xyb.plane_data(0)[i], x);
             assert_eq!(xyb.plane_data(1)[i], y);
             assert_eq!(xyb.plane_data(2)[i], b);
+        }
+    }
+
+    #[test]
+    fn in_place_conversion_matches_separate_planes_and_reuses_storage() {
+        for threads in [1, 4] {
+            let pool = ThreadPool::new(threads);
+            let mut scratch = CoderScratch::default();
+            for (w, h) in [(1, 1), (3, 7), (17, 3), (129, 19), (2049, 2)] {
+                let mut linear = Image3F::new(w, h);
+                for c in 0..3 {
+                    for (i, v) in linear.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                        // Include signed and HDR inputs as well as SDR values.
+                        *v = ((i * 97 + c * 13) % 1031) as f32 / 255.0 - 0.5;
+                    }
+                }
+                for f in [scalar_band as ToXybBandFn, selected_to_xyb_band_fn()] {
+                    let mut expected = Image3F::new(w, h);
+                    to_xyb_with_fn(
+                        f,
+                        &XybMatrix::SPEC,
+                        &linear,
+                        &mut expected,
+                        &pool,
+                        &mut scratch,
+                    );
+                    let mut actual = linear.clone();
+                    let pointers = [0, 1, 2].map(|c| actual.plane_data(c).as_ptr());
+                    to_xyb_in_place_with_fn(f, &XybMatrix::SPEC, &mut actual, &pool, &mut scratch);
+                    for (c, pointer) in pointers.into_iter().enumerate() {
+                        assert_eq!(actual.plane_data(c).as_ptr(), pointer);
+                        assert!(
+                            actual
+                                .plane_data(c)
+                                .iter()
+                                .zip(expected.plane_data(c))
+                                .all(|(actual, expected)| actual.to_bits() == expected.to_bits())
+                        );
+                    }
+                }
+            }
         }
     }
 

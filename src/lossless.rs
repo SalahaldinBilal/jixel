@@ -88,8 +88,8 @@ pub(crate) use rct::forward_ycocg;
 use rct::{rank_rcts, rct_planes as rct_planes_fn, write_rct_transform};
 pub(crate) use squeeze::ExtraSqueeze;
 pub(crate) use squeeze::{
-    LmPlainInput, encode_frame_lossy_modular_plain, encode_frame_lossy_modular_squeeze,
-    lm_calibrated_distance, lm_plain_distance,
+    LmPlainInput, dc_frame_supported, encode_dc_frame, encode_frame_lossy_modular_plain,
+    encode_frame_lossy_modular_squeeze, lm_calibrated_distance, lm_plain_distance,
 };
 use squeeze::{encode_squeeze_multigroup, encode_squeeze_single_group};
 use std::sync::{Condvar, Mutex, OnceLock};

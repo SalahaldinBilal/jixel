@@ -29,8 +29,6 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
-mod aq_blur;
-mod aq_loop;
 mod cfl;
 mod color;
 mod dc_ops;
@@ -54,8 +52,6 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_sse41, afv1_sse41, afv2_sse41, afv3_sse41};
-pub(crate) use aq_blur::{blur_horizontal_sse41, blur_vertical_sse41};
-pub(crate) use aq_loop::downsample_rows_sse41;
 pub(crate) use cfl::cfl_rd_cost_sse41;
 pub(crate) use color::color_matrix_shaper_sse41;
 pub(crate) use dc_ops::{adjust_b_dc_sse41, compensate_b_dc_sse41, reconstruct_dc_sse41};

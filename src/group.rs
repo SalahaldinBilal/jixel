@@ -64,70 +64,6 @@ pub(crate) fn rdoq_channel_weights(coding: crate::CodingTransform) -> [f32; 3] {
     }
 }
 
-/// Chroma deadzone narrowing for chromatic 8x8 blocks.
-const CHROMA_DZ_SAT_START: f32 = 0.3;
-const CHROMA_DZ_SAT_WIDTH: f32 = 0.3;
-const CHROMA_DZ_TARGET: f32 = 0.5;
-const CHROMA_DZ_MIN_RELATIVE_ENERGY: f32 = 0.2;
-
-/// Saturation proxy and chroma magnitude of the block mean in XYB, where gray
-/// has X = 0 and B = Y. No RGB conversion is needed.
-#[inline]
-fn chroma_block_saturation(dc: [f32; 3]) -> (f32, f32) {
-    let by = dc[2] - dc[1];
-    let chroma = (dc[0] * dc[0] + by * by).sqrt();
-    ((chroma / dc[1].max(0.02)).min(1.0), chroma)
-}
-
-/// Re-apply the hard-threshold quantizer on an 8x8 chroma block with the
-/// zero thresholds pulled toward [`CHROMA_DZ_TARGET`] by `f` in [0, 1].
-/// Only the single strongest deleted coefficient can change (to +-1), and
-/// only when the deleted AC energy (Parseval: the sum of squared AC
-/// coefficients is the pixel variance for the mean-normalised DCT) is at
-/// least [`CHROMA_DZ_MIN_RELATIVE_ENERGY`] of the block's DC chroma.
-#[allow(clippy::too_many_arguments)]
-fn chroma_deadzone_fixup(
-    c: usize,
-    coeffs: &[f32],
-    inv_qm: &[f32],
-    q_scaled: f32,
-    distance: f32,
-    qm_mul: f32,
-    f: f32,
-    dc_chroma: f32,
-    quantized: &mut [i32],
-) {
-    if f <= 0.0 {
-        return;
-    }
-    // Validate the 8x8 extent once, so the scan needs no per-element bounds checks.
-    let coeffs = &coeffs[..64];
-    let inv_qm = &inv_qm[..64];
-    let quantized = &mut quantized[..64];
-    let thr = quantize_ac_thresholds_scaled(c, 1, 1, distance, qm_mul);
-    let eff: [f32; 4] =
-        std::array::from_fn(|i| (thr[i] - f * (thr[i] - CHROMA_DZ_TARGET)).max(0.5));
-    let mut best = (0.0f32, usize::MAX);
-    let mut deleted = 0.0f32;
-    for i in 1..64 {
-        if quantized[i] != 0 {
-            continue;
-        }
-        let coeff = coeffs[i];
-        deleted += coeff * coeff;
-        let magnitude = (coeff * inv_qm[i] * q_scaled).abs();
-        // Only look up the quadrant threshold when this could become the best.
-        if magnitude > best.0
-            && magnitude >= eff[usize::from(i >= 32) * 2 + usize::from(i % 8 >= 4)]
-        {
-            best = (magnitude, i);
-        }
-    }
-    if best.1 == usize::MAX || deleted.sqrt() < CHROMA_DZ_MIN_RELATIVE_ENERGY * dc_chroma {
-        return;
-    }
-    quantized[best.1] = if coeffs[best.1] < 0.0 { -1 } else { 1 };
-}
 const RDOQ_MAX_CHOICES: usize = 64 * RDOQ_MAX_STRIDE;
 
 const K_GROUP_DIM_IN_BLOCKS: usize = 32;
@@ -280,14 +216,8 @@ fn update_rdoq_state_pair(
 
 /// Trellis window over the scan, and the prefix of it whose levels may be
 /// restored; past that prefix a level only keeps, steps toward zero or drops.
-fn rdoq_window_len(covered_blocks: usize, large_window: bool, distance: f32) -> (usize, usize) {
-    if large_window && covered_blocks >= 8 && distance >= 3.0 {
-        // 32x16: 128, 32x32: 256, 64x32: 512, 64x64: 1024 AC positions.
-        // SS2/CVVDP sweeps found the gain at coarser quality; preserve the
-        // 8/16-family and high-quality quantization budgets.
-        let window = (16 * covered_blocks).min(1024);
-        (window, window)
-    } else if covered_blocks == 1 {
+fn rdoq_window_len(covered_blocks: usize) -> (usize, usize) {
+    if covered_blocks == 1 {
         (63, 20)
     } else {
         (
@@ -358,7 +288,6 @@ fn few_colors(
 #[allow(clippy::too_many_arguments)]
 fn rdoq_block(
     channel_weight: f32,
-    large_window: bool,
     prices: &FrozenTokenPrices,
     scan: &[u32],
     source: &[f32],
@@ -379,7 +308,7 @@ fn rdoq_block(
     costs: &mut [[f32; RDOQ_MAX_STRIDE]; 2],
 ) {
     let covered_blocks = cx * cy;
-    let (window_cap, restore_len) = rdoq_window_len(covered_blocks, large_window, distance);
+    let (window_cap, restore_len) = rdoq_window_len(covered_blocks);
     // The 128 family always takes the banded trellis: the full DP grows with
     // a block's nonzero count, thousands of states over 16384 coefficients.
     let legacy_limit = window_cap <= 64 && !crate::dc_group_data::is_128_strategy(raw_strategy);
@@ -1656,20 +1585,47 @@ pub(crate) struct MemoSnapshot {
     recon: Vec<f32>,
 }
 
+struct RdoqScratch {
+    choices: Box<[u8; RDOQ_MAX_CHOICES]>,
+    costs: HeapMatrix<f32, 2, RDOQ_MAX_STRIDE>,
+}
+
+impl Default for RdoqScratch {
+    fn default() -> Self {
+        Self {
+            choices: heap_array(u8::MAX),
+            costs: HeapMatrix::new(f32::INFINITY),
+        }
+    }
+}
+
+struct ReconScratch {
+    err: Box<[f32; 16384]>,
+    pix: Box<[f32; 16384]>,
+}
+
+impl Default for ReconScratch {
+    fn default() -> Self {
+        Self {
+            err: heap_array(0.0),
+            pix: heap_array(0.0),
+        }
+    }
+}
+
 pub(crate) struct AcGroupScratch {
     coeffs: HeapMatrix<f32, 3, 16384>,
     quantized: HeapMatrix<i32, 3, 16384>,
-    source_y: Box<[f32; 16384]>,
+    /// Saved luma coefficients for RDOQ or reconstruction capture.
+    source_y: Option<Box<[f32; 16384]>>,
     block: Box<[i32; 16384]>,
-    rdoq_choices: Box<[u8; RDOQ_MAX_CHOICES]>,
-    rdoq_costs: HeapMatrix<f32, 2, RDOQ_MAX_STRIDE>,
+    rdoq: Option<RdoqScratch>,
     /// Edge-replicated pixels of a footprint that crosses the image edge.
     gather: Box<[f32; 16384]>,
     /// Distinct source colors, reused across RDOQ blocks and groups.
     few_color_keys: Vec<u64>,
     /// Y coefficient error and its pixel-domain image for the recon capture.
-    recon_err: Box<[f32; 16384]>,
-    recon_pix: Box<[f32; 16384]>,
+    recon: Option<ReconScratch>,
 }
 
 impl Default for AcGroupScratch {
@@ -1677,14 +1633,12 @@ impl Default for AcGroupScratch {
         Self {
             coeffs: HeapMatrix::new(0.0),
             quantized: HeapMatrix::new(0),
-            source_y: heap_array(0.0),
+            source_y: None,
             block: heap_array(0),
-            rdoq_choices: heap_array(u8::MAX),
-            rdoq_costs: HeapMatrix::new(f32::INFINITY),
+            rdoq: None,
             gather: heap_array(0.0),
             few_color_keys: Vec::new(),
-            recon_err: heap_array(0.0),
-            recon_pix: heap_array(0.0),
+            recon: None,
         }
     }
 }
@@ -1694,6 +1648,21 @@ pub(crate) struct SourceDc {
     pub(crate) y: crate::image::Plane<f32>,
     pub(crate) b: crate::image::Plane<f32>,
     pub(crate) x: crate::image::Plane<f32>,
+}
+
+/// The part of quantized coefficient `c` that pass `pass` transmits. Each
+/// pass sends the remainder rounded toward zero (libjxl's split), so a small
+/// coefficient stays zero in the earlier passes instead of landing in every
+/// pass with opposite signs; the decoder sums `sent << shift` over passes.
+#[inline]
+fn pass_coefficient(c: i32, coeff_shifts: &[u32], pass: usize) -> i32 {
+    let mut remaining = c;
+    let mut sent = 0;
+    for &shift in &coeff_shifts[..=pass] {
+        sent = remaining.signum() * (remaining.abs() >> shift);
+        remaining -= sent << shift;
+    }
+    sent
 }
 
 /// Process and tokenize one stripe of an AC group, pushing tokens into `out`.
@@ -1749,7 +1718,6 @@ pub(crate) fn write_ac_group(
 
     let nzeros_by0 = group_brect.y0 % K_GROUP_DIM_IN_BLOCKS;
     let mut chroma_distortion = 0.0f32;
-    let chroma_deadzone = ctx.speed.effort().chroma_deadzone && ctx.coding.is_xyb();
     let cfl_factor_x = crate::color_correlation::dc_cfl_factor_x(dc_step, ctx.cfl_base_x());
 
     // All the big per-block buffers live in the worker scratch: re-creating them
@@ -1761,12 +1729,10 @@ pub(crate) fn write_ac_group(
         quantized,
         source_y,
         block: pblock,
-        rdoq_choices,
-        rdoq_costs,
+        rdoq,
         gather,
         few_color_keys,
-        recon_err,
-        recon_pix,
+        recon: recon_scratch,
     } = scratch;
 
     for by in 0..ysize_blocks {
@@ -2184,6 +2150,7 @@ pub(crate) fn write_ac_group(
                     }
                 } else {
                     if rdoq_prices.is_some() || recon_y.is_some() {
+                        let source_y = source_y.get_or_insert_with(|| heap_array(0.0));
                         source_y[..size].copy_from_slice(&coeffs[1][..size]);
                     }
                     quantize_roundtrip_y_block(
@@ -2199,6 +2166,10 @@ pub(crate) fn write_ac_group(
                         &mut quantized[1][..size],
                     );
                     if let Some(prices) = rdoq_prices {
+                        let RdoqScratch {
+                            choices: rdoq_choices,
+                            costs: rdoq_costs,
+                        } = rdoq.get_or_insert_with(RdoqScratch::default);
                         let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                         let nzero_map = &num_nzeros[0];
                         let row_top = (nz_by != 0).then(|| nzero_map.plane_row(1, nz_by - 1));
@@ -2210,10 +2181,9 @@ pub(crate) fn write_ac_group(
                         );
                         rdoq_block(
                             rdoq_channel_weights(ctx.coding)[1],
-                            ctx.speed.effort().large_transform_rdoq,
                             prices,
                             coeff_orders.scan_for(strategy_code, 1),
-                            &source_y[..size],
+                            &source_y.as_ref().expect("luma saved for RDOQ")[..size],
                             inv_qm_y,
                             quantize_ac_q_scaled(quant_ac, scale, 1.0),
                             &mut quantized[1][..size],
@@ -2247,6 +2217,11 @@ pub(crate) fn write_ac_group(
                 if !hit[1]
                     && let Some((recon, y_off, _)) = recon_y.as_mut()
                 {
+                    let ReconScratch {
+                        err: recon_err,
+                        pix: recon_pix,
+                    } = recon_scratch.get_or_insert_with(ReconScratch::default);
+                    let source_y = source_y.as_ref().expect("luma saved for reconstruction");
                     let y_off = *y_off;
                     for ((e, &q), &src) in recon_err[..size]
                         .iter_mut()
@@ -2421,16 +2396,6 @@ pub(crate) fn write_ac_group(
                 }
 
                 // ---- X channel: write post-CfL DC, quantize AC ----
-                let (dz_f, dz_dc_chroma) = if chroma_deadzone && covered_dc == 1 {
-                    let (sat, chroma) =
-                        chroma_block_saturation([dc_vals[0][0], dc_vals[1][0], dc_vals[2][0]]);
-                    (
-                        ((sat - CHROMA_DZ_SAT_START) / CHROMA_DZ_SAT_WIDTH).clamp(0.0, 1.0),
-                        chroma,
-                    )
-                } else {
-                    (0.0, 0.0)
-                };
                 let inv_qm_x: &[f32] = match raw_strategy {
                     STRATEGY_DCT => &matrices.inv_matrix(0)[..],
                     STRATEGY_IDENTITY => &matrices.inv_matrix_identity(0)[..],
@@ -2485,17 +2450,6 @@ pub(crate) fn write_ac_group(
                         cy,
                         &mut quantized[0][..size],
                     );
-                    chroma_deadzone_fixup(
-                        0,
-                        &coeffs[0][..size],
-                        inv_qm_x,
-                        quantize_ac_q_scaled(quant_ac, scale, x_qm_mul),
-                        distance,
-                        x_qm_mul,
-                        dz_f,
-                        dz_dc_chroma,
-                        &mut quantized[0][..size],
-                    );
                     // Chroma RDOQ (review §8): the trellis is channel-generic — the
                     // CfL residuals are the source, contexts/prices/orders are
                     // channel-specific, and unlike Y the input coefficients are not
@@ -2503,6 +2457,10 @@ pub(crate) fn write_ac_group(
                     // transform's calibrated weights and the distance-scheduled X/B
                     // multiplier (`chroma_rdoq_weight`).
                     if let Some(prices) = rdoq_prices {
+                        let RdoqScratch {
+                            choices: rdoq_choices,
+                            costs: rdoq_costs,
+                        } = rdoq.get_or_insert_with(RdoqScratch::default);
                         let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                         let nzero_map = &num_nzeros[0];
                         let row_top = (nz_by != 0).then(|| nzero_map.plane_row(0, nz_by - 1));
@@ -2514,7 +2472,6 @@ pub(crate) fn write_ac_group(
                         );
                         rdoq_block(
                             rdoq_channel_weights(ctx.coding)[0],
-                            ctx.speed.effort().large_transform_rdoq,
                             prices,
                             coeff_orders.scan_for(strategy_code, 0),
                             &coeffs[0][..size],
@@ -2596,18 +2553,11 @@ pub(crate) fn write_ac_group(
                         cy,
                         &mut quantized[2][..size],
                     );
-                    chroma_deadzone_fixup(
-                        2,
-                        &coeffs[2][..size],
-                        inv_qm_b,
-                        quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul()),
-                        distance,
-                        ctx.b_qm_mul(),
-                        dz_f,
-                        dz_dc_chroma,
-                        &mut quantized[2][..size],
-                    );
                     if let Some(prices) = rdoq_prices {
+                        let RdoqScratch {
+                            choices: rdoq_choices,
+                            costs: rdoq_costs,
+                        } = rdoq.get_or_insert_with(RdoqScratch::default);
                         let strategy_code = dc_data.ac_strategy.strategy_code(global_bx, global_by);
                         let nzero_map = &num_nzeros[0];
                         let row_top = (nz_by != 0).then(|| nzero_map.plane_row(2, nz_by - 1));
@@ -2619,7 +2569,6 @@ pub(crate) fn write_ac_group(
                         );
                         rdoq_block(
                             rdoq_channel_weights(ctx.coding)[2],
-                            ctx.speed.effort().large_transform_rdoq,
                             prices,
                             coeff_orders.scan_for(strategy_code, 2),
                             &coeffs[2][..size],
@@ -2673,6 +2622,10 @@ pub(crate) fn write_ac_group(
                 // CfL was applied against the dequantized Y, so the decoder's chroma
                 // error is the residual's own quantization error.
                 if let Some((recon, y_off, _)) = recon_y.as_mut() {
+                    let ReconScratch {
+                        err: recon_err,
+                        pix: recon_pix,
+                    } = recon_scratch.get_or_insert_with(ReconScratch::default);
                     let y_off = *y_off;
                     let q_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
                     let q_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
@@ -2807,19 +2760,12 @@ pub(crate) fn write_ac_group(
                     // Materialize the coefficients pass `pass` transmits. With
                     // decreasing per-pass shifts ending at 0, the decoder sums
                     // (sent_p << shift_p) over passes to recover `full_block`
-                    // (jxl-vardct hf_coeff.rs:185,191). For 2 passes/shifts
-                    // [s,0]: pass0 = C>>s, pass1 = C-((C>>s)<<s).
+                    // (jxl-vardct hf_coeff.rs:185,191).
                     let block = if pass == 0 && coeff_shifts[0] == 0 {
                         full_block
                     } else {
                         for k in 0..size {
-                            let mut remaining = full_block[k];
-                            let mut sent = 0i32;
-                            for p in 0..=pass {
-                                sent = remaining >> coeff_shifts[p];
-                                remaining -= sent << coeff_shifts[p];
-                            }
-                            pblock[k] = sent;
+                            pblock[k] = pass_coefficient(full_block[k], coeff_shifts, pass);
                         }
                         &pblock[..size]
                     };
@@ -2993,6 +2939,159 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ac_scratch_allocates_optional_buffers_only_for_active_tools_and_reuses_them() {
+        use super::{AcGroupScratch, write_ac_group};
+        use crate::coeff_order::CoeffOrders;
+        use crate::dc_group_data::DcGroupData;
+        use crate::encoding_context::EncodingContext;
+        use crate::entropy::{FrozenTokenPrices, Token, build_entropy_code_no_cluster};
+        use crate::image::{Image3B, Image3F, Image3S, Rect};
+
+        let (w, h) = (17, 19);
+        let mut image = Image3F::new(w, h);
+        for c in 0..3 {
+            for (i, value) in image.plane_mut(c).as_mut_slice().iter_mut().enumerate() {
+                *value = ((i * 97 + c * 13) % 257) as f32 / 257.0;
+            }
+        }
+        let mut dc = DcGroupData::new(w.div_ceil(8), h.div_ceil(8)).unwrap();
+        dc.raw_quant_field.as_mut_slice().fill(8);
+        let orders = CoeffOrders::natural();
+        let samples: Vec<_> = (0..4096).map(|i| Token::new(i % 2, i % 17)).collect();
+        let mut code = build_entropy_code_no_cluster(&samples, 2, &mut Vec::new());
+        code.context_map = (0..crate::ac_context::K_NUM_FINE_AC_CONTEXTS)
+            .map(|i| (i % 2) as u8)
+            .collect();
+        let prices = FrozenTokenPrices::new(&code);
+        let run = |ctx: &EncodingContext,
+                   scratch: &mut AcGroupScratch,
+                   rdoq: bool,
+                   capture: bool,
+                   shifts: &[u32]| {
+            let mut quant_dc = Image3S::new(w.div_ceil(8), h.div_ceil(8));
+            let mut nzeros: Vec<_> = shifts.iter().map(|_| Image3B::new(32, 32)).collect();
+            let mut tokens: Vec<_> = shifts.iter().map(|_| Vec::new()).collect();
+            let mut recon = Image3F::new(w, h);
+            let mut starts = Vec::new();
+            write_ac_group(
+                ctx,
+                scratch,
+                &image,
+                (0, 0),
+                Rect::new(0, 0, w.div_ceil(8), h.div_ceil(8)),
+                1.0,
+                1.0,
+                [1.0; 3],
+                2.0,
+                2,
+                &dc,
+                0,
+                &mut quant_dc,
+                None,
+                0,
+                0,
+                &mut nzeros,
+                shifts,
+                rdoq.then_some(&prices),
+                &orders,
+                &[],
+                None,
+                false,
+                8,
+                capture.then_some((&mut recon, 0, &mut starts)),
+                None,
+                &mut tokens,
+            );
+            (
+                tokens
+                    .into_iter()
+                    .map(|stream| {
+                        stream
+                            .into_iter()
+                            .map(|t| (t.context, t.value))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+                [0, 1, 2].map(|c| {
+                    recon
+                        .plane_data(c)
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                }),
+            )
+        };
+        let pointers = |scratch: &AcGroupScratch| {
+            (
+                scratch.source_y.as_ref().map(|v| v.as_ptr()),
+                scratch
+                    .rdoq
+                    .as_ref()
+                    .map(|v| (v.choices.as_ptr(), v.costs[0].as_ptr())),
+                scratch
+                    .recon
+                    .as_ref()
+                    .map(|v| (v.err.as_ptr(), v.pix.as_ptr())),
+            )
+        };
+        for speed in [
+            crate::Speed::UltraFast,
+            crate::Speed::Fastest,
+            crate::Speed::Fast,
+            crate::Speed::Medium,
+        ] {
+            let ctx = EncodingContext::new(
+                speed,
+                crate::Arbiter::Ssimulacra2,
+                crate::xyb::XybMatrix::SPEC,
+                2.0,
+                1,
+            );
+            let mut scratch = AcGroupScratch::default();
+            for shifts in [&[0u32][..], &[2, 0]] {
+                run(&ctx, &mut scratch, false, false, shifts);
+                assert_eq!(pointers(&scratch), (None, None, None));
+            }
+        }
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            2.0,
+            1,
+        );
+        for (rdoq, capture) in [(true, false), (false, true), (true, true)] {
+            let mut scratch = AcGroupScratch::default();
+            for shifts in [&[0u32][..], &[2, 0]] {
+                let expected = run(&ctx, &mut scratch, rdoq, capture, shifts);
+                assert!(scratch.source_y.is_some());
+                assert_eq!(scratch.rdoq.is_some(), rdoq);
+                assert_eq!(scratch.recon.is_some(), capture);
+                let storage = pointers(&scratch);
+                assert_eq!(run(&ctx, &mut scratch, rdoq, capture, shifts), expected);
+                assert_eq!(pointers(&scratch), storage);
+                let mut fresh = AcGroupScratch::default();
+                assert_eq!(run(&ctx, &mut fresh, rdoq, capture, shifts), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn pass_split_sums_back_and_rounds_toward_zero() {
+        for shifts in [&[1, 0][..], &[2, 0], &[3, 0], &[2, 1, 0], &[3, 2, 1, 0]] {
+            for c in -40..=40 {
+                let sent: Vec<i32> = (0..shifts.len())
+                    .map(|p| super::pass_coefficient(c, shifts, p))
+                    .collect();
+                let sum: i32 = sent.iter().zip(shifts).map(|(&v, &s)| v << s).sum();
+                assert_eq!(sum, c, "{shifts:?} {c}");
+                assert!(sent.iter().all(|&v| v == 0 || v.signum() == c.signum()));
+                assert_eq!(sent[0], c.signum() * (c.abs() >> shifts[0]));
+            }
+        }
+    }
+
+    #[test]
     fn few_colors_counts_distinct_source_colors() {
         use crate::image::Image3F;
         let mut xyb = Image3F::new(16, 8);
@@ -3020,9 +3119,8 @@ mod tests {
     }
 
     use super::{
-        QuantizeDcMethods, chroma_block_saturation, chroma_deadzone_fixup, quantize_ac_thresholds,
-        quantize_ac_thresholds_scaled, quantize_dc_cfl_scalar, quantize_dc_scalar,
-        selected_quantize_dc_methods,
+        QuantizeDcMethods, quantize_ac_thresholds, quantize_ac_thresholds_scaled,
+        quantize_dc_cfl_scalar, quantize_dc_scalar, selected_quantize_dc_methods,
     };
 
     #[test]
@@ -3162,7 +3260,6 @@ mod tests {
             let run = |block: &mut [i32], choices: &mut _, costs: &mut _| {
                 super::rdoq_block(
                     super::rdoq_channel_weights(coding)[c],
-                    false,
                     &prices,
                     &scan,
                     &source,
@@ -3194,24 +3291,16 @@ mod tests {
         );
     }
     #[test]
-    fn rdoq_window_policy_is_coarse_quality_and_large_transform_only() {
+    fn rdoq_window_policy() {
         for covered in [1, 2, 4, 8, 16, 32, 64] {
             // Past the restoring prefix a multi-block window only lowers levels.
-            let base = if covered == 1 {
+            let expected = if covered == 1 {
                 (63, 20)
             } else {
                 ((64 * covered).min(1024), (24 * covered).min(256))
             };
-            assert_eq!(super::rdoq_window_len(covered, false, 8.), base);
-            assert_eq!(super::rdoq_window_len(covered, true, 2.999), base);
-            let large = (16 * covered).min(1024);
-            assert_eq!(
-                super::rdoq_window_len(covered, true, 3.),
-                if covered >= 8 { (large, large) } else { base }
-            );
+            assert_eq!(super::rdoq_window_len(covered), expected);
         }
-        assert!(!crate::Speed::Slow.effort().large_transform_rdoq);
-        assert!(crate::Speed::ExtraSlow.effort().large_transform_rdoq);
     }
 
     #[test]
@@ -3304,7 +3393,6 @@ mod tests {
             };
             super::rdoq_block(
                 super::rdoq_channel_weights(coding)[c],
-                false,
                 &prices,
                 &scan,
                 &source,
@@ -3324,8 +3412,7 @@ mod tests {
                 &mut fresh_choices,
                 &mut fresh_costs,
             );
-            let (window, restore) =
-                super::rdoq_window_len(cx * cy, false, [1., 2., 3., 4.][case % 4]);
+            let (window, restore) = super::rdoq_window_len(cx * cy);
             run(&mut actual, &mut choices, &mut costs, window, restore);
             assert_eq!(actual, expected, "scratch reuse in case {case}");
             changed += usize::from(actual != original);
@@ -3805,196 +3892,6 @@ mod tests {
                     assert_eq!(got, want, "wide CfL length {len}, scale={scale}, cfl={cfl}");
                 }
             }
-        }
-    }
-
-    #[test]
-    fn chroma_block_saturation_is_zero_for_gray() {
-        assert_eq!(chroma_block_saturation([0.0, 0.5, 0.5]), (0.0, 0.0));
-        let (sat, chroma) = chroma_block_saturation([0.03, 0.5, 0.3]);
-        assert!((chroma - (0.0009f32 + 0.04).sqrt()).abs() < 1e-6);
-        assert!((sat - chroma / 0.5).abs() < 1e-6);
-        assert_eq!(chroma_block_saturation([0.5, 0.01, 0.9]).0, 1.0);
-    }
-
-    #[test]
-    fn chroma_deadzone_restores_one_strongest_deleted_coefficient() {
-        let inv_qm = [1.0f32; 64];
-        let mut coeffs = [0.0f32; 64];
-        coeffs[0] = 0.9; // DC is never touched
-        coeffs[3] = 0.6;
-        coeffs[10] = -0.7;
-        coeffs[20] = 0.3;
-        // X thresholds at d2: [0.58, 0.715, 0.74, 0.78]; every candidate is
-        // below its threshold, so the plain quantizer deletes all of them.
-        let thr = quantize_ac_thresholds_scaled(0, 1, 1, 2.0, 1.0);
-        assert!(thr[0] > 0.5 && thr[1] > 0.715 - 1e-6);
-        let run = |coeffs: &[f32; 64], f: f32, dc_chroma: f32| {
-            let mut q = [0i32; 64];
-            chroma_deadzone_fixup(0, coeffs, &inv_qm, 1.0, 2.0, 1.0, f, dc_chroma, &mut q);
-            q
-        };
-        assert_eq!(run(&coeffs, 0.0, 1.0), [0; 64]);
-        let q = run(&coeffs, 1.0, 1.0);
-        assert_eq!(q[10], -1);
-        assert_eq!(q.iter().filter(|&&v| v != 0).count(), 1);
-        // Deleted energy sqrt(0.36 + 0.49 + 0.09) = 0.97 < 0.2 * 10.
-        assert_eq!(run(&coeffs, 1.0, 10.0), [0; 64]);
-        // Partial pull: eff = 0.58 - 0.5 * 0.08 = 0.54, so 0.7 still qualifies.
-        assert_eq!(run(&coeffs, 0.5, 1.0)[10], -1);
-        // Below plain rounding nothing is restored even at full pull.
-        coeffs[10] = -0.45;
-        coeffs[3] = 0.45;
-        assert_eq!(run(&coeffs, 1.0, 1.0), [0; 64]);
-    }
-
-    #[test]
-    fn chroma_deadzone_preserves_threshold_boundaries_and_ties() {
-        // Disabled fixup must return before accessing the slices.
-        chroma_deadzone_fixup(0, &[], &[], 1.0, 2.0, 1.0, 0.0, 0.0, &mut []);
-
-        let inv_qm = [1.0f32; 65];
-        let thr = quantize_ac_thresholds_scaled(0, 1, 1, 2.0, 1.0);
-        for i in 1..64 {
-            let t = thr[usize::from(i >= 32) * 2 + usize::from(i % 8 >= 4)];
-            let t = (t - 0.5 * (t - super::CHROMA_DZ_TARGET)).max(0.5);
-            for magnitude in [t.next_down(), t] {
-                let mut coeffs = [0.0; 65];
-                coeffs[i] = -magnitude;
-                coeffs[0] = 10.0;
-                coeffs[64] = 10.0;
-                let mut quantized = [0; 65];
-                chroma_deadzone_fixup(0, &coeffs, &inv_qm, 1.0, 2.0, 1.0, 0.5, 0.0, &mut quantized);
-                let mut expected = [0; 65];
-                if magnitude == t {
-                    expected[i] = -1;
-                }
-                assert_eq!(quantized, expected, "threshold at AC index {i}");
-            }
-        }
-
-        let mut coeffs = [0.0; 65];
-        coeffs[1] = -0.75;
-        coeffs[63] = 0.75;
-        let mut quantized = [0; 65];
-        chroma_deadzone_fixup(0, &coeffs, &inv_qm, 1.0, 2.0, 1.0, 1.0, 0.0, &mut quantized);
-        assert_eq!(quantized[1], -1);
-        assert_eq!(quantized[63], 0);
-        // Existing nonzero coefficients must neither change nor add deleted energy.
-        coeffs[1] = 100.0;
-        chroma_deadzone_fixup(
-            0,
-            &coeffs,
-            &inv_qm,
-            1.0,
-            2.0,
-            1.0,
-            1.0,
-            10.0,
-            &mut quantized,
-        );
-        assert_eq!(quantized[1], -1);
-        assert_eq!(quantized[63], 0);
-    }
-
-    #[test]
-    fn chroma_deadzone_matches_original_scan() {
-        // Keep the original scan as a reference for operation order, NaNs,
-        // ties, and rounding near the relative-energy cutoff.
-        let reference = |c,
-                         coeffs: &[f32],
-                         inv_qm: &[f32],
-                         q_scaled: f32,
-                         distance: f32,
-                         qm_mul: f32,
-                         f: f32,
-                         dc_chroma: f32,
-                         quantized: &mut [i32]| {
-            if f <= 0.0 {
-                return;
-            }
-            let thr = quantize_ac_thresholds_scaled(c, 1, 1, distance, qm_mul);
-            let eff: [f32; 4] =
-                std::array::from_fn(|i| (thr[i] - f * (thr[i] - super::CHROMA_DZ_TARGET)).max(0.5));
-            let mut best = (0.0f32, usize::MAX);
-            let mut deleted = 0.0f32;
-            for i in 1..64 {
-                if quantized[i] != 0 {
-                    continue;
-                }
-                deleted += coeffs[i] * coeffs[i];
-                let t = eff[usize::from(i >= 32) * 2 + usize::from(i % 8 >= 4)];
-                let ideal = coeffs[i] * inv_qm[i] * q_scaled;
-                if ideal.abs() >= t && ideal.abs() > best.0 {
-                    best = (ideal.abs(), i);
-                }
-            }
-            if best.1 == usize::MAX
-                || deleted.sqrt() < super::CHROMA_DZ_MIN_RELATIVE_ENERGY * dc_chroma
-            {
-                return;
-            }
-            quantized[best.1] = if coeffs[best.1] < 0.0 { -1 } else { 1 };
-        };
-
-        let mut seed = 73u32;
-        let mut random = || {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            (seed >> 8) as f32 / (1u32 << 24) as f32
-        };
-        for case in 0..8192 {
-            let c = case % 3;
-            let mut coeffs: [f32; 64] = std::array::from_fn(|_| 4.0 * random() - 2.0);
-            let inv_qm: [f32; 64] = std::array::from_fn(|_| 0.125 + 3.0 * random());
-            let zero_fraction = [0.0, 0.1, 0.5, 0.9, 1.0][case % 5];
-            let mut actual: [i32; 64] =
-                std::array::from_fn(|_| if random() < zero_fraction { 0 } else { -2 });
-            if case % 8 == 0 {
-                coeffs[1 + case % 63] =
-                    [0.0, -0.0, f32::INFINITY, f32::NEG_INFINITY, f32::NAN][case / 8 % 5];
-            }
-            let mut expected = actual;
-            let q_scaled = [0.0, 0.125, 0.5, 1.0, 4.0, f32::NAN][case % 6];
-            let distance = 0.1 + 3.0 * random();
-            let qm_mul = [0.8, 1.0, 1.25][case / 3 % 3];
-            let f = [0.0, 0.25, 0.5, 1.0, f32::NAN][case / 5 % 5];
-            let deleted = (1..64)
-                .filter(|&i| actual[i] == 0)
-                .fold(0.0f32, |sum, i| sum + coeffs[i] * coeffs[i]);
-            let cutoff = deleted.sqrt() / super::CHROMA_DZ_MIN_RELATIVE_ENERGY;
-            let dc_chroma = [
-                0.0,
-                cutoff.next_down(),
-                cutoff,
-                cutoff.next_up(),
-                f32::NAN,
-                100.0 * random(),
-            ][case / 6 % 6];
-            reference(
-                c,
-                &coeffs,
-                &inv_qm,
-                q_scaled,
-                distance,
-                qm_mul,
-                f,
-                dc_chroma,
-                &mut expected,
-            );
-            chroma_deadzone_fixup(
-                c,
-                &coeffs,
-                &inv_qm,
-                q_scaled,
-                distance,
-                qm_mul,
-                f,
-                dc_chroma,
-                &mut actual,
-            );
-            assert_eq!(actual, expected, "case {case}");
         }
     }
 

@@ -40,7 +40,9 @@
 // Run the djxl pixel-identity oracle before trusting format-bearing changes end
 // to end.
 
+use super::TokenSlice;
 use super::histogram::Histogram;
+#[cfg(test)]
 use super::token::Token;
 use crate::bit_writer::BitWriter;
 use crate::entropy::dlog2::{f_fmla, f_log2};
@@ -563,21 +565,22 @@ impl AnsCoder {
 
 const ANS_NO_EMIT: u32 = u32::MAX;
 
-pub(crate) fn write_ans_tokens(
-    tokens: &[Token],
+pub(crate) fn write_ans_tokens<'a>(
+    tokens: impl Into<TokenSlice<'a>>,
     context_map: &[u8],
     symbol_info: &[Vec<AnsEncSymbolInfo>],
     reverse_maps: &[u16],
     hybrid_uint_configs: &[super::token::HybridUintConfig],
     w: &mut BitWriter,
 ) {
+    let tokens = tokens.into();
     // The reverse ANS traversal records, per token, the renormalization word
     // (or `ANS_NO_EMIT`) in the high half and the extra bits in the low half,
     // with the extra-bit count alongside, so the forward pass only writes.
     let mut emitted: Vec<u64> = Vec::with_capacity(tokens.len());
     let mut extra_bits: Vec<u8> = Vec::with_capacity(tokens.len());
     let mut coder = AnsCoder::new();
-    for t in tokens.iter().rev() {
+    tokens.iter().rev().for_each(|t| {
         let hist = context_map[t.context as usize] as usize;
         let (sym, nbits, bits) =
             super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist]);
@@ -588,7 +591,7 @@ pub(crate) fn write_ans_tokens(
         );
         emitted.push((u64::from(word.map_or(ANS_NO_EMIT, u32::from)) << 32) | u64::from(bits));
         extra_bits.push(nbits as u8);
-    }
+    });
     w.write(32, coder.state() as u64);
     for (&packed, &nbits) in emitted.iter().rev().zip(extra_bits.iter().rev()) {
         let word = (packed >> 32) as u32;
@@ -602,16 +605,17 @@ pub(crate) fn write_ans_tokens(
 }
 
 #[cfg(test)]
-pub(crate) fn ans_tokens_bits(
-    tokens: &[Token],
+pub(crate) fn ans_tokens_bits<'a>(
+    tokens: impl Into<TokenSlice<'a>>,
     context_map: &[u8],
     symbol_info: &[Vec<AnsEncSymbolInfo>],
     reverse_maps: &[u16],
     hybrid_uint_configs: &[super::token::HybridUintConfig],
 ) -> usize {
+    let tokens = tokens.into();
     let mut coder = AnsCoder::new();
     let mut bits = 32usize;
-    for t in tokens.iter().rev() {
+    tokens.iter().rev().for_each(|t| {
         let hist = context_map[t.context as usize] as usize;
         let (sym, nbits, _) =
             super::token::uint_encode_with_config(t.value, hybrid_uint_configs[hist]);
@@ -624,7 +628,7 @@ pub(crate) fn ans_tokens_bits(
             bits += 16;
         }
         bits += nbits as usize;
-    }
+    });
     bits
 }
 
@@ -639,16 +643,17 @@ pub(crate) struct AnsTokenCodeRef<'a> {
 /// Count two ANS streams in one traversal, sharing symbolization when their
 /// configurations agree. Reclustering may choose different configurations,
 /// so each state must use its own symbol and extra-bit count in that case.
-pub(crate) fn ans_tokens_bits_pair(
-    tokens: &[Token],
+pub(crate) fn ans_tokens_bits_pair<'a>(
+    tokens: impl Into<TokenSlice<'a>>,
     first: &AnsTokenCodeRef<'_>,
     second: &AnsTokenCodeRef<'_>,
 ) -> (usize, usize) {
+    let tokens = tokens.into();
     let mut first_coder = AnsCoder::new();
     let mut second_coder = AnsCoder::new();
     let mut first_bits = 32usize;
     let mut second_bits = 32usize;
-    for token in tokens.iter().rev() {
+    tokens.iter().rev().for_each(|token| {
         let context = token.context as usize;
         let first_hist = first.context_map[context] as usize;
         let second_hist = second.context_map[context] as usize;
@@ -685,7 +690,7 @@ pub(crate) fn ans_tokens_bits_pair(
         }
         first_bits += nbits as usize;
         second_bits += second_nbits as usize;
-    }
+    });
     (first_bits, second_bits)
 }
 

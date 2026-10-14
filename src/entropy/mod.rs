@@ -37,6 +37,7 @@ mod histogram;
 mod huffman_tree;
 mod prefix_code;
 mod token;
+mod token_stream;
 mod write;
 
 pub(crate) use ans::{
@@ -55,6 +56,7 @@ pub(crate) use prefix_code::{ALPHABET_SIZE, PrefixCode, convert_bit_depths_to_sy
 pub(crate) use token::{
     CompactToken, HybridUintConfig, Token, pack_signed, uint_encode, uint_encode_with_config,
 };
+pub(crate) use token_stream::{AcTokens, TokenSlice};
 #[cfg(any(feature = "splines", test))]
 pub(crate) use write::optimize_entropy_code_ac;
 pub(crate) use write::{

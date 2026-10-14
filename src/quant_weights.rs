@@ -217,7 +217,11 @@ fn scaled_override<const N: usize>(defaults: &[[f32; N]; 3], scale: f32) -> Band
 
 /// [`scaled_override`] whose luma band ratios are scaled geometrically so the
 /// last band ends `luma_hf` times the spec weight relative to the base.
-fn tilted_override<const N: usize>(defaults: &[[f32; N]; 3], scale: f32, luma_hf: f32) -> BandOverride {
+fn tilted_override<const N: usize>(
+    defaults: &[[f32; N]; 3],
+    scale: f32,
+    luma_hf: f32,
+) -> BandOverride {
     let mut out = scaled_override(defaults, scale);
     let step = luma_hf.powf(1.0 / (N as f32 - 1.0));
     for i in 1..N {
@@ -1940,7 +1944,11 @@ struct LargeTables {
 
 fn dct16_override(use_ss2: bool, tilt: Option<Arbiter>) -> Option<BandOverride> {
     match tilt {
-        Some(a) => Some(tilted_override(&DCT16X16_BANDS, QM_SS2_SCALE16, a.tuning().dct16_luma_hf)),
+        Some(a) => Some(tilted_override(
+            &DCT16X16_BANDS,
+            QM_SS2_SCALE16,
+            a.tuning().dct16_luma_hf,
+        )),
         None => use_ss2.then(|| scaled_override(&DCT16X16_BANDS, QM_SS2_SCALE16)),
     }
 }

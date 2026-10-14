@@ -92,8 +92,6 @@ effort_gates! {
     /// SSIM reconstruction rerank at every distance (otherwise high quality only).
     full_rerank,
     dct64,
-    /// Wider AC trellis for 32/64-family transforms at distance >= 3.
-    large_transform_rdoq,
     fine_mosaic,
     learned_rate,
     /// Chroma content analysis and every policy it drives: saturated/pair-B/x-heavy
@@ -107,7 +105,6 @@ effort_gates! {
     /// the closed loop's exact SSIMULACRA2 arbiter.
     layout_loop,
     cfl_rdo,
-    chroma_deadzone,
     yellow_opsin,
     coeff_orders,
     /// Race frequency-derived coefficient orders against natural scans using
@@ -225,7 +222,6 @@ const SLOW: Effort = Effort {
     layout_loop: false,
     coeff_order_entropy_race: false,
     dc_cfl_weighted: false,
-    large_transform_rdoq: false,
     rdoq_fresh_prices: false,
     ans_exhaustive: false,
     lz_exhaustive_entropy: false,

@@ -29,8 +29,6 @@
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
-mod aq_blur;
-mod aq_loop;
 mod cfl;
 mod color;
 mod dc_ops;
@@ -46,7 +44,6 @@ mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
 mod splines;
-mod ssimulacra2;
 mod xyb;
 mod yellow_opsin;
 mod ytob;
@@ -57,8 +54,6 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::{chroma_hf_stats_neon, fill_quant_field};
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
-pub(crate) use aq_blur::{blur_horizontal_neon, blur_vertical_neon};
-pub(crate) use aq_loop::downsample_rows_neon;
 pub(crate) use cfl::{
     apply_cfl_neon, cfl_rd_cost_neon, cfl_rdo_block_neon, cfl_rdo_stats_neon, cfl_regression_neon,
 };
@@ -95,7 +90,6 @@ pub(crate) use quant::{
 pub(crate) use quantize_xyb::{
     quantize_xyb_channels_neon, quantize_xyb_tile_colors_neon, round_lattice_pow2_neon,
 };
-pub(crate) use ssimulacra2::{ss2_contribution_neon, ss2_expand_row_neon};
 pub(crate) use xyb::{to_linear_rows_neon, to_xyb_neon_band};
 pub(crate) use yellow_opsin::sampled_b_gradient_ratio_neon;
 pub(crate) use ytob::{accumulate_ytob_weights_neon, fill_ytob_residuals_neon, fill_ytob_row_neon};

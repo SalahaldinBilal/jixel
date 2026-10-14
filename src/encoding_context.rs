@@ -57,6 +57,14 @@ pub(crate) struct EncodingContext {
     pub(crate) speed: Speed,
     /// Lossy arm selection from the public config
     pub(crate) lossy_modular: crate::LossyModular,
+    /// Code VarDCT frames' DC as a separate DC frame (see
+    /// `EncodeConfig::progressive_dc`).
+    pub(crate) progressive_dc: bool,
+    /// Squeeze levels of the DC frame (see
+    /// `EncodeConfig::progressive_dc_levels`).
+    pub(crate) progressive_dc_levels: Option<u32>,
+    /// Codestream order of the VarDCT groups (see `EncodeConfig::group_order`).
+    pub(crate) group_order: crate::GroupOrder,
     /// Metric the lossy decisions are tuned for (see [`crate::Arbiter`]).
     pub(crate) arbiter: crate::Arbiter,
     /// Experimental spline coding (see `EncodeConfig::splines`).
@@ -442,6 +450,9 @@ impl EncodingContext {
             thread_pool: ThreadPool::new(num_threads),
             speed,
             lossy_modular: crate::LossyModular::Off,
+            progressive_dc: false,
+            progressive_dc_levels: None,
+            group_order: crate::GroupOrder::Scanline,
             arbiter,
             #[cfg(feature = "splines")]
             splines: false,

@@ -384,6 +384,22 @@ pub struct EncodeConfig {
     pub decoding_speed: DecodingSpeed,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
+    /// Progressive DC for lossy VarDCT: the 1:8 DC image is coded as its own
+    /// squeezed modular frame ahead of the main frame, so a decoder can show
+    /// previews refining from 1:256 to 1:8 before any AC data arrives.
+    /// Costs some size. XYB frames without alpha only; other frames ignore it.
+    /// Defaults to false.
+    pub progressive_dc: bool,
+    /// Squeeze levels of the progressive DC frame, finest first; each level
+    /// halves the preview resolution. `None` (default) squeezes down to an
+    /// 8x8 preview. `Some(n)` keeps the `n` finest levels, clamped to between
+    /// one and the most the image allows; fewer levels give fewer, larger
+    /// previews. A single level costs noticeably more size; two or more cost
+    /// about the same as the full pyramid. Used only with `progressive_dc`.
+    pub progressive_dc_levels: Option<u32>,
+    /// Codestream order of the lossy VarDCT groups (see [`GroupOrder`]).
+    /// Default [`GroupOrder::Scanline`].
+    pub group_order: GroupOrder,
     /// Choose VarDCT transforms by what each candidate costs under the
     /// image's own coefficient statistics instead of a fixed rate model.
     /// Patterned and synthetic content compresses much better; photographs
@@ -397,6 +413,24 @@ pub struct EncodeConfig {
     pub gain_map: Option<GainMap>,
     /// Color transform of lossy frames (see [`CodingTransform`]).
     pub coding_transform: CodingTransform,
+}
+
+/// Order in which a lossy VarDCT frame stores its groups. A progressive
+/// decoder renders groups as they arrive, so this is the order the image
+/// fills in. Costs a few bytes for the signaled permutation; the pixels are
+/// identical.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupOrder {
+    /// Row by row from the top left (the default).
+    #[default]
+    Scanline,
+    /// Rings around the image center, each swept clockwise from the top;
+    /// with several passes, every pass fills in from the center again.
+    CenterFirst,
+    /// Both corner-to-corner diagonals first, growing out from the center,
+    /// then bands ever farther from them: the image draws an X that
+    /// thickens until it fills the frame.
+    Diagonals,
 }
 
 /// Which arm the **lossy** encoder uses. Besides VarDCT, jixel carries a lossy
@@ -498,6 +532,9 @@ impl Default for EncodeConfig {
             arbiter: Arbiter::Ssimulacra2,
             decoding_speed: DecodingSpeed::Slow,
             lossy_modular: LossyModular::Off,
+            progressive_dc: false,
+            progressive_dc_levels: None,
+            group_order: GroupOrder::Scanline,
             learned_rate: true,
             gain_map: None,
             coding_transform: CodingTransform::Xyb,
@@ -833,6 +870,26 @@ impl EncodeConfig {
         self
     }
 
+    /// Code the lossy DC as a progressive DC frame (see
+    /// [`EncodeConfig::progressive_dc`]).
+    pub fn with_progressive_dc(mut self, progressive_dc: bool) -> Self {
+        self.progressive_dc = progressive_dc;
+        self
+    }
+
+    /// Store the lossy VarDCT groups in `order` (see [`GroupOrder`]).
+    pub fn with_group_order(mut self, order: GroupOrder) -> Self {
+        self.group_order = order;
+        self
+    }
+
+    /// Limit the progressive DC frame to its `levels` finest squeeze levels
+    /// (see [`EncodeConfig::progressive_dc_levels`]).
+    pub fn with_progressive_dc_levels(mut self, levels: u32) -> Self {
+        self.progressive_dc_levels = Some(levels);
+        self
+    }
+
     /// Price VarDCT transform candidates by the image's own coefficient
     /// statistics (see [`EncodeConfig::learned_rate`]).
     pub fn with_learned_rate(mut self, learned_rate: bool) -> Self {
@@ -929,6 +986,9 @@ pub(crate) fn lossy_context(
     };
     let mut ctx = EncodingContext::new(config.speed, config.arbiter, xyb, distance, num_threads);
     ctx.lossy_modular = config.lossy_modular;
+    ctx.progressive_dc = config.progressive_dc;
+    ctx.progressive_dc_levels = config.progressive_dc_levels;
+    ctx.group_order = config.group_order;
     ctx.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
     #[cfg(feature = "splines")]
     {
@@ -1100,7 +1160,7 @@ pub fn encode_image(
             stride: 3,
         },
         false,
-        &linear,
+        linear,
         &cfg,
         &ctx,
         &mut scratch,
@@ -1187,7 +1247,7 @@ pub fn encode_image_with_alpha(
             stride: 4,
         },
         false,
-        &linear,
+        linear,
         &cfg,
         &ctx,
         &mut scratch,
@@ -1367,7 +1427,7 @@ fn encode_gray_impl(
             stride: 1,
         },
         true,
-        &linear,
+        linear,
         &cfg,
         &ctx,
         &mut scratch,
@@ -1607,7 +1667,7 @@ fn encode_gray_high_depth_impl(
             max: ((1u32 << bps.bits()) - 1) as u16,
         },
         true,
-        &linear,
+        linear,
         &cfg,
         &ctx,
         &mut scratch,
@@ -1710,7 +1770,7 @@ fn encode_high_depth_rgba(
                 max: bp_max,
             },
             false,
-            &linear,
+            linear,
             &cfg,
             &ctx,
             &mut scratch,
@@ -1739,7 +1799,7 @@ fn encode_high_depth_rgba(
                 max: bp_max,
             },
             false,
-            &linear,
+            linear,
             &cfg,
             &ctx,
             &mut scratch,
@@ -1901,7 +1961,7 @@ fn encode_float_rgba(
                 stride: 4,
             },
             false,
-            &linear,
+            linear,
             &cfg,
             &ctx,
             &mut scratch,
@@ -1929,7 +1989,7 @@ fn encode_float_rgba(
                 stride: 3,
             },
             false,
-            &linear,
+            linear,
             &cfg,
             &ctx,
             &mut scratch,
@@ -1978,7 +2038,7 @@ fn encode_float_gray(
             stride: 1,
         },
         true,
-        &linear,
+        linear,
         &cfg,
         &ctx,
         &mut scratch,
@@ -2114,7 +2174,7 @@ impl Samples<'_> {
 fn encode_samples_lossy(
     samples: Samples<'_>,
     gray: bool,
-    linear: &Image3F,
+    linear: Image3F,
     config: &EncodeConfigImpl,
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -2136,11 +2196,11 @@ fn encode_samples_lossy(
             [p0[x], p1[x], p2[x]] = ctx.coding.code(r, g, b);
         }
     }
-    encode_with_coded_planes(linear, Some(&coded), config, ctx, scratch)
+    encode_with_coded_planes(linear, Some(coded), config, ctx, scratch)
 }
 
 fn encode_with_context(
-    input: &Image3F,
+    input: Image3F,
     config: &EncodeConfigImpl,
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -2151,20 +2211,18 @@ fn encode_with_context(
 /// `coded` carries the planes of a non-XYB frame when they are not the
 /// sRGB rendition of `input`, which then only steers adaptive quantization.
 pub(crate) fn encode_with_coded_planes(
-    input: &Image3F,
-    coded: Option<&Image3F>,
+    input: Image3F,
+    coded: Option<Image3F>,
     config: &EncodeConfigImpl,
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
 ) -> Result<Vec<u8>, EncodeError> {
-    if input.xsize() == 0 || input.ysize() == 0 {
+    let (width, height) = (input.xsize(), input.ysize());
+    if width == 0 || height == 0 {
         return Err(EncodeError::EmptyImage);
     }
-    if input.xsize() > MAX_DIMENSION || input.ysize() > MAX_DIMENSION {
-        return Err(EncodeError::DimensionTooLarge {
-            width: input.xsize(),
-            height: input.ysize(),
-        });
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(EncodeError::DimensionTooLarge { width, height });
     }
     if !config.distance.is_finite() || config.distance <= 0.0 {
         return Err(EncodeError::InvalidDistance(config.distance));
@@ -2172,9 +2230,9 @@ pub(crate) fn encode_with_coded_planes(
 
     if let Some(alpha) = config.alpha.as_ref() {
         let expected = match &alpha {
-            AlphaPlane::U8(_) => checked_buffer_size::<u8>(input.xsize(), input.ysize(), 1)?,
-            AlphaPlane::U16 { .. } => checked_buffer_size::<u16>(input.xsize(), input.ysize(), 1)?,
-            AlphaPlane::F32(_) => checked_buffer_size::<f32>(input.xsize(), input.ysize(), 1)?,
+            AlphaPlane::U8(_) => checked_buffer_size::<u8>(width, height, 1)?,
+            AlphaPlane::U16 { .. } => checked_buffer_size::<u16>(width, height, 1)?,
+            AlphaPlane::F32(_) => checked_buffer_size::<f32>(width, height, 1)?,
         };
         if alpha.len() != expected {
             return Err(EncodeError::AlphaSizeMismatch {
@@ -2188,7 +2246,7 @@ pub(crate) fn encode_with_coded_planes(
     let mut w = BitWriter::new();
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
-    write_size_header(input.xsize(), input.ysize(), &mut w);
+    write_size_header(width, height, &mut w);
     let coeff_shifts = progressive_schedule(
         config.progressive,
         config.progressive_passes,
@@ -3174,6 +3232,44 @@ mod encode_smoke_tests {
     #[test]
     fn rgb8_lossy() {
         ok(encode_image(&rgb8(), W, H, &lossy()));
+    }
+
+    #[test]
+    fn progressive_dc_only_where_supported() {
+        // 160x96 has a 20x12 DC image, large enough to squeeze.
+        let (w, h) = (160, 96);
+        let rgb: Vec<u8> = (0..w * h)
+            .flat_map(|i| {
+                let (x, y) = (i % w, i / w);
+                [(x + y) as u8, (2 * x) as u8, ((x * y) % 251) as u8]
+            })
+            .collect();
+        let rgba: Vec<u8> = rgb
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|&[r, g, b]| [r, g, b, 200])
+            .collect();
+        for speed in [Speed::Fast, Speed::Slow] {
+            let off = lossy().with_speed(speed).with_num_threads(1);
+            let on = off.clone().with_progressive_dc(true);
+            let full = encode_image(&rgb, w, h, &on).unwrap();
+            assert_ne!(encode_image(&rgb, w, h, &off).unwrap(), full);
+            // Level counts clamp to the 1..=2 this DC image allows.
+            let levels = |n| encode_image(&rgb, w, h, &on.clone().with_progressive_dc_levels(n));
+            assert_eq!(levels(99).unwrap(), full);
+            assert_eq!(levels(0).unwrap(), levels(1).unwrap());
+            assert_ne!(levels(1).unwrap(), full);
+            // A 2x2 DC image cannot be squeezed; alpha frames keep their DC.
+            assert_eq!(
+                encode_image(&rgb8(), W, H, &off).unwrap(),
+                encode_image(&rgb8(), W, H, &on).unwrap()
+            );
+            assert_eq!(
+                encode_image_with_alpha(&rgba, w, h, &off).unwrap(),
+                encode_image_with_alpha(&rgba, w, h, &on).unwrap()
+            );
+        }
     }
 
     #[test]

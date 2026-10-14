@@ -26,6 +26,7 @@
  * // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
+use super::TokenSlice;
 use super::ans::{ANS_LOG_TAB_SIZE, AnsEncSymbolInfo, AnsHistogram};
 use super::prefix_code::{ALPHABET_SIZE, PrefixCode};
 use super::token::{HybridUintConfig, Token, uint_encode_with_config};
@@ -156,18 +157,22 @@ impl FrozenTokenPrices {
     /// Shannon bits of `streams` under this code's clustering and hybrid-uint
     /// configs with the symbol histograms rebuilt from the streams themselves:
     /// the cost of an adapted code, without its header.
-    pub(crate) fn adaptive_bits<'a>(&self, streams: impl Iterator<Item = &'a [Token]>) -> f32 {
+    pub(crate) fn adaptive_bits<'a, I>(&self, streams: I) -> f32
+    where
+        I: IntoIterator,
+        I::Item: Into<TokenSlice<'a>>,
+    {
         let clusters = self.configs.len();
         let mut counts = vec![0u32; clusters * ALPHABET_SIZE];
         let mut extra = 0u64;
         for stream in streams {
-            for token in stream {
+            stream.into().iter().for_each(|token| {
                 let cluster = self.context_map[token.context as usize] as usize;
                 let (symbol, extra_bits, _) =
                     uint_encode_with_config(token.value, self.configs[cluster]);
                 counts[cluster * ALPHABET_SIZE + (symbol as usize).min(ALPHABET_SIZE - 1)] += 1;
                 extra += u64::from(extra_bits);
-            }
+            });
         }
         let mut bits = extra as f64;
         for hist in counts.as_chunks::<ALPHABET_SIZE>().0 {

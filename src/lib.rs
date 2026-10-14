@@ -38,8 +38,6 @@ mod ac_context;
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
-mod aq_blur;
-mod aq_loop;
 mod arbiter;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
@@ -105,13 +103,14 @@ pub use color_encoding::{
     ColorEncoding, ColorSpace, Primaries, RenderingIntent, TransferFunction, WhitePoint,
 };
 pub use encode_image::{
-    Arbiter, DecodingSpeed, EncodeConfig, LossyModular, Speed, distance_from_quality, encode_image,
-    encode_image_10bit, encode_image_12bit, encode_image_16bit, encode_image_f16, encode_image_f32,
-    encode_image_gray, encode_image_gray_10bit, encode_image_gray_12bit, encode_image_gray_16bit,
-    encode_image_gray_alpha, encode_image_gray_alpha_10bit, encode_image_gray_alpha_12bit,
-    encode_image_gray_alpha_16bit, encode_image_gray_f16, encode_image_gray_f32,
-    encode_image_with_alpha, encode_image_with_alpha_10bit, encode_image_with_alpha_12bit,
-    encode_image_with_alpha_16bit, encode_image_with_alpha_f16, encode_image_with_alpha_f32,
+    Arbiter, DecodingSpeed, EncodeConfig, GroupOrder, LossyModular, Speed, distance_from_quality,
+    encode_image, encode_image_10bit, encode_image_12bit, encode_image_16bit, encode_image_f16,
+    encode_image_f32, encode_image_gray, encode_image_gray_10bit, encode_image_gray_12bit,
+    encode_image_gray_16bit, encode_image_gray_alpha, encode_image_gray_alpha_10bit,
+    encode_image_gray_alpha_12bit, encode_image_gray_alpha_16bit, encode_image_gray_f16,
+    encode_image_gray_f32, encode_image_with_alpha, encode_image_with_alpha_10bit,
+    encode_image_with_alpha_12bit, encode_image_with_alpha_16bit, encode_image_with_alpha_f16,
+    encode_image_with_alpha_f32,
 };
 pub use fast_loseless::{FlMeta, encode_fast_lossless, encode_fast_lossless_u16};
 pub use gain_map::{GainMap, GainMapPixels};

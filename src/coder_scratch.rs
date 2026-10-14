@@ -358,10 +358,9 @@ impl CoderScratch {
     fn new(reserve_lossy_buffers: bool) -> Self {
         let (aq_map, gradient, order0_entropy, threshold) = if reserve_lossy_buffers {
             (
-                AqMapScratch {
-                    aq_map: vec![0.0; 256 * 256],
-                    secondary: vec![0.0; 2048 + 512 * 512],
-                },
+                // AQ kernels grow these to the current DC group's dimensions.
+                // Most workers only process AC groups and never need them.
+                AqMapScratch::default(),
                 GradientScratch {
                     cur: vec![0; 256],
                     prev: vec![0; 256],
@@ -467,6 +466,13 @@ mod tests {
         let entropy = LzEntropyScratch::default();
         assert_eq!(entropy.histograms.capacity(), 0);
         assert_eq!(entropy.prefix_codes.capacity(), 0);
+    }
+
+    #[test]
+    fn lossy_scratch_allocates_aq_only_when_needed() {
+        let scratch = CoderScratch::default();
+        assert_eq!(scratch.aq_map.aq_map.capacity(), 0);
+        assert_eq!(scratch.aq_map.secondary.capacity(), 0);
     }
 
     #[test]

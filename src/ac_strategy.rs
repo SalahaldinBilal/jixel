@@ -137,8 +137,6 @@ const MERGE_MARGIN_32_RECT: Banded = Banded::new(0.161_916_72, 0.29);
 const MERGE_MARGIN_32: Banded = Banded::new(0.213_985_08, 0.234);
 
 const MERGE_MARGIN_LOWQ_FRACTION: f32 = 0.82;
-const MERGE_MARGIN_LOWQ3_D: f32 = 3.85;
-const MERGE_MARGIN_LOWQ3_SCALE: f32 = 1.10;
 const MERGE_MARGIN_FADE_START: f32 = 1.0;
 const MERGE_MARGIN_FADE_END: f32 = 4.0;
 const BIAS_4X4: f32 = 1.33;
@@ -183,12 +181,7 @@ fn merge_margin(distance: f32, margin: Banded) -> f32 {
     let fade = ((distance - MERGE_MARGIN_FADE_START)
         / (MERGE_MARGIN_FADE_END - MERGE_MARGIN_FADE_START))
         .clamp(0.0, 1.0);
-    let lowq3 = if distance >= MERGE_MARGIN_LOWQ3_D {
-        MERGE_MARGIN_LOWQ3_SCALE
-    } else {
-        1.0
-    };
-    margin.at(distance) * (1.0 - fade * (1.0 - MERGE_MARGIN_LOWQ_FRACTION)) * lowq3
+    margin.at(distance) * (1.0 - fade * (1.0 - MERGE_MARGIN_LOWQ_FRACTION))
 }
 
 #[inline]
@@ -340,43 +333,6 @@ impl SearchScope {
     #[inline]
     fn rerank(self, distance: f32) -> bool {
         self.full_rerank || distance <= FAST_RERANK_MAX_DISTANCE
-    }
-}
-
-pub(crate) struct RateCalibration;
-
-impl RateCalibration {
-    /// [pair, 16x16, 32-class] × [hq, mid, low]; hq at d<=1.5, mid at 2.75,
-    /// low from d=4, linear in between.
-    const TABLE: [[f32; 3]; 3] = [[1.0, 0.96, 0.96], [1.0, 0.93, 0.93], [1.0, 0.91, 0.91]];
-
-    #[inline]
-    fn family(strategy: u8) -> Option<usize> {
-        Some(match strategy {
-            STRATEGY_DCT16X8 | STRATEGY_DCT8X16 => 0,
-            STRATEGY_DCT16X16 => 1,
-            STRATEGY_DCT32X32 | STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => 2,
-            _ => return None,
-        })
-    }
-
-    /// Rate multiplier for `strategy` at `distance` (1.0 for DCT8 and for
-    /// every family outside the table).
-    #[inline]
-    pub(crate) fn scale(strategy: u8, distance: f32) -> f32 {
-        let Some(f) = Self::family(strategy) else {
-            return 1.0;
-        };
-        let [hq, mid, low] = Self::TABLE[f];
-        if distance <= 1.5 {
-            hq
-        } else if distance <= 2.75 {
-            fmla((distance - 1.5) / 1.25, mid - hq, hq)
-        } else if distance <= 4.0 {
-            fmla((distance - 2.75) / 1.25, low - mid, mid)
-        } else {
-            low
-        }
     }
 }
 
@@ -578,9 +534,7 @@ fn forward_transform(
     }
 }
 
-const DCT64_MIN_DISTANCE: f32 = 3.0;
-const DCT64_WINDOW_LO: f32 = 1.0;
-const DCT64_WINDOW_HI: f32 = 2.25;
+const DCT64_MIN_DISTANCE: f32 = 1.0;
 const BIAS_64X64: f32 = 1.0;
 const BIAS_64_RECT: f32 = 1.0;
 const ACCEPT_64: f32 = 0.945;
@@ -596,9 +550,7 @@ const fn dct64_rect_accept() -> f32 {
 
 #[inline]
 fn use_dct64(speed: crate::Speed, distance: f32) -> bool {
-    speed.effort().dct64
-        && (distance >= DCT64_MIN_DISTANCE
-            || (DCT64_WINDOW_LO..DCT64_WINDOW_HI).contains(&distance))
+    speed.effort().dct64 && distance >= DCT64_MIN_DISTANCE
 }
 
 /// DCT64 is evaluated outside the standard chooser, reusing the chooser's
@@ -919,10 +871,7 @@ fn coefficient_dist_and_rate(
         d_total += ctx.channel_weight(c) * d;
         r_total += r;
     }
-    (
-        d_total * visible,
-        r_total * RateCalibration::scale(strategy, distance),
-    )
+    (d_total * visible, r_total)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1098,7 +1047,7 @@ fn reconstruction_dist_and_rate(
                 ctx, strategy, coeffs, [false; 3], qac, qm_mult_x, distance, cx, cy,
             )
         })
-        .unwrap_or_else(|| cost.rate * RateCalibration::scale(strategy, distance));
+        .unwrap_or(cost.rate);
     cost
 }
 

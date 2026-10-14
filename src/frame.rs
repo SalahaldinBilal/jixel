@@ -43,7 +43,8 @@ use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
 use crate::entropy::{
-    EntropyCode, Token, f_log2, optimize_entropy_code, pack_signed, write_entropy_code, write_token,
+    AcTokens, EntropyCode, Token, TokenSlice, f_log2, optimize_entropy_code, pack_signed,
+    write_entropy_code, write_token,
 };
 use crate::group::write_ac_group;
 use crate::image::{Image3B, Image3F, Image3S, Rect};
@@ -139,7 +140,7 @@ fn dc_refinement(distance: f32) -> f32 {
 
 const DCEPF_VLQ_D0: f32 = 8.0;
 const DCEPF_VLQ_D1: f32 = 15.0;
-const VLQ_DC_MUL: f32 = 0.45;
+const VLQ_DC_MUL: f32 = 0.7;
 
 #[inline]
 fn dcepf_vlq_t(distance: f32) -> f32 {
@@ -946,6 +947,7 @@ fn write_frame_header_kind(
     kind: VarDctFrameKind<'_>,
     has_splines: bool,
     skip_dc_smoothing: bool,
+    use_dc_frame: bool,
     coding: crate::coding::CodingTransform,
     epf_channel_scale: Option<[f32; 3]>,
     w: &mut BitWriter,
@@ -962,6 +964,7 @@ fn write_frame_header_kind(
             false,
             has_splines,
             skip_dc_smoothing,
+            use_dc_frame,
             coding,
             epf_channel_scale,
             w,
@@ -977,6 +980,7 @@ fn write_frame_header_kind(
             true,
             has_splines,
             skip_dc_smoothing,
+            use_dc_frame,
             coding,
             epf_channel_scale,
             w,
@@ -1064,6 +1068,7 @@ fn write_frame_header(
     has_patches: bool,
     has_splines: bool,
     skip_dc_smoothing: bool,
+    use_dc_frame: bool,
     coding: crate::coding::CodingTransform,
     epf_channel_scale: Option<[f32; 3]>,
     w: &mut BitWriter,
@@ -1071,11 +1076,17 @@ fn write_frame_header(
     w.write(1, 0); // not all default
     w.write(2, 0); // regular frame
     w.write(1, 0); // vardct
-    // Optional flags: kPatches (2), kSplines (16) and kSkipAdaptiveDCSmoothing
-    // (128), chosen per frame by `skip_dc_smoothing`.
+    // Optional flags: kPatches (2), kSplines (16), kUseDcFrame (32) and
+    // kSkipAdaptiveDCSmoothing (128), chosen per frame by `skip_dc_smoothing`.
+    // A DC frame implies no smoothing.
     let flags = if has_patches { 2u64 } else { 0 }
         + if has_splines { 16 } else { 0 }
-        + if skip_dc_smoothing { 128 } else { 0 };
+        + if use_dc_frame { 32 } else { 0 }
+        + if skip_dc_smoothing && !use_dc_frame {
+            128
+        } else {
+            0
+        };
     match flags {
         0 => w.write(2, 0),
         1..=16 => {
@@ -1096,12 +1107,15 @@ fn write_frame_header(
             }
         }
     }
-    w.write(2, 0); // no upsampling
+    // Absent with kUseDcFrame.
+    if !use_dc_frame {
+        w.write(2, 0); // no upsampling
 
-    // Per-extra-channel upsampling. Same u2S(1,2,4,8) code, default 1:
-    // selector "00" gives 1, written once per extra channel.
-    if has_alpha {
-        w.write(2, 0); // ec_upsampling[0] = 1
+        // Per-extra-channel upsampling. Same u2S(1,2,4,8) code, default 1:
+        // selector "00" gives 1, written once per extra channel.
+        if has_alpha {
+            w.write(2, 0); // ec_upsampling[0] = 1
+        }
     }
 
     // The quant scales are only serialized for XYB frames.
@@ -1529,8 +1543,20 @@ fn write_ac_global(
     }
 }
 
-fn write_toc(sizes: &[usize], w: &mut BitWriter) {
-    w.write(1, 0); // no permutation
+/// Section sizes in codestream order, after the optional permutation
+/// (`permutation[i]` = codestream slot of canonical section `i`).
+fn write_toc(
+    sizes: &[usize],
+    permutation: Option<(&[u32], &mut Vec<crate::entropy::HuffmanNode>)>,
+    w: &mut BitWriter,
+) {
+    match permutation {
+        Some((permutation, huffman_pool)) => {
+            w.write(1, 1);
+            crate::coeff_order::write_permutation(permutation, huffman_pool, w);
+        }
+        None => w.write(1, 0),
+    }
     w.zero_pad_to_byte();
     let k_bits = [10usize, 14, 22, 30];
     for &s in sizes {
@@ -1551,6 +1577,16 @@ fn write_toc(sizes: &[usize], w: &mut BitWriter) {
 }
 
 pub(crate) fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWriter) {
+    combine_sections_ordered(sections, None, writer);
+}
+
+/// [`combine_sections`] storing the sections in `order` (canonical section
+/// indices in codestream order), signaled through the TOC permutation.
+fn combine_sections_ordered(
+    sections: &mut Vec<BitWriter>,
+    order: Option<(&[usize], &mut Vec<crate::entropy::HuffmanNode>)>,
+    writer: &mut BitWriter,
+) {
     if sections.len() == 4 {
         // Single AC group case: concat sections 1..4 (bitwise) into section 0.
         let tail: Vec<BitWriter> = sections.drain(1..).collect();
@@ -1558,14 +1594,98 @@ pub(crate) fn combine_sections(sections: &mut Vec<BitWriter>, writer: &mut BitWr
             sections[0].append(s);
         }
     }
-
+    let order = order.filter(|(order, _)| {
+        sections.len() > 1 && order.iter().enumerate().any(|(slot, &i)| slot != i)
+    });
+    let Some((order, huffman_pool)) = order else {
+        let sizes: Vec<usize> = sections
+            .iter()
+            .map(|s| s.bits_written().div_ceil(8))
+            .collect();
+        write_toc(&sizes, None, writer);
+        // After write_toc, writer is byte-aligned.
+        writer.append_byte_aligned(sections);
+        return;
+    };
+    debug_assert_eq!(order.len(), sections.len());
+    let mut permutation = vec![0u32; order.len()];
+    for (slot, &i) in order.iter().enumerate() {
+        permutation[i] = slot as u32;
+    }
+    let mut taken: Vec<Option<BitWriter>> = sections.drain(..).map(Some).collect();
+    sections.extend(order.iter().map(|&i| taken[i].take().expect("permutation")));
     let sizes: Vec<usize> = sections
         .iter()
         .map(|s| s.bits_written().div_ceil(8))
         .collect();
-    write_toc(&sizes, writer);
-    // After write_toc, writer is byte-aligned.
+    write_toc(&sizes, Some((&permutation, huffman_pool)), writer);
     writer.append_byte_aligned(sections);
+}
+
+/// Canonical section indices of a VarDCT frame in `group_order`: the
+/// LfGlobal and HfGlobal sections stay put, the DC groups and each pass's AC
+/// groups are sorted by [`group_order_key`].
+fn group_section_order(
+    dim: &ImageDim,
+    num_passes: usize,
+    group_order: crate::GroupOrder,
+) -> Vec<usize> {
+    let sorted = |xgroups: usize, ygroups: usize, group_dim: usize| -> Vec<usize> {
+        let mut keys: Vec<(i64, f64, f64, usize)> = (0..xgroups * ygroups)
+            .map(|g| {
+                let (x0, y0) = ((g % xgroups) * group_dim, (g / xgroups) * group_dim);
+                let w = group_dim.min(dim.xsize - x0);
+                let h = group_dim.min(dim.ysize - y0);
+                let center = (x0 as f64 + w as f64 / 2.0, y0 as f64 + h as f64 / 2.0);
+                let (band, radius, angle) = group_order_key(dim, group_dim, center, group_order);
+                (band, radius, angle, g)
+            })
+            .collect();
+        keys.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then(a.1.total_cmp(&b.1))
+                .then(a.2.total_cmp(&b.2))
+                .then(a.3.cmp(&b.3))
+        });
+        keys.into_iter().map(|(.., g)| g).collect()
+    };
+    let dc = sorted(dim.xsize_dc_groups, dim.ysize_dc_groups, K_DC_GROUP_DIM);
+    let ac = sorted(dim.xsize_groups, dim.ysize_groups, K_GROUP_DIM);
+    let mut order = vec![0];
+    order.extend(dc.iter().map(|&g| 1 + g));
+    order.push(1 + dim.num_dc_groups);
+    for pass in 0..num_passes {
+        let base = 2 + dim.num_dc_groups + pass * dim.num_groups;
+        order.extend(ac.iter().map(|&g| base + g));
+    }
+    order
+}
+
+/// Sort key of a group centered at `center`: (band, distance from the image
+/// center, clockwise angle from the top). Center-first bands are rings one
+/// group wide, each swept by angle alone; diagonal bands are half a group
+/// wide around the nearer corner-to-corner diagonal and grow outward, so the
+/// image draws an X that then thickens.
+fn group_order_key(
+    dim: &ImageDim,
+    group_dim: usize,
+    center: (f64, f64),
+    group_order: crate::GroupOrder,
+) -> (i64, f64, f64) {
+    let (w, h) = (dim.xsize as f64, dim.ysize as f64);
+    let (dx, dy) = (center.0 - w / 2.0, center.1 - h / 2.0);
+    let radius = dx.hypot(dy);
+    let angle = dx.atan2(-dy).rem_euclid(std::f64::consts::TAU);
+    let g = group_dim as f64;
+    match group_order {
+        crate::GroupOrder::Diagonals => {
+            let diagonal = w.hypot(h);
+            let main = (w * center.1 - h * center.0).abs() / diagonal;
+            let anti = (w * (h - center.1) - h * center.0).abs() / diagonal;
+            ((main.min(anti) / (0.5 * g)).floor() as i64, radius, angle)
+        }
+        _ => ((radius / g).floor() as i64, 0.0, angle),
+    }
 }
 
 fn zero_alpha_for_lossy(alpha: Option<&AlphaPlane>, pixels: usize) -> Option<AlphaPlane> {
@@ -1722,8 +1842,8 @@ pub(crate) fn encode_frame(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
     distance: f32,
-    linear: &Image3F,
-    coded: Option<&Image3F>,
+    linear: Image3F,
+    coded: Option<Image3F>,
     is_achromatic: bool,
     alpha: Option<&AlphaPlane>,
     fill_invisible: bool,
@@ -1737,9 +1857,7 @@ pub(crate) fn encode_frame(
         // Non-XYB planes skip every XYB content heuristic: they read as
         // achromatic to the classifiers, and patches quantize on the XYB
         // lattice.
-        let mut coded = coded
-            .expect("non-XYB frames carry their coded planes")
-            .clone();
+        let mut coded = coded.expect("non-XYB frames carry their coded planes");
         if fill_invisible && let Some(alpha) = alpha {
             crate::invisible::fill_invisible(&mut coded, alpha);
         }
@@ -1755,7 +1873,7 @@ pub(crate) fn encode_frame(
                 coded.xsize(),
                 coded.ysize(),
                 crate::lossless::lm_plain_distance(ctx.coding, distance)
-                    * lm_texture_factor(linear),
+                    * lm_texture_factor(&linear),
                 ctx.speed,
                 &ctx.thread_pool,
                 scratch,
@@ -1810,6 +1928,15 @@ pub(crate) fn encode_frame(
             }
         });
     }
+    let modular_distance = if alpha.is_none()
+        && (ctx.lossy_modular == crate::LossyModular::Force
+            || (ctx.lossy_modular == crate::LossyModular::Auto
+                && ctx.speed.effort().lossy_modular_auto))
+    {
+        crate::lossless::lm_calibrated_distance(distance) * lm_texture_factor(&linear)
+    } else {
+        0.0
+    };
     let mut xyb = to_xyb_image(ctx, scratch, linear);
     if fill_invisible && let Some(alpha) = alpha {
         crate::invisible::fill_invisible(&mut xyb, alpha);
@@ -1825,7 +1952,7 @@ pub(crate) fn encode_frame(
         let mut modular_writer = BitWriter::new();
         if crate::lossless::encode_frame_lossy_modular_squeeze(
             &xyb,
-            crate::lossless::lm_calibrated_distance(distance) * lm_texture_factor(linear),
+            modular_distance,
             ctx.speed,
             &ctx.thread_pool,
             scratch,
@@ -1842,7 +1969,7 @@ pub(crate) fn encode_frame(
         let mut modular_writer = BitWriter::new();
         let have_modular = crate::lossless::encode_frame_lossy_modular_squeeze(
             &xyb,
-            crate::lossless::lm_calibrated_distance(distance) * lm_texture_factor(linear),
+            modular_distance,
             ctx.speed,
             &ctx.thread_pool,
             scratch,
@@ -3123,17 +3250,15 @@ fn snap_achromatic_xyb(xyb: &mut Image3F) {
     }
 }
 
-fn to_xyb_image(ctx: &EncodingContext, scratch: &mut CoderScratch, linear: &Image3F) -> Image3F {
-    let mut xyb = Image3F::new(linear.xsize(), linear.ysize());
-    crate::xyb::to_xyb_with_fn(
+fn to_xyb_image(ctx: &EncodingContext, scratch: &mut CoderScratch, mut linear: Image3F) -> Image3F {
+    crate::xyb::to_xyb_in_place_with_fn(
         ctx.to_xyb_band,
         &ctx.xyb,
-        linear,
-        &mut xyb,
+        &mut linear,
         &ctx.thread_pool,
         scratch,
     );
-    xyb
+    linear
 }
 
 /// Pre-invert Gaborish so the decoder's forward pass reproduces `xyb`.
@@ -3196,6 +3321,16 @@ fn encode_frame_core(
     // passes by a decreasing per-pass shift (last = 0). The decoder reconstructs
     // C = sum_p (sent_p << shift_p) (jxl-vardct hf_coeff.rs:185,191).
     let num_passes = coeff_shifts.len();
+    // Progressive DC: the DC image goes out as its own squeezed DC frame,
+    // which this frame references instead of coding a DC stream.
+    let use_dc_frame = ctx.progressive_dc
+        && matches!(
+            frame_kind,
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+        )
+        && alpha.is_none()
+        && ctx.coding.is_xyb()
+        && crate::lossless::dc_frame_supported(dim.xsize_blocks, dim.ysize_blocks);
     let extra_squeeze = alpha
         .filter(|_| ctx.extra_squeeze_distance > 0.0)
         .and_then(|plane| {
@@ -3219,7 +3354,8 @@ fn encode_frame_core(
     let group_coords: Vec<(usize, usize)> = (0..dim.ysize_dc_groups)
         .flat_map(|gy| (0..dim.xsize_dc_groups).map(move |gx| (gx, gy)))
         .collect();
-    let opsin = &opsin;
+    let opsin_image = opsin;
+    let opsin = &opsin_image;
 
     // Split the thread budget across nesting levels: `outer` lanes steal DC
     // groups, each parallelizing its AC-strategy bands with the remainder, so
@@ -3274,8 +3410,15 @@ fn encode_frame_core(
     // already written on the natural scan), so the work would be wasted and its
     // mere presence perturbs codegen enough to shift a few borderline
     // quantizer roundings on paths that should be untouched.
-    let want_order_stats =
-        num_passes == 1 && (0.03..=24.0).contains(&distance) && ctx.speed.effort().coeff_orders;
+    let want_order_stats = ctx.speed.effort().coeff_orders;
+    // Passes before the refined one only feed statistics and token prices,
+    // which describe whole coefficients: they tokenize as one pass, and only
+    // the refined pass splits the coefficients across the frame's passes.
+    let (analysis_passes, analysis_shifts): (usize, &[u32]) = if want_order_stats {
+        (1, &[0])
+    } else {
+        (num_passes, coeff_shifts)
+    };
     let results = ctx
         .thread_pool
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
@@ -3288,8 +3431,8 @@ fn encode_frame_core(
                 &dim,
                 &distp,
                 &dc_ref[dc_idx],
-                num_passes,
-                coeff_shifts,
+                analysis_passes,
+                analysis_shifts,
                 dc_gx,
                 dc_gy,
                 gx,
@@ -3298,7 +3441,7 @@ fn encode_frame_core(
                 None,
                 &natural_orders,
                 &[],
-                want_order_stats,
+                want_order_stats || use_dc_frame,
                 qf_threshold,
                 false,
                 None,
@@ -3356,7 +3499,7 @@ fn encode_frame_core(
         });
         // Keep the incumbent RDOQ scan: the final race changes coding only,
         // so all arms transmit exactly the same quantized coefficients.
-        if ctx.speed.effort().coeff_order_entropy_race {
+        if ctx.speed.effort().coeff_order_entropy_race && num_passes == 1 {
             if let Some(stats) = &order_stats {
                 let mut proposed = crate::coeff_order::CoeffOrders::natural();
                 crate::coeff_order::propose_orders(stats, &mut proposed);
@@ -3368,7 +3511,10 @@ fn encode_frame_core(
                 order_alternatives.push(crate::coeff_order::CoeffOrders::natural());
             }
         }
-        ytob_dc = if ctx.speed.effort().dc_cfl_weighted {
+        drop(order_stats);
+        ytob_dc = if use_dc_frame {
+            0
+        } else if ctx.speed.effort().dc_cfl_weighted {
             crate::color_correlation::choose_ytob_dc_weighted(
                 &dc_datas,
                 ctx,
@@ -3397,15 +3543,17 @@ fn encode_frame_core(
                 ctx.quantize_dc_cfl,
             )
         };
-        distp.dc_step = crate::color_correlation::choose_dc_steps(
-            &dc_datas,
-            ctx,
-            distp.scale_dc,
-            ytob_dc,
-            distp.dc_step,
-            ctx.cfl_frame(),
-        );
-        if !ctx.speed.effort().chroma_dc_squeeze {
+        if !use_dc_frame {
+            distp.dc_step = crate::color_correlation::choose_dc_steps(
+                &dc_datas,
+                ctx,
+                distp.scale_dc,
+                ytob_dc,
+                distp.dc_step,
+                ctx.cfl_frame(),
+            );
+        }
+        if !ctx.speed.effort().chroma_dc_squeeze && !use_dc_frame {
             for dc in &mut dc_datas {
                 dc.source_dc_b = None;
                 dc.source_dc_y = None;
@@ -3433,8 +3581,8 @@ fn encode_frame_core(
                         &dim,
                         &distp,
                         &dc_ref[dc_idx],
-                        num_passes,
-                        coeff_shifts,
+                        analysis_passes,
+                        analysis_shifts,
                         dc_gx,
                         dc_gy,
                         gx,
@@ -3469,28 +3617,29 @@ fn encode_frame_core(
         // The closed loop's reference and verification encodes are pass 2
         // itself (same RDOQ, prices and orders), so when it runs its final
         // groups replace the refined pass.
-        let loop_groups = if ctx.speed.effort().aq_closed_loop && ctx.coding.is_xyb() {
-            run_quant_field_loop(
-                ctx,
-                scratch,
-                opsin,
-                &dim,
-                &distp,
-                &mut dc_datas,
-                &ac_tasks,
-                &group_coords,
-                num_passes,
-                coeff_shifts,
-                &coeff_orders,
-                &order_alternatives,
-                ytob_dc,
-                qf_threshold,
-                &prices,
-            )
-        } else {
-            None
-        };
         all_pending.clear();
+        let loop_groups =
+            if ctx.speed.effort().aq_closed_loop && ctx.coding.is_xyb() && num_passes == 1 {
+                run_quant_field_loop(
+                    ctx,
+                    scratch,
+                    opsin,
+                    &dim,
+                    &distp,
+                    &mut dc_datas,
+                    &ac_tasks,
+                    &group_coords,
+                    num_passes,
+                    coeff_shifts,
+                    &coeff_orders,
+                    &order_alternatives,
+                    ytob_dc,
+                    qf_threshold,
+                    &prices,
+                )
+            } else {
+                None
+            };
         let loop_groups = loop_groups.map(|(groups, chosen)| {
             distp = chosen;
             groups
@@ -3536,7 +3685,7 @@ fn encode_frame_core(
 
     // The retained source DC is invariant under AC reranking. Search against
     // the final Y levels and steps, then quantize X once from that source.
-    let ytox_dc = if ctx.coding.is_xyb() && ctx.speed.effort().dc_x_cfl {
+    let ytox_dc = if ctx.coding.is_xyb() && ctx.speed.effort().dc_x_cfl && !use_dc_frame {
         crate::color_correlation::choose_ytox_dc(
             &mut dc_datas,
             distp.scale_dc,
@@ -3558,6 +3707,7 @@ fn encode_frame_core(
     // Flattening and Haar selection must use that same target as well.
     let compensate_b = ctx.coding.is_xyb()
         && ctx.speed.effort().chroma_dc_squeeze
+        && !use_dc_frame
         && compensate_b_dc(
             &mut dc_datas,
             &distp,
@@ -3565,7 +3715,7 @@ fn encode_frame_core(
             dc_cfl,
             ctx.dc_rows.compensate_b,
         );
-    if ctx.coding.is_xyb() {
+    if ctx.coding.is_xyb() && !use_dc_frame {
         flatten_chroma_dc(
             opsin,
             &dim,
@@ -3577,7 +3727,7 @@ fn encode_frame_core(
             compensate_b,
         )?;
     }
-    if ctx.coding.is_xyb() && ctx.speed.effort().chroma_dc_squeeze {
+    if ctx.coding.is_xyb() && ctx.speed.effort().chroma_dc_squeeze && !use_dc_frame {
         choose_chroma_dc_coding(
             &dim,
             &mut dc_datas,
@@ -3588,7 +3738,7 @@ fn encode_frame_core(
             ctx.dc_rows.adjust_b,
         )?;
     }
-    if ctx.coding.is_xyb() && ctx.speed.effort().dc_rdoq && distance >= 3.0 {
+    if ctx.coding.is_xyb() && ctx.speed.effort().dc_rdoq && !use_dc_frame {
         dc_rdo::refine_dc_rounding(
             &mut dc_datas,
             &distp,
@@ -3598,18 +3748,22 @@ fn encode_frame_core(
             &mut scratch.dc_predictor,
         )?;
     }
-    let skip_dc_smoothing = skip_dc_smoothing(
-        &ctx.thread_pool,
-        scratch,
-        opsin,
-        &dim,
-        &dc_datas,
-        &group_coords,
-        &distp,
-        ytob_dc,
-        dc_cfl,
-        ctx.dc_rows.reconstruct,
-    )?;
+    let skip_dc_smoothing = !use_dc_frame
+        && skip_dc_smoothing(
+            &ctx.thread_pool,
+            scratch,
+            opsin,
+            &dim,
+            &dc_datas,
+            &group_coords,
+            &distp,
+            ytob_dc,
+            dc_cfl,
+            ctx.dc_rows.reconstruct,
+        )?;
+    // Pixel-domain decisions are finished; entropy coding only reads DC data
+    // and tokens. Release the full-resolution planes before its working sets.
+    drop(opsin_image);
 
     // Phase 2: build adaptive DC entropy code from all DC + AC-metadata tokens.
     // Per-leaf DC predictor selection.
@@ -3626,13 +3780,17 @@ fn encode_frame_core(
                 &DC_PREDICTOR_GRADIENT
             };
             // Both residual candidates use the same WP state and context.
-            let (wp, grad) = collect_dc_tokens_with_gradient(
-                &dc_datas[i],
-                predictor,
-                &mut props,
-                effort.dc_learned_tree,
-                dc_predictor_search,
-            );
+            let (wp, grad) = if use_dc_frame {
+                (Vec::new(), Vec::new())
+            } else {
+                collect_dc_tokens_with_gradient(
+                    &dc_datas[i],
+                    predictor,
+                    &mut props,
+                    effort.dc_learned_tree,
+                    dc_predictor_search,
+                )
+            };
             let mut meta_props = Vec::new();
             let meta = collect_ac_metadata_tokens(
                 &dc_datas[i],
@@ -3701,7 +3859,7 @@ fn encode_frame_core(
     // `dc_code_refined`: the Slow arm battle already priced both finalists on
     // ANS-refined codes, so the winner needs no second refinement.
     let (dc_tokens_per_group, meta_tokens_per_group, mut dc_code_owned, dc_tree, dc_code_refined) =
-        if !effort.dc_learned_tree {
+        if !effort.dc_learned_tree || use_dc_frame {
             (
                 dc_tokens_static,
                 meta_tokens_per_group,
@@ -3904,6 +4062,10 @@ fn encode_frame_core(
                 None => (best.0, best.1, best.2, best.3, false),
             }
         };
+    drop(wp_tokens_per_group);
+    drop(grad_tokens_per_group);
+    drop(props_per_group);
+    drop(meta_props_per_group);
     let ans_refinement = if effort.ans_refine {
         Some(crate::entropy::AnsRefinement::slow_for_speed(ctx.speed))
     } else if effort.ans_fast_refine {
@@ -4082,21 +4244,24 @@ fn encode_frame_core(
         .steal_map(scratch, dc_datas.len(), |i, scratch| {
             let dc_data = &dc_datas[i];
             let mut w = BitWriter::new();
-            w.write(2, 0); // extra_dc_precision
-            w.write(4, 3); // use global tree, default wp, no transforms
-            if dc_code.use_prefix_code {
-                for t in &dc_tokens_per_group[i] {
-                    write_token(*t, &dc_code, &mut w);
+            // With a DC frame, the group carries no DC stream.
+            if !use_dc_frame {
+                w.write(2, 0); // extra_dc_precision
+                w.write(4, 3); // use global tree, default wp, no transforms
+                if dc_code.use_prefix_code {
+                    for t in &dc_tokens_per_group[i] {
+                        write_token(*t, &dc_code, &mut w);
+                    }
+                } else {
+                    crate::entropy::write_ans_tokens(
+                        &dc_tokens_per_group[i],
+                        dc_code.context_map,
+                        dc_code.ans_symbols,
+                        dc_code.ans_reverse_maps,
+                        dc_code.hybrid_uint_configs,
+                        &mut w,
+                    );
                 }
-            } else {
-                crate::entropy::write_ans_tokens(
-                    &dc_tokens_per_group[i],
-                    dc_code.context_map,
-                    dc_code.ans_symbols,
-                    dc_code.ans_reverse_maps,
-                    dc_code.hybrid_uint_configs,
-                    &mut w,
-                );
             }
             // ModularLfGroup: the extra channel's coarse squeeze levels.
             if let Some(squeezed) = extra_squeeze {
@@ -4134,6 +4299,8 @@ fn encode_frame_core(
     for (i, section) in dc_sections.into_iter().enumerate() {
         sections[1 + i] = section;
     }
+    drop(dc_tokens_per_group);
+    drop(meta_tokens_per_group);
 
     let (ac_global, ac_sections) = if let Some(raced) = raced_ac_sections {
         raced
@@ -4161,6 +4328,7 @@ fn encode_frame_core(
     for (section_idx, section) in ac_sections {
         sections[section_idx] = section;
     }
+    drop(all_pending);
     // Modular alpha: extra-channel modular data is decoded in the last pass
     // (the only pass whose modular sub-image shift range is set when num_ds=0,
     // jxl-frame lib.rs:101-108 / pass_group.rs:93). Write it into that section.
@@ -4201,6 +4369,27 @@ fn encode_frame_core(
         }
     }
 
+    // The DC frame precedes the frame that uses it.
+    let mut dc_frame_bits = 0;
+    if use_dc_frame {
+        let dc_image = assemble_source_dc(&dc_datas, &group_coords, &dim);
+        let mut dc_writer = BitWriter::new();
+        let coded = crate::lossless::encode_dc_frame(
+            &dc_image,
+            std::array::from_fn(|c| {
+                distp.dc_step[c] / (crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc)
+            }),
+            ctx.progressive_dc_levels,
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut dc_writer,
+        );
+        debug_assert!(coded, "DC frame size checked up front");
+        dc_frame_bits = dc_writer.bits_written();
+        writer.append(&dc_writer);
+    }
+
     #[cfg(feature = "splines")]
     let has_splines = splines.is_some();
     #[cfg(not(feature = "splines"))]
@@ -4216,18 +4405,55 @@ fn encode_frame_core(
         frame_kind,
         has_splines,
         skip_dc_smoothing,
+        use_dc_frame,
         ctx.coding,
         ctx.epf_channel_scale,
         writer,
     );
-    let payload_bits = sections
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != 0 && *i != 1 + dim.num_dc_groups)
-        .map(|(_, section)| section.bits_written())
-        .sum();
-    combine_sections(&mut sections, writer);
+    let payload_bits = dc_frame_bits
+        + sections
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 0 && *i != 1 + dim.num_dc_groups)
+            .map(|(_, section)| section.bits_written())
+            .sum::<usize>();
+    let order = (ctx.group_order != crate::GroupOrder::Scanline
+        && matches!(
+            frame_kind,
+            VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+        ))
+    .then(|| group_section_order(&dim, num_passes, ctx.group_order));
+    combine_sections_ordered(
+        &mut sections,
+        order.as_deref().map(|o| (o, &mut scratch.huffman_pool)),
+        writer,
+    );
     Ok(payload_bits)
+}
+
+/// The frame's unrounded per-block XYB DC (the DC frame's input), stitched
+/// from the DC groups.
+fn assemble_source_dc(
+    dc_datas: &[DcGroupData],
+    group_coords: &[(usize, usize)],
+    dim: &ImageDim,
+) -> Image3F {
+    let mut image = Image3F::new(dim.xsize_blocks, dim.ysize_blocks);
+    for (dc, &(gx, gy)) in dc_datas.iter().zip(group_coords) {
+        let ox = gx * (K_DC_GROUP_DIM / K_BLOCK_DIM);
+        let oy = gy * (K_DC_GROUP_DIM / K_BLOCK_DIM);
+        for (c, plane) in [&dc.source_dc_x, &dc.source_dc_y, &dc.source_dc_b]
+            .into_iter()
+            .enumerate()
+        {
+            let plane = plane.as_ref().expect("source DC kept for the DC frame");
+            for y in 0..plane.ysize() {
+                image.plane_row_mut(c, oy + y)[ox..ox + plane.xsize()]
+                    .copy_from_slice(plane.row(y));
+            }
+        }
+    }
+    image
 }
 
 fn finalize_ac_entropy(
@@ -4305,9 +4531,7 @@ fn finalize_ac_entropy(
         ctx.thread_pool
             .steal_for_each_mut(scratch, pending, |_i, p, _s| {
                 for pass_tokens in &mut p.tokens {
-                    for t in pass_tokens.iter_mut() {
-                        *t = Token::new(plan.remap(t.context), t.value);
-                    }
+                    pass_tokens.remap_contexts(|context| plan.remap(context));
                 }
             });
     };
@@ -4320,7 +4544,7 @@ fn finalize_ac_entropy(
         let proposed = crate::ac_context::plan_block_ctx_map(
             pending
                 .iter()
-                .flat_map(|pending| pending.tokens.iter().map(Vec::as_slice)),
+                .flat_map(|pending| pending.tokens.iter().map(AcTokens::as_slice)),
             qf_threshold,
         );
         if proposed == baseline {
@@ -4328,31 +4552,36 @@ fn finalize_ac_entropy(
             let codes = build_codes(pending, baseline.num_ac_contexts(), scratch);
             (baseline, codes)
         } else {
-            // Materialize the proposed arm, remap the originals to baseline in
-            // place, and keep whichever arm's real bits win.
-            let plan_ref = &proposed;
-            let mut planned: Vec<Vec<Vec<Token>>> = pending
+            // Both arms keep the coefficient values. Save only the original
+            // contexts so the same token buffers can be remapped for each arm.
+            const { assert!(crate::ac_context::K_NUM_FINE_AC_CONTEXTS <= 1 << 16) };
+            let contexts: Vec<Vec<Vec<u16>>> = pending
                 .iter()
                 .map(|p| {
                     p.tokens
                         .iter()
-                        .map(|pass_tokens| {
-                            pass_tokens
-                                .iter()
-                                .map(|t| Token::new(plan_ref.remap(t.context), t.value))
-                                .collect()
-                        })
+                        .map(|tokens| tokens.iter().map(|t| t.context as u16).collect())
                         .collect()
                 })
                 .collect();
+            let remap_saved = |pending: &mut [PendingAcGroup],
+                               plan: &crate::ac_context::AcCtxPlan,
+                               scratch: &mut CoderScratch| {
+                ctx.thread_pool
+                    .steal_for_each_mut(scratch, pending, |i, p, _s| {
+                        for (tokens, contexts) in p.tokens.iter_mut().zip(&contexts[i]) {
+                            let mut contexts = contexts.iter();
+                            tokens.remap_contexts(|_| {
+                                plan.remap(u32::from(*contexts.next().unwrap()))
+                            });
+                        }
+                    });
+            };
             remap_tokens(pending, &baseline, scratch);
 
             let base_codes = build_codes(pending, baseline.num_ac_contexts(), scratch);
             let base_bits = arm_bits(pending, &base_codes, &baseline, scratch);
-            // Swap in the proposed tokens to price them with the same helpers.
-            for (p, planned_tokens) in pending.iter_mut().zip(&mut planned) {
-                std::mem::swap(&mut p.tokens, planned_tokens);
-            }
+            remap_saved(pending, &proposed, scratch);
             let plan_codes = build_codes(pending, proposed.num_ac_contexts(), scratch);
             let plan_bits = arm_bits(pending, &plan_codes, &proposed, scratch);
 
@@ -4360,10 +4589,7 @@ fn finalize_ac_entropy(
             if plan_bits + AC_PLAN_MARGIN_BITS < base_bits {
                 (proposed, plan_codes)
             } else {
-                // Swap the baseline tokens back.
-                for (p, planned_tokens) in pending.iter_mut().zip(&mut planned) {
-                    std::mem::swap(&mut p.tokens, planned_tokens);
-                }
+                remap_saved(pending, &baseline, scratch);
                 (baseline, base_codes)
             }
         }
@@ -4416,14 +4642,14 @@ fn encode_ac_sections(
             let i = task / num_passes;
             let pass = task % num_passes;
             let pg = &pending[i];
-            let pass_tokens = &pg.tokens[pass];
+            let pass_tokens = pg.tokens[pass].as_slice();
             let mut w = BitWriter::new();
             let section_idx = 2 + num_dc_groups + pass * num_groups + pg.group_idx;
             let code_ref = codes[pass].as_ref();
             if code_ref.use_prefix_code {
-                for t in pass_tokens {
-                    write_token(*t, &code_ref, &mut w);
-                }
+                pass_tokens
+                    .iter()
+                    .for_each(|t| write_token(t, &code_ref, &mut w));
             } else {
                 // rANS: the whole group's tokens are encoded as one LIFO unit.
                 crate::entropy::write_ans_tokens(
@@ -4523,7 +4749,7 @@ type RefinedAcGroup = (usize, usize, usize, PendingAcGroup, Image3S);
 #[derive(Clone)]
 pub(crate) struct PendingAcGroup {
     pub(crate) group_idx: usize,
-    pub(crate) tokens: Vec<Vec<Token>>,
+    pub(crate) tokens: Vec<AcTokens>,
 }
 
 /// Closed-loop quant-field refinement (ExtraSlow). Every group is re-quantized
@@ -4553,7 +4779,6 @@ fn run_quant_field_loop(
     qf_threshold: u32,
     prices: &crate::entropy::FrozenTokenPrices,
 ) -> Option<(Vec<RefinedAcGroup>, DistanceParams)> {
-    use crate::ssimulacra2::ssimulacra2_deficit_and_map;
     /// Marginals and slope come from plain quantization; the ratio of deficit
     /// to bits is what the trellis preserves, at a third of the cost.
     const SHIFT_RDOQ: bool = false;
@@ -4577,7 +4802,8 @@ fn run_quant_field_loop(
     if xb < TILE_BLOCKS || yb < TILE_BLOCKS {
         return None;
     }
-    let metric = |recon: &Image3F| ssimulacra2_deficit_and_map(opsin, recon);
+    let reference = crate::ssimulacra2::Ssimulacra2Reference::new(opsin)?;
+    let metric = |recon: &Image3F| reference.deficit_and_map(recon);
     let blocks_per_dc = K_DC_GROUP_DIM / K_BLOCK_DIM;
 
     let locate = |bx: usize, by: usize| -> (usize, usize, usize) {
@@ -4777,25 +5003,25 @@ fn run_quant_field_loop(
         out
     };
     let frame_bits = |e: &Eval| {
-        prices.adaptive_bits(
-            e.pending
-                .iter()
-                .map(|p| p.as_ref().map_or(&[][..], |p| p.tokens[0].as_slice())),
-        )
+        prices.adaptive_bits(e.pending.iter().map(|p| {
+            p.as_ref()
+                .map_or(TokenSlice::Wide(&[]), |p| p.tokens[0].as_slice())
+        }))
     };
     // Frozen-price bits of every first block, indexed by frame block.
     let block_bits = |e: &Eval| -> Vec<f32> {
         let mut out = vec![0f32; xb * yb];
         for (t, starts) in e.starts.iter().enumerate() {
             let (dc_gx, dc_gy) = group_coords[ac_tasks[t].0];
-            let toks: &[Token] = e.pending[t]
+            let toks = e.pending[t]
                 .as_ref()
-                .map_or(&[], |p| p.tokens[0].as_slice());
+                .map_or(TokenSlice::Wide(&[]), |p| p.tokens[0].as_slice());
             for (i, &(lbx, lby, start)) in starts.iter().enumerate() {
                 let end = starts.get(i + 1).map_or(toks.len(), |s| s.2 as usize);
-                let bits: f32 = toks[start as usize..end]
+                let bits: f32 = toks
+                    .slice(start as usize..end)
                     .iter()
-                    .map(|&k| prices.token_bits(k))
+                    .map(|k| prices.token_bits(k))
                     .sum();
                 let bx = dc_gx * blocks_per_dc + lbx as usize;
                 let by = dc_gy * blocks_per_dc + lby as usize;
@@ -4937,9 +5163,7 @@ fn run_quant_field_loop(
                 judge.reset(&cur.recon, &decoded_dc(&cur, distp));
                 LoopArbiter::Cvvdp(Box::new(judge))
             }
-            None => LoopArbiter::Ssimulacra2(Box::new(crate::ssimulacra2::Ssimulacra2State::new(
-                opsin, &cur.recon,
-            ))),
+            None => LoopArbiter::Ssimulacra2(Box::new(reference.state(&cur.recon))),
         });
         (state.deficit(), state.map())
     };
@@ -5108,9 +5332,7 @@ fn run_quant_field_loop(
             // SSIMULACRA2 arbitrates the frame instead of the loop stopping.
             if cv_flat {
                 cv_slope = 0.0;
-                let state = LoopArbiter::Ssimulacra2(Box::new(
-                    crate::ssimulacra2::Ssimulacra2State::new(opsin, &cur.recon),
-                ));
+                let state = LoopArbiter::Ssimulacra2(Box::new(reference.state(&cur.recon)));
                 cur_d = state.deficit();
                 loop_state = Some(state);
             }
@@ -5182,7 +5404,7 @@ fn run_quant_field_loop(
             };
         let group_bits = |e: &Eval, task: usize| -> f32 {
             e.pending[task].as_ref().map_or(0.0, |p| {
-                p.tokens[0].iter().map(|&k| prices.token_bits(k)).sum()
+                p.tokens[0].iter().map(|k| prices.token_bits(k)).sum()
             })
         };
         // Rounds: candidates in distinct AC groups are re-encoded together in
@@ -5453,7 +5675,7 @@ fn run_quant_field_loop(
         };
         let group_bits = |e: &Eval, task: usize| -> f32 {
             e.pending[task].as_ref().map_or(0.0, |p| {
-                p.tokens[0].iter().map(|&k| prices.token_bits(k)).sum()
+                p.tokens[0].iter().map(|k| prices.token_bits(k)).sum()
             })
         };
         let copy_task = |from: &Eval, to: &mut Eval, task: usize, r: crate::ssimulacra2::Rect| {
@@ -5846,7 +6068,7 @@ fn run_quant_field_loop(
                 + e.pending[task].as_ref().map_or(0.0, |p| {
                     p.tokens[0]
                         .iter()
-                        .map(|&k| prices.token_bits(k))
+                        .map(|k| prices.token_bits(k))
                         .sum::<f32>()
                 })
         };
@@ -6634,7 +6856,7 @@ fn process_ac_group(
     (
         PendingAcGroup {
             group_idx: image_gy * dim.xsize_groups + image_gx,
-            tokens,
+            tokens: tokens.into_iter().map(AcTokens::from).collect(),
         },
         local_quant_dc,
         source_dc,
@@ -6678,6 +6900,40 @@ fn build_stripe(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn center_first_order_is_rings_around_the_center() {
+        // 2048x1365: 8x6 AC groups in one DC group, two passes.
+        let dim = super::ImageDim::new(2048, 1365);
+        let order = super::group_section_order(&dim, 2, crate::GroupOrder::CenterFirst);
+        let n = dim.num_groups;
+        assert_eq!(order.len(), 3 + 2 * n);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert!(sorted.iter().enumerate().all(|(i, &v)| i == v));
+        assert_eq!(&order[..3], &[0, 1, 2]);
+        // The four groups around the center lead each pass, starting top right.
+        let first: Vec<usize> = order[3..7].iter().map(|&s| s - 3).collect();
+        assert_eq!(first, [20, 28, 27, 19]);
+        let pass1: Vec<usize> = order[3 + n..].iter().map(|&s| s - 3 - n).collect();
+        let pass0: Vec<usize> = order[3..3 + n].iter().map(|&s| s - 3).collect();
+        assert_eq!(pass0, pass1);
+    }
+
+    #[test]
+    fn diagonal_order_draws_an_x_first() {
+        // 2048x1365: 8x6 AC groups. The first twelve form the X: the center
+        // four, then both diagonals outward.
+        let dim = super::ImageDim::new(2048, 1365);
+        let order = super::group_section_order(&dim, 1, crate::GroupOrder::Diagonals);
+        let groups: Vec<usize> = order[3..].iter().map(|&s| s - 3).collect();
+        let mut x: Vec<usize> = groups[..12].to_vec();
+        x.sort_unstable();
+        assert_eq!(x, [9, 10, 13, 14, 19, 20, 26, 27, 28, 29, 33, 38]);
+        let mut sorted = groups.clone();
+        sorted.sort_unstable();
+        assert!(sorted.iter().enumerate().all(|(i, &v)| i == v));
+    }
+
+    #[test]
     fn coefficient_order_race_prices_serialized_permutations_and_ac_sections() {
         use super::{PendingAcGroup, encode_order_arm};
         use crate::bit_writer::BitWriter;
@@ -6701,7 +6957,8 @@ mod tests {
                     tokens: vec![
                         (0..4096)
                             .map(|i| crate::entropy::Token::new(0, (i % 13) as u32))
-                            .collect(),
+                            .collect::<Vec<_>>()
+                            .into(),
                     ],
                 })
                 .collect();

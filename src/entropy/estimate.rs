@@ -31,18 +31,19 @@
 //! rate-model reconciliation log rely on.
 
 use crate::adaptive_quant::dirty_log2f;
-use crate::entropy::{OwnedEntropyCode, Token};
+use crate::entropy::{OwnedEntropyCode, TokenSlice};
 
 pub(crate) fn estimate_ac_plain_bits<'a, I>(streams: I, code: &OwnedEntropyCode) -> u64
 where
-    I: IntoIterator<Item = &'a [Token]>,
+    I: IntoIterator,
+    I::Item: Into<TokenSlice<'a>>,
 {
-    estimate_ac_plain_bits_shared(&mut streams.into_iter(), code)
+    estimate_ac_plain_bits_shared(&mut streams.into_iter().map(Into::into), code)
 }
 
 // Dispatch once per stream; keep the cost table and token loops shared.
 fn estimate_ac_plain_bits_shared(
-    streams: &mut dyn Iterator<Item = &[Token]>,
+    streams: &mut dyn Iterator<Item = TokenSlice<'_>>,
     code: &OwnedEntropyCode,
 ) -> u64 {
     if !code.use_prefix_code {
@@ -67,23 +68,23 @@ fn estimate_ac_plain_bits_shared(
             .collect();
         let mut bits = 0.0f64;
         for tokens in streams {
-            for t in tokens {
+            tokens.iter().for_each(|t| {
                 let cl = code.context_map[t.context as usize] as usize;
                 let (sym, nbits, _) =
                     crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
                 bits += cost[cl][sym as usize] as f64 + nbits as f64;
-            }
+            });
         }
         return bits as u64;
     }
     let mut bits: u64 = 0;
     for tokens in streams {
-        for t in tokens {
+        tokens.iter().for_each(|t| {
             let cl = code.context_map[t.context as usize] as usize;
             let (sym, nbits, _) =
                 crate::entropy::uint_encode_with_config(t.value, code.hybrid_uint_configs[cl]);
             bits += code.prefix_codes[cl].depths[sym as usize] as u64 + nbits as u64;
-        }
+        });
     }
     bits
 }

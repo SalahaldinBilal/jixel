@@ -248,7 +248,7 @@ fn encode_cmyk_impl<T: CmykSample + crate::encode_image::AsSignedInt>(
         .with_bits_per_sample(bps)
         .with_alpha(k_plane);
     let mut scratch = Box::<CoderScratch>::default();
-    encode_with_coded_planes(&linear, Some(&coded), &cfg, &ctx, &mut scratch)
+    encode_with_coded_planes(linear, Some(coded), &cfg, &ctx, &mut scratch)
 }
 
 /// K lattice step in stored units, held about as fine as luma.

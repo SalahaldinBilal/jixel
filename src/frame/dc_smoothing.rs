@@ -333,6 +333,8 @@ pub(super) fn flatten_chroma_dc(
 static CHROMA_DC_SQUEEZE_HF_STEPS: [f32; 4] = [0.5, 0.75, 1.0, 1.5];
 /// Required saving of the combined rate + distortion score.
 const CHROMA_DC_SQUEEZE_MARGIN: f64 = 0.98;
+/// At medium/low quality, allow a bounded error increase when rate pays for it.
+const CHROMA_DC_SQUEEZE_MAX_ERROR_RATIO: f64 = 1.15;
 
 /// Choose, per chroma channel, between the DC plane as quantized and a 2x
 /// finer DC step holding a one-level Haar reconstruction of the source DC
@@ -434,6 +436,11 @@ pub(super) fn choose_chroma_dc_coding(
         if base_d <= 0.0 {
             continue;
         }
+        let max_d = if distp.distance >= 3.0 {
+            base_d * CHROMA_DC_SQUEEZE_MAX_ERROR_RATIO
+        } else {
+            base_d
+        };
         let lambda = base_bits / base_d;
         let base_score = base_bits + lambda * base_d;
         // The finer step as the decoder will read it back.
@@ -458,7 +465,7 @@ pub(super) fn choose_chroma_dc_coding(
                 let back = (l as f32 + y_level * cfl_fine) * ratio - y_level * cfl_coarse;
                 d += f64::from(target - back).powi(2);
             }
-            if d > base_d {
+            if d > max_d {
                 continue;
             }
             let bits = plane_price(&levels, w, dim, dc_datas);

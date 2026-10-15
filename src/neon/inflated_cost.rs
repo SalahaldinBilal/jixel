@@ -505,6 +505,7 @@ fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
+    bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
     width: usize,
     height: usize,
@@ -559,7 +560,7 @@ fn recon_quantize_neon<const BIASED: bool, const COMPUTE_RATE: bool>(
             let quantized =
                 vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(scaled)), keep));
             let dequantized = if BIASED {
-                super::ac_strategy::neon_dequantized_level_f32(quantized)
+                super::ac_strategy::neon_dequantized_level_f32(quantized, bias)
             } else {
                 quantized
             };
@@ -739,6 +740,7 @@ fn recon_quantize_neon_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
+    bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
     width: usize,
     height: usize,
@@ -793,7 +795,7 @@ fn recon_quantize_neon_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
             let quantized =
                 vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(vrndaq_f32(scaled)), keep));
             let dequantized = if BIASED {
-                super::ac_strategy::neon_dequantized_level_f32(quantized)
+                super::ac_strategy::neon_dequantized_level_f32(quantized, bias)
             } else {
                 quantized
             };
@@ -913,6 +915,7 @@ mod tests {
                             &coeff,
                             &inv,
                             scale,
+                            crate::group::DequantBias::DEFAULT[case % 3],
                             &thresholds,
                             width,
                             height,
@@ -1007,6 +1010,7 @@ mod tests {
                     qm_mult_x: 1.2,
                     qm_mult_b: 1.6,
                     distance: 1.5,
+                    dequant_bias: crate::group::DequantBias::DEFAULT,
                 },
                 transform: ReconTransform {
                     blocks_x: cx,

@@ -169,16 +169,13 @@ pub(crate) fn gradient_region_stats_with_chroma_avx2(
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn avx_dequantized_level_f32(q: __m256) -> __m256 {
+pub(crate) fn avx_dequantized_level_f32(q: __m256, bias: crate::group::DequantBias) -> __m256 {
     let sign_mask = _mm256_set1_ps(-0.0);
     let absq = _mm256_andnot_ps(sign_mask, q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
-    let big = _mm256_sub_ps(
-        q,
-        _mm256_div_ps(_mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_3), q),
-    );
+    let big = _mm256_sub_ps(q, _mm256_div_ps(_mm256_set1_ps(bias.numerator), q));
     let sign = _mm256_and_ps(sign_mask, q);
-    let one = _mm256_or_ps(sign, _mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_1));
+    let one = _mm256_or_ps(sign, _mm256_set1_ps(bias.one));
     let use_big = _mm256_cmp_ps::<_CMP_GE_OQ>(absq, _mm256_set1_ps(1.125));
     let dq = _mm256_blendv_ps(one, big, use_big);
     let nz = _mm256_cmp_ps::<_CMP_GT_OQ>(absq, _mm256_setzero_ps());
@@ -193,6 +190,7 @@ pub(crate) fn sse_and_rate_avx2<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -206,6 +204,7 @@ pub(crate) fn sse_and_rate_avx2<const BIASED: bool>(
         coeff,
         inv_matrix,
         q_scaled,
+        bias,
         width,
         height,
         half,
@@ -224,6 +223,7 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -301,7 +301,7 @@ pub(crate) fn sse_and_rate_avx2_impl<const BIASED: bool, const SAVE_LEVELS: bool
             let q = _mm256_and_ps(rounded, keep);
 
             let d = if BIASED {
-                _mm256_sub_ps(a, avx_dequantized_level_f32(q))
+                _mm256_sub_ps(a, avx_dequantized_level_f32(q, bias))
             } else {
                 _mm256_sub_ps(a, q)
             };
@@ -390,6 +390,7 @@ pub(crate) fn sse_and_rate_avx2_impl_reference<const BIASED: bool, const SAVE_LE
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -467,7 +468,7 @@ pub(crate) fn sse_and_rate_avx2_impl_reference<const BIASED: bool, const SAVE_LE
             let q = _mm256_and_ps(rounded, keep);
 
             let d = if BIASED {
-                _mm256_sub_ps(a, avx_dequantized_level_f32(q))
+                _mm256_sub_ps(a, avx_dequantized_level_f32(q, bias))
             } else {
                 _mm256_sub_ps(a, q)
             };
@@ -614,6 +615,7 @@ mod tests {
         coeff: &[f32],
         inv: &[f32],
         qs: f32,
+        bias: crate::group::DequantBias,
         w: usize,
         h: usize,
         half: usize,
@@ -640,11 +642,7 @@ mod tests {
                 } else {
                     0.0
                 };
-                let d = if biased {
-                    a - crate::group::dequantized_level_f32(q)
-                } else {
-                    a - q
-                };
+                let d = if biased { a - bias.level_f32(q) } else { a - q };
                 sse += d * d;
                 if q != 0.0 {
                     nz += 1;
@@ -684,10 +682,13 @@ mod tests {
                 let coeff: Vec<f32> = (0..n).map(|_| (rnd() - 0.5) * coeff_scale).collect();
                 let inv: Vec<f32> = (0..n).map(|_| 0.001 + rnd() * 0.5).collect();
                 let qs = 0.5 + rnd() * 3.0;
+                let bias = crate::group::DequantBias::DEFAULT[case % 3];
                 let thr = [rnd() * 0.6, rnd() * 0.6, rnd() * 0.6, rnd() * 0.6];
                 let scan_pos = crate::coeff_order::scan_pos_lut(w, h);
                 for biased in [false, true] {
-                    let r = reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr, scan_pos, biased);
+                    let r = reference(
+                        &coeff, &inv, qs, bias, w, h, half, cx, cy, &thr, scan_pos, biased,
+                    );
                     let kernel = if biased {
                         sse_and_rate_avx2::<true>
                     } else {
@@ -698,6 +699,7 @@ mod tests {
                             &coeff,
                             &inv,
                             qs,
+                            bias,
                             w,
                             h,
                             half,

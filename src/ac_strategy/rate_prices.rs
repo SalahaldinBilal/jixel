@@ -478,6 +478,7 @@ impl RatePrices {
                         &coeffs[..size],
                         inverse_matrix_of(ctx, strategy, c),
                         qac * qm,
+                        ctx.dequant_bias(c),
                         width,
                         height,
                         width / 2,

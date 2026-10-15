@@ -155,15 +155,12 @@ pub(crate) fn gradient_region_stats_with_chroma_wasm(
 /// bounds-validated against `width*height`.
 #[inline]
 #[target_feature(enable = "simd128")]
-fn wasm_dequantized_level_f32(q: v128) -> v128 {
+fn wasm_dequantized_level_f32(q: v128, bias: crate::group::DequantBias) -> v128 {
     let absq = f32x4_abs(q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
-    let big = f32x4_sub(
-        q,
-        f32x4_div(f32x4_splat(crate::group::DEFAULT_QUANT_BIAS_3), q),
-    );
+    let big = f32x4_sub(q, f32x4_div(f32x4_splat(bias.numerator), q));
     let sign = v128_and(q, f32x4_splat(-0.0));
-    let one = v128_or(sign, f32x4_splat(crate::group::DEFAULT_QUANT_BIAS_1));
+    let one = v128_or(sign, f32x4_splat(bias.one));
     let use_big = f32x4_ge(absq, f32x4_splat(1.125));
     let dq = v128_bitselect(big, one, use_big);
     let nz = f32x4_gt(absq, f32x4_splat(0.0));
@@ -176,6 +173,7 @@ pub(crate) fn sse_and_rate_wasm<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -189,6 +187,7 @@ pub(crate) fn sse_and_rate_wasm<const BIASED: bool>(
         coeff,
         inv_matrix,
         q_scaled,
+        bias,
         width,
         height,
         half,
@@ -207,6 +206,7 @@ pub(crate) fn sse_and_rate_wasm_impl<const BIASED: bool, const SAVE_LEVELS: bool
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -277,7 +277,7 @@ pub(crate) fn sse_and_rate_wasm_impl<const BIASED: bool, const SAVE_LEVELS: bool
             let q = v128_and(rounded, keep);
 
             let d = if BIASED {
-                f32x4_sub(a, wasm_dequantized_level_f32(q))
+                f32x4_sub(a, wasm_dequantized_level_f32(q, bias))
             } else {
                 f32x4_sub(a, q)
             };
@@ -348,6 +348,7 @@ pub(crate) fn sse_and_rate_wasm_impl_reference<const BIASED: bool, const SAVE_LE
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -418,7 +419,7 @@ pub(crate) fn sse_and_rate_wasm_impl_reference<const BIASED: bool, const SAVE_LE
             let q = v128_and(rounded, keep);
 
             let d = if BIASED {
-                f32x4_sub(a, wasm_dequantized_level_f32(q))
+                f32x4_sub(a, wasm_dequantized_level_f32(q, bias))
             } else {
                 f32x4_sub(a, q)
             };

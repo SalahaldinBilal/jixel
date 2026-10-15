@@ -78,6 +78,7 @@ pub(crate) type SseAndRateFn = unsafe fn(
     &[f32],
     &[f32],
     f32,
+    crate::group::DequantBias,
     usize,
     usize,
     usize,
@@ -126,6 +127,7 @@ pub(crate) type SseAndQuantizeFn = unsafe fn(
     &[f32],
     &[f32],
     f32,
+    crate::group::DequantBias,
     usize,
     usize,
     usize,
@@ -260,6 +262,7 @@ fn fused_coefficient_scoring_preserves_distortion_and_coding_levels() {
                                 &coeffs,
                                 &inverse,
                                 qac * qm,
+                                crate::group::DequantBias::DEFAULT[c],
                                 width,
                                 height,
                                 width / 2,
@@ -275,6 +278,7 @@ fn fused_coefficient_scoring_preserves_distortion_and_coding_levels() {
                                 &coeffs,
                                 &inverse,
                                 qac * qm,
+                                crate::group::DequantBias::DEFAULT[c],
                                 width,
                                 height,
                                 width / 2,
@@ -324,6 +328,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
             let coeff: Vec<f32> = (0..n).map(|_| (random() - 0.5) * coeff_scale).collect();
             let inv: Vec<f32> = (0..n).map(|_| 0.001 + random() * 0.5).collect();
             let q_scaled = 0.5 + random() * 3.0;
+            let bias = crate::group::DequantBias::DEFAULT[case % 3];
             let thr = [
                 random() * 0.6,
                 random() * 0.6,
@@ -349,11 +354,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
                     } else {
                         0.0
                     };
-                    let d = if biased {
-                        a - crate::group::dequantized_level_f32(q)
-                    } else {
-                        a - q
-                    };
+                    let d = if biased { a - bias.level_f32(q) } else { a - q };
                     expected_sse += d * d;
                     if q != 0.0 {
                         expected_nzeros += 1;
@@ -368,6 +369,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
                     &coeff,
                     &inv,
                     q_scaled,
+                    bias,
                     width,
                     height,
                     half,
@@ -454,6 +456,7 @@ pub(crate) fn assert_coefficient_kernel_preserves_original(
                     &coeff,
                     &inv,
                     scale,
+                    crate::group::DequantBias::DEFAULT[case % 3],
                     width,
                     height,
                     width / 2,
@@ -487,6 +490,7 @@ pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -500,6 +504,7 @@ pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
         coeff,
         inv_matrix,
         q_scaled,
+        bias,
         width,
         height,
         half,
@@ -517,6 +522,7 @@ pub(crate) fn sse_and_rate_scalar_impl<const BIASED: bool, const SAVE_LEVELS: bo
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -552,11 +558,7 @@ pub(crate) fn sse_and_rate_scalar_impl<const BIASED: bool, const SAVE_LEVELS: bo
             if SAVE_LEVELS {
                 levels[y * width + x] = q as i32;
             }
-            let d = if BIASED {
-                a - crate::group::dequantized_level_f32(q)
-            } else {
-                a - q
-            };
+            let d = if BIASED { a - bias.level_f32(q) } else { a - q };
             sse += d * d;
             if q != 0.0 {
                 nzeros += 1;
@@ -587,6 +589,7 @@ pub(crate) fn channel_rd(
     coeff: &[f32],
     inv_matrix: &[f32],
     channel: usize,
+    bias: crate::group::DequantBias,
     qac: f32,
     qm_mult: f32,
     distance: f32,
@@ -603,6 +606,7 @@ pub(crate) fn channel_rd(
             coeff,
             inv_matrix,
             qac * qm_mult,
+            bias,
             width,
             height,
             half,
@@ -876,6 +880,7 @@ pub(crate) type ReconQuantizeFn = unsafe fn(
     &[f32],
     &[f32],
     f32,
+    crate::group::DequantBias,
     &[f32; 4],
     usize,
     usize,
@@ -904,6 +909,7 @@ pub(crate) struct ReconQuantization<'a> {
     pub(crate) qm_mult_x: f32,
     pub(crate) qm_mult_b: f32,
     pub(crate) distance: f32,
+    pub(crate) dequant_bias: [crate::group::DequantBias; 3],
 }
 
 pub(crate) struct ReconTransform {
@@ -1335,6 +1341,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
             &coeffs[1][..n],
             &inverse_matrices[1][..n],
             quant_scales[1],
+            quantization.dequant_bias[1],
             &thresholds[1],
             width,
             height,
@@ -1359,6 +1366,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                 &combined_error[..n],
                 &inverse_matrices[c][..n],
                 quant_scales[c],
+                quantization.dequant_bias[c],
                 &thresholds[c],
                 width,
                 height,
@@ -1742,6 +1750,7 @@ fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
+    bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
     width: usize,
     height: usize,
@@ -1789,7 +1798,7 @@ fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool>(
                 0.0
             };
             *error = if BIASED {
-                (scaled - crate::group::dequantized_level_f32(quantized)) / denominator
+                (scaled - bias.level_f32(quantized)) / denominator
             } else {
                 (scaled - quantized) / denominator
             };
@@ -2149,6 +2158,7 @@ mod tests {
                         qm_mult_x: 1.2,
                         qm_mult_b: 1.6,
                         distance: 1.5,
+                        dequant_bias: crate::group::DequantBias::DEFAULT,
                     },
                     transform: ReconTransform {
                         blocks_x: cx / 8,
@@ -2228,6 +2238,7 @@ mod tests {
                             qm_mult_x: 1.2,
                             qm_mult_b: 1.6,
                             distance: 1.5,
+                            dequant_bias: crate::group::DequantBias::DEFAULT,
                         },
                         transform: ReconTransform {
                             blocks_x: cx / 8,
@@ -2312,6 +2323,7 @@ mod tests {
                 qm_mult_x: 1.2,
                 qm_mult_b: 1.6,
                 distance: 4.0,
+                dequant_bias: crate::group::DequantBias::DEFAULT,
             },
             transform: ReconTransform {
                 blocks_x: 1,

@@ -158,16 +158,13 @@ pub(crate) fn gradient_region_stats_with_chroma_sse41(
 /// bounds-validated against `width*height`.
 #[inline]
 #[target_feature(enable = "sse4.1")]
-pub(super) fn sse_dequantized_level_f32(q: __m128) -> __m128 {
+pub(super) fn sse_dequantized_level_f32(q: __m128, bias: crate::group::DequantBias) -> __m128 {
     let sign_mask = _mm_set1_ps(-0.0);
     let absq = _mm_andnot_ps(sign_mask, q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
-    let big = _mm_sub_ps(
-        q,
-        _mm_div_ps(_mm_set1_ps(crate::group::DEFAULT_QUANT_BIAS_3), q),
-    );
+    let big = _mm_sub_ps(q, _mm_div_ps(_mm_set1_ps(bias.numerator), q));
     let sign = _mm_and_ps(sign_mask, q);
-    let one = _mm_or_ps(sign, _mm_set1_ps(crate::group::DEFAULT_QUANT_BIAS_1));
+    let one = _mm_or_ps(sign, _mm_set1_ps(bias.one));
     let use_big = _mm_cmpge_ps(absq, _mm_set1_ps(1.125));
     let dq = _mm_blendv_ps(one, big, use_big);
     let nz = _mm_cmpgt_ps(absq, _mm_setzero_ps());
@@ -180,6 +177,7 @@ pub(crate) fn sse_and_rate_sse<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -193,6 +191,7 @@ pub(crate) fn sse_and_rate_sse<const BIASED: bool>(
         coeff,
         inv_matrix,
         q_scaled,
+        bias,
         width,
         height,
         half,
@@ -211,6 +210,7 @@ pub(crate) fn sse_and_rate_sse_impl<const BIASED: bool, const SAVE_LEVELS: bool>
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -282,7 +282,7 @@ pub(crate) fn sse_and_rate_sse_impl<const BIASED: bool, const SAVE_LEVELS: bool>
             let q = _mm_and_ps(rounded, keep);
 
             let d = if BIASED {
-                _mm_sub_ps(a, sse_dequantized_level_f32(q))
+                _mm_sub_ps(a, sse_dequantized_level_f32(q, bias))
             } else {
                 _mm_sub_ps(a, q)
             };
@@ -358,6 +358,7 @@ pub(crate) fn sse_and_rate_sse_impl_reference<const BIASED: bool, const SAVE_LEV
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -429,7 +430,7 @@ pub(crate) fn sse_and_rate_sse_impl_reference<const BIASED: bool, const SAVE_LEV
             let q = _mm_and_ps(rounded, keep);
 
             let d = if BIASED {
-                _mm_sub_ps(a, sse_dequantized_level_f32(q))
+                _mm_sub_ps(a, sse_dequantized_level_f32(q, bias))
             } else {
                 _mm_sub_ps(a, q)
             };

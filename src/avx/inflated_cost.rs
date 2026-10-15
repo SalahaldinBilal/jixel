@@ -520,19 +520,13 @@ fn recon_dist_and_rate_avx2_impl<const BIASED: bool>(
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn avx_dequantized_level_f32(q: __m256) -> __m256 {
+fn avx_dequantized_level_f32(q: __m256, bias: crate::group::DequantBias) -> __m256 {
     let sign_mask = _mm256_set1_ps(-0.0);
     let absq = _mm256_andnot_ps(sign_mask, q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
-    let big = _mm256_sub_ps(
-        q,
-        _mm256_div_ps(_mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_3), q),
-    );
+    let big = _mm256_sub_ps(q, _mm256_div_ps(_mm256_set1_ps(bias.numerator), q));
     let sign_bits = _mm256_and_ps(sign_mask, q);
-    let one = _mm256_or_ps(
-        sign_bits,
-        _mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_1),
-    );
+    let one = _mm256_or_ps(sign_bits, _mm256_set1_ps(bias.one));
     let use_big = _mm256_cmp_ps::<_CMP_GE_OQ>(absq, _mm256_set1_ps(1.125));
     let dq = _mm256_blendv_ps(one, big, use_big);
     let nz = _mm256_cmp_ps::<_CMP_GT_OQ>(absq, _mm256_setzero_ps());
@@ -545,6 +539,7 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
+    bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
     width: usize,
     height: usize,
@@ -608,7 +603,7 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
             let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
             let dequantized = if BIASED {
-                avx_dequantized_level_f32(quantized)
+                avx_dequantized_level_f32(quantized, bias)
             } else {
                 quantized
             };
@@ -680,6 +675,7 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
+    bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
     width: usize,
     height: usize,
@@ -743,7 +739,7 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
             let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
             let dequantized = if BIASED {
-                avx_dequantized_level_f32(quantized)
+                avx_dequantized_level_f32(quantized, bias)
             } else {
                 quantized
             };
@@ -996,6 +992,7 @@ mod tests {
                             &coeff,
                             &inv,
                             scale,
+                            crate::group::DequantBias::DEFAULT[case % 3],
                             &thresholds,
                             width,
                             height,
@@ -1096,6 +1093,7 @@ mod tests {
                     qm_mult_x: 1.2,
                     qm_mult_b: 1.6,
                     distance: 1.5,
+                    dequant_bias: crate::group::DequantBias::DEFAULT,
                 },
                 transform: ReconTransform {
                     blocks_x: cx,

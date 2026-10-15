@@ -605,6 +605,7 @@ fn strategy_cost64(
             &coeff[..size],
             matrix,
             c,
+            ctx.dequant_bias(c),
             qac,
             qm_mult,
             distance,
@@ -862,6 +863,7 @@ fn coefficient_dist_and_rate(
             &coeffs[c][..size],
             inverse_matrix_for(ctx, strategy, c),
             c,
+            ctx.dequant_bias(c),
             qac,
             qm_mult,
             distance,
@@ -1015,6 +1017,7 @@ fn reconstruction_dist_and_rate(
                 qm_mult_x,
                 qm_mult_b: ctx.b_qm_mul(),
                 distance,
+                dequant_bias: std::array::from_fn(|c| ctx.dequant_bias(c)),
             },
             transform: ReconTransform {
                 blocks_x: cx,

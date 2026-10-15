@@ -30,7 +30,14 @@
 use std::arch::aarch64::*;
 
 #[target_feature(enable = "neon")]
-pub(crate) fn cfl_rd_cost_neon(m: &[f32], s: &[f32], factor: f32, weight: f32, lambda: f32) -> f32 {
+pub(crate) fn cfl_rd_cost_neon(
+    m: &[f32],
+    s: &[f32],
+    factor: f32,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+) -> f32 {
     use crate::color_correlation::{CFL_MAGNITUDE_BITS, CFL_NONZERO_BITS};
     let len = m.len().min(s.len());
     let factor_v = vdupq_n_f32(factor);
@@ -50,7 +57,7 @@ pub(crate) fn cfl_rd_cost_neon(m: &[f32], s: &[f32], factor: f32, weight: f32, l
         let level = vrndaq_f32(residual);
         let coded_err = vsubq_f32(
             residual,
-            super::ac_strategy::neon_dequantized_level_f32(level),
+            super::ac_strategy::neon_dequantized_level_f32(level, bias),
         );
         let abs_level = vabsq_f32(level);
         // log2(|level|) = log2(1 + (|level| - 1)); only read where level != 0.
@@ -68,7 +75,7 @@ pub(crate) fn cfl_rd_cost_neon(m: &[f32], s: &[f32], factor: f32, weight: f32, l
         let mut best = weight * residual * residual;
         let level = residual.round();
         if level != 0.0 {
-            let coded_err = residual - crate::group::dequantized_level_f32(level);
+            let coded_err = residual - bias.level_f32(level);
             let coded = weight * coded_err * coded_err
                 + lambda
                     * (CFL_NONZERO_BITS

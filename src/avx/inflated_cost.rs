@@ -489,7 +489,7 @@ pub(crate) fn combine_error_avx2(spatial: &[f32], luma: &[f32], factor: f32, com
 /// any vector load or store.
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn recon_dist_and_rate_avx2(
-    scratch: &mut [[f32; 1024]; 8],
+    scratch: &mut [[f32; 4096]; 8],
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
 ) -> ReconCost {
@@ -498,7 +498,7 @@ pub(crate) fn recon_dist_and_rate_avx2(
 
 #[target_feature(enable = "avx2,fma")]
 fn recon_dist_and_rate_avx2_impl<const BIASED: bool>(
-    scratch: &mut [[f32; 1024]; 8],
+    scratch: &mut [[f32; 4096]; 8],
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
 ) -> ReconCost {
@@ -1058,7 +1058,7 @@ mod tests {
                 }
             }
         }
-        let mut coeffs = [[0.0f32; 1024]; 3];
+        let mut coeffs = [[0.0f32; 4096]; 3];
         let mut state = 17u32;
         for channel in &mut coeffs {
             for value in channel {
@@ -1066,7 +1066,7 @@ mod tests {
                 *value = ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0;
             }
         }
-        let inv_storage = [vec![1.0f32; 1024], vec![0.9f32; 1024], vec![1.1f32; 1024]];
+        let inv_storage = [vec![1.0f32; 4096], vec![0.9f32; 4096], vec![1.1f32; 4096]];
         let idct = crate::dct::IdctMethods::scalar();
         for (strategy, cx, cy) in [
             (STRATEGY_DCT, 1, 1),
@@ -1076,6 +1076,9 @@ mod tests {
             (STRATEGY_DCT16X32, 4, 2),
             (STRATEGY_DCT32X16, 4, 2),
             (STRATEGY_DCT32X32, 4, 4),
+            (crate::dc_group_data::STRATEGY_DCT64X64, 8, 8),
+            (crate::dc_group_data::STRATEGY_DCT64X32, 8, 4),
+            (crate::dc_group_data::STRATEGY_DCT32X64, 8, 4),
         ] {
             let inv = [
                 &inv_storage[0][..],
@@ -1117,7 +1120,7 @@ mod tests {
                 },
             };
             for biased in [false, true] {
-                let mut scalar_scratch = [[0.0f32; 1024]; 8];
+                let mut scalar_scratch = [[0.0f32; 4096]; 8];
                 let scalar = if biased {
                     recon_dist_and_rate_scalar::<true>(&mut scalar_scratch, &input)
                 } else {
@@ -1135,7 +1138,7 @@ mod tests {
                     },
                     rgb_hue_chroma_edge_loss: rgb_hue_chroma_edge_loss_avx2,
                 };
-                let mut simd_scratch = [[0.0f32; 1024]; 8];
+                let mut simd_scratch = [[0.0f32; 4096]; 8];
                 let simd = unsafe {
                     if biased {
                         recon_dist_and_rate_avx2_impl::<true>(
@@ -1151,7 +1154,9 @@ mod tests {
                         )
                     }
                 };
-                let rate_tolerance = 2e-4f32.max(scalar.rate.abs() * 3e-6);
+                // Larger footprints accumulate more scalar/SIMD sum-order error.
+                let relative_rate_tolerance = if cx * cy > 16 { 6e-6 } else { 3e-6 };
+                let rate_tolerance = 2e-4f32.max(scalar.rate.abs() * relative_rate_tolerance);
                 assert!(
                     (simd.rate - scalar.rate).abs() <= rate_tolerance,
                     "strategy {strategy} biased={biased} rate: simd={} scalar={}",

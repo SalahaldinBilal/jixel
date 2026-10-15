@@ -36,9 +36,10 @@ use crate::ac_context::{
 use crate::dc_group_data::{
     AcStrategyImage, DcGroupData, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3,
     STRATEGY_DCT, STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
-    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
-    STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_DCT64X128,
-    STRATEGY_DCT128X64, STRATEGY_DCT128X128, STRATEGY_IDENTITY,
+    STRATEGY_DCT8X16, STRATEGY_DCT8X32, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
+    STRATEGY_DCT32X8, STRATEGY_DCT32X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32,
+    STRATEGY_DCT64X64, STRATEGY_DCT64X128, STRATEGY_DCT128X64, STRATEGY_DCT128X128,
+    STRATEGY_IDENTITY,
 };
 use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, fmla};
 use crate::encoding_context::EncodingContext;
@@ -693,6 +694,8 @@ fn rdoq_block_wide_oracle(
             | STRATEGY_DCT32X32
             | STRATEGY_DCT32X16
             | STRATEGY_DCT16X32
+            | STRATEGY_DCT32X8
+            | STRATEGY_DCT8X32
             | STRATEGY_DCT64X64
             | STRATEGY_DCT64X32
             | STRATEGY_DCT32X64
@@ -1965,6 +1968,14 @@ pub(crate) fn write_ac_group(
                             let dst: &mut [f32; 512] = coeffs[c].first_chunk_mut::<512>().unwrap();
                             (ctx.dct16x32)(DctInput::new(input, stride), dst);
                         }
+                        STRATEGY_DCT32X8 => {
+                            let dst: &mut [f32; 256] = coeffs[c].first_chunk_mut::<256>().unwrap();
+                            (ctx.dct32x8)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT8X32 => {
+                            let dst: &mut [f32; 256] = coeffs[c].first_chunk_mut::<256>().unwrap();
+                            (ctx.dct8x32)(DctInput::new(input, stride), dst);
+                        }
                         STRATEGY_AFV0 => {
                             let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
                             (ctx.afv0)(DctInput::new(input, stride), dst);
@@ -2076,6 +2087,14 @@ pub(crate) fn write_ac_group(
                             (ctx.dc_from_dct16x32)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
                         }
                     }
+                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
+                        // Four DC values along the long axis: a 4x1 column or
+                        // 1x4 row, both in didx order.
+                        for c in 0..3 {
+                            let cb: &[f32; 256] = coeffs[c].first_chunk::<256>().unwrap();
+                            (ctx.dc_from_dct8x32)(cb, dc_vals[c].first_chunk_mut::<4>().unwrap());
+                        }
+                    }
                     STRATEGY_DCT128X128 => {
                         for c in 0..3 {
                             (ctx.dc_from_dct128x128)(
@@ -2176,6 +2195,9 @@ pub(crate) fn write_ac_group(
                 }
                 STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
                     (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
+                }
+                STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
+                    (&matrices.inv_matrix_8x32(1)[..], &matrices.matrix_8x32(1)[..])
                 }
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
@@ -2411,6 +2433,12 @@ pub(crate) fn write_ac_group(
                         (ctx.dc_from_dct16x32)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
                         (ctx.dc_from_dct16x32)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
                     }
+                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
+                        let xb: &[f32; 256] = coeffs[0].first_chunk::<256>().unwrap();
+                        let bb: &[f32; 256] = coeffs[2].first_chunk::<256>().unwrap();
+                        (ctx.dc_from_dct8x32)(xb, x_dc_post.first_chunk_mut::<4>().unwrap());
+                        (ctx.dc_from_dct8x32)(bb, b_dc_post.first_chunk_mut::<4>().unwrap());
+                    }
                     STRATEGY_DCT128X128 => {
                         (ctx.dc_from_dct128x128)(
                             coeffs[0].first_chunk::<16384>().unwrap(),
@@ -2460,6 +2488,7 @@ pub(crate) fn write_ac_group(
                     }
                     STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(0)[..],
                     STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(0)[..],
+                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => &matrices.inv_matrix_8x32(0)[..],
                     _ => &matrices.inv_matrix_16x8(0)[..],
                 };
                 let mut chroma_dc_q = [0i16; 256];
@@ -2573,6 +2602,7 @@ pub(crate) fn write_ac_group(
                     }
                     STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(2)[..],
                     STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(2)[..],
+                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => &matrices.inv_matrix_8x32(2)[..],
                     _ => &matrices.inv_matrix_16x8(2)[..],
                 };
                 if !hit[2] {

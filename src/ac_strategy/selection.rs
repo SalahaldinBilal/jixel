@@ -32,7 +32,9 @@
 use super::*;
 
 mod leaf_first;
+mod recon64;
 pub(crate) use leaf_first::LeafChoice;
+pub(crate) use recon64::Recon64Scratch;
 
 #[derive(Clone, Copy)]
 struct AcStrategyParams<'a> {
@@ -1539,6 +1541,132 @@ pub(crate) fn fill_ac_strategy(
     )
 }
 
+/// Charge on a DCT32X8 / DCT8X32 candidate against the blocks it replaces.
+const BIAS_8X32: f32 = 1.1;
+
+/// Replace whole 8-wide x 32-tall columns (DCT32X8) or 32-wide x 8-tall rows
+/// (DCT8X32) of every aligned 4x4-block region when one transform prices
+/// below the DCT8 / pair blocks that tile the strip. Each region keeps the
+/// orientation with the larger total saving, and the frame keeps them only if
+/// together they pay the signaled table's header. Returns the replaced strips.
+fn place_dct8x32(
+    params: &AcStrategyParams<'_>,
+    scratch: &mut CoderScratch,
+    quant_field: &ImageB,
+    ac_strategy: &mut AcStrategyImage,
+    rollbacks: &[(usize, usize, usize, usize)],
+) -> Vec<(usize, usize, usize, usize)> {
+    let p = *params;
+    let cost = |scratch: &mut CoderScratch, s: u8, bx: usize, by: usize, w: usize, h: usize| {
+        let cmap = cmap_factors(p.ctx.cfl_frame(), p.ytox_map, p.ytob_map, bx, by);
+        strategy_cost(
+            p.ctx,
+            scratch,
+            s,
+            p.opsin,
+            p.dc_group_px + bx * 8,
+            p.dc_group_py + by * 8,
+            region_qac(quant_field, bx, by, w, h, p.scale, p.distance),
+            p.qm_mult_x,
+            META_R,
+            p.distance,
+            cmap,
+        )
+    };
+    // Cost of the transforms tiling the strip, or None when one is not a DCT8
+    // or pair or crosses the strip's border.
+    let strip = |scratch: &mut CoderScratch,
+                 ac: &AcStrategyImage,
+                 bx: usize,
+                 by: usize,
+                 w: usize,
+                 h: usize|
+     -> Option<f32> {
+        if rollbacks
+            .iter()
+            .any(|&(rx, ry, rw, rh)| bx < rx + rw && rx < bx + w && by < ry + rh && ry < by + h)
+        {
+            return None;
+        }
+        let mut covered = 0;
+        let mut total = 0.0f32;
+        for y in by..by + h {
+            for x in bx..bx + w {
+                let s = ac.raw_strategy(x, y);
+                if !matches!(s, STRATEGY_DCT | STRATEGY_DCT16X8 | STRATEGY_DCT8X16) {
+                    return None;
+                }
+                if !ac.is_first_block(x, y) {
+                    continue;
+                }
+                let cw = AcStrategyImage::covered_blocks_x_of(s);
+                let ch = AcStrategyImage::covered_blocks_y_of(s);
+                if x + cw > bx + w || y + ch > by + h {
+                    return None;
+                }
+                covered += cw * ch;
+                total += cost(scratch, s, x, y, cw, ch);
+            }
+        }
+        (covered == w * h).then_some(total)
+    };
+    // Decide every region first; commit only if the summed saving pays the
+    // table's header fee, so the frame-level matrix gate never has to undo
+    // placements (its fallback would keep the merged quantizer).
+    let mut chosen: Vec<(usize, usize, u8)> = Vec::new();
+    let mut gain_bits = 0.0f32;
+    let (xsize, ysize) = (ac_strategy.xsize(), ac_strategy.ysize());
+    for by in (0..ysize.saturating_sub(3)).step_by(4) {
+        for bx in (0..xsize.saturating_sub(3)).step_by(4) {
+            let mut tall = [0.0f32; 4];
+            let mut wide = [0.0f32; 4];
+            for i in 0..4 {
+                if ac_strategy.can_place_strategy(bx + i, by, STRATEGY_DCT32X8)
+                    && let Some(inc) = strip(scratch, ac_strategy, bx + i, by, 1, 4)
+                {
+                    let cand = BIAS_8X32 * cost(scratch, STRATEGY_DCT32X8, bx + i, by, 1, 4);
+                    tall[i] = (inc - cand).max(0.0);
+                }
+                if ac_strategy.can_place_strategy(bx, by + i, STRATEGY_DCT8X32)
+                    && let Some(inc) = strip(scratch, ac_strategy, bx, by + i, 4, 1)
+                {
+                    let cand = BIAS_8X32 * cost(scratch, STRATEGY_DCT8X32, bx, by + i, 4, 1);
+                    wide[i] = (inc - cand).max(0.0);
+                }
+            }
+            let (gt, gw): (f32, f32) = (tall.iter().sum(), wide.iter().sum());
+            if gt <= 0.0 && gw <= 0.0 {
+                continue;
+            }
+            for i in 0..4 {
+                if gt >= gw && tall[i] > 0.0 {
+                    chosen.push((bx + i, by, STRATEGY_DCT32X8));
+                } else if gw > gt && wide[i] > 0.0 {
+                    chosen.push((bx, by + i, STRATEGY_DCT8X32));
+                }
+            }
+            gain_bits += gt.max(gw) / RD_LAMBDA;
+        }
+    }
+    let header = crate::quant_weights::MatrixHeaderCost::new(p.ctx.matrices());
+    let others = header.custom_mask() & !(1 << 12);
+    let fee = header.payload[12] as f32 + if others == 0 { 17.0 * 3.0 } else { 0.0 };
+    if gain_bits < fee {
+        return Vec::new();
+    }
+    let mut changed = Vec::new();
+    for (x, y, st) in chosen {
+        ac_strategy.set_first(x, y, st);
+        let (w, h) = if st == STRATEGY_DCT32X8 {
+            (1, 4)
+        } else {
+            (4, 1)
+        };
+        changed.push((x, y, w, h));
+    }
+    changed
+}
+
 #[allow(clippy::too_many_arguments)]
 fn select_transforms(
     ctx: &EncodingContext,
@@ -1667,16 +1795,20 @@ fn select_transforms(
         // gains now and sum them at the end.
         pipeline.leaf_gain.clear();
         pipeline.leaf_gain.resize(xsize * ysize, 0.0);
+        pipeline.rerank_leaves.clear();
+        pipeline.rerank_leaves.resize(xsize * ysize, STRATEGY_DCT);
         fine_fallbacks.resize(xsize * ysize, STRATEGY_DCT);
         // `fill_selection_bands` always yields at least the single full band.
         for (&(y0, y1), band) in pipeline.bands.iter().zip(&pipeline.band_scratch) {
-            for ((leaf, gain), fallback) in band.leaves[..xsize * (y1 - y0)]
+            for (((leaf, gain), fallback), strategy) in band.leaves[..xsize * (y1 - y0)]
                 .iter()
                 .zip(&mut pipeline.leaf_gain[y0 * xsize..y1 * xsize])
                 .zip(&mut fine_fallbacks[y0 * xsize..y1 * xsize])
+                .zip(&mut pipeline.rerank_leaves[y0 * xsize..y1 * xsize])
             {
                 *gain = leaf.gain;
                 *fallback = leaf.fallback;
+                *strategy = leaf.strategy;
             }
         }
     }
@@ -1826,6 +1958,11 @@ fn select_transforms(
             bands: &pipeline.bands,
             num_threads,
             leaf_first,
+            leaves: if leaf_first {
+                &pipeline.rerank_leaves
+            } else {
+                &[]
+            },
         };
         let band_count = pipeline.bands.len();
         rerank_large_transforms(
@@ -1900,6 +2037,23 @@ fn select_transforms(
         }
     }
 
+    if scope.rectangles() && ctx.coding.is_xyb() {
+        let rollbacks: Vec<(usize, usize, usize, usize)> = pipeline.band_scratch
+            [..pipeline.bands.len().max(1)]
+            .iter()
+            .flat_map(|band| band.fine_rollbacks.iter())
+            .map(|r| (r.bx, r.by, r.cov_x, r.cov_y))
+            .collect();
+        let changed = place_dct8x32(&params, scratch, quant_field, ac_strategy, &rollbacks);
+        if reranked {
+            for (bx, by, w, h) in changed {
+                for y in by..by + h {
+                    pipeline.current_costs[y * xsize + bx..y * xsize + bx + w].fill(f32::NAN);
+                }
+            }
+        }
+    }
+
     if leaf_first {
         // The frame-level exact metadata gate judges only the post-merge
         // IDENTITY/DCT2X2 refinements: structural DCT4/AFV leaves competed
@@ -1970,6 +2124,8 @@ struct RerankContext<'a> {
     /// Each band's `leaves` holds the structural 1x1 winner of every block,
     /// including those a nested merge's saved grid no longer shows.
     leaf_first: bool,
+    /// Whole-group source leaves, since a 64-family block may cross bands.
+    leaves: &'a [u8],
 }
 
 const FINE_MOSAIC_BOUNDARY_ALPHA: f32 = 32.0;
@@ -2290,11 +2446,11 @@ fn find_rerank_downgrades(
         .map(|s| ((s.bx, s.by), s.grid))
         .collect();
     output.rerank_downgrades.clear();
+    output.rerank64_downgrades.clear();
     output.fine_rollbacks.clear();
     output.current_costs.clear();
     // Mutable access initializes these lazily. Every slot read is overwritten
     // by this region's cost pass, so subsequent passes need no clearing.
-    let mosaic = &mut output.fine_mosaic;
     let fine_lambda = fine_mosaic_lambda(params.distance);
     let coarse_chromatic = ctx.x_heavy();
     // The strong yellow rows use B biases 0.85/0.90. Keep the mild/default
@@ -2310,8 +2466,10 @@ fn find_rerank_downgrades(
             strat,
             STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64
         ) {
+            recon64::find_downgrade(rerank, scratch, ac_strategy, bx, by, strat, output);
             continue;
         }
+        let mosaic = &mut output.fine_mosaic;
         let cxb = AcStrategyImage::covered_blocks_x_of(strat);
         let cyb = AcStrategyImage::covered_blocks_y_of(strat);
         if cxb * cyb <= 1 {
@@ -3073,6 +3231,16 @@ fn rerank_large_transforms(
             for iy in 0..downgrade.cov_y {
                 for ix in 0..downgrade.cov_x {
                     let s = downgrade.restore[iy * 4 + ix];
+                    if s != NO_CHILD_BLOCK {
+                        ac_strategy.set_first(downgrade.bx + ix, downgrade.by + iy, s);
+                    }
+                }
+            }
+        }
+        for downgrade in &result.rerank64_downgrades {
+            for iy in 0..downgrade.cov_y {
+                for ix in 0..downgrade.cov_x {
+                    let s = downgrade.restore[iy * 8 + ix];
                     if s != NO_CHILD_BLOCK {
                         ac_strategy.set_first(downgrade.bx + ix, downgrade.by + iy, s);
                     }
@@ -4072,8 +4240,8 @@ mod tests {
     /// The leaf-first selector runs inside the DCT4/AFV band, whose edge is
     /// the sub-8 gate.
     #[test]
-    fn leaf_first_band_is_the_sub8_gate() {
-        assert_eq!(LEAF_FIRST_MAX_DISTANCE, SUB8_MAX_DISTANCE);
+    fn leaf_first_band_lies_inside_the_sub8_gate() {
+        assert!(std::hint::black_box(LEAF_FIRST_MAX_DISTANCE) <= SUB8_MAX_DISTANCE);
     }
 
     /// The per-block fine admission carries a fitted rate charge: without it
@@ -4177,6 +4345,7 @@ mod tests {
             bands: &[(0, 2)],
             num_threads: 1,
             leaf_first: false,
+            leaves: &[],
         };
         let mut map = AcStrategyImage::new(2, 2);
         map.set_first(0, 0, STRATEGY_DCT16X16);

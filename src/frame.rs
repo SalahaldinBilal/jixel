@@ -1350,13 +1350,13 @@ fn write_dc_global(
 }
 
 /// Slots whose transform actually appears in the frame: the nine
-/// `quant_table_slot_of` slots, then DCT2X2, DCT4X4 and AFV.
-fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 12] {
+/// `quant_table_slot_of` slots, then DCT2X2, DCT4X4 and AFV, then DCT32X8/8X32.
+fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 13] {
     use crate::dc_group_data::{
         STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT2X2,
         STRATEGY_DCT4X4,
     };
-    let mut used = [false; 12];
+    let mut used = [false; 13];
     for dc in dc_datas {
         for (_, _, strategy) in dc.ac_strategy.iter_first_blocks() {
             if let Some(slot) = quant_table_slot_of(strategy) {
@@ -1375,7 +1375,7 @@ fn used_quant_table_slots(dc_datas: &[DcGroupData]) -> [bool; 12] {
 
 fn write_dequant_matrices(
     matrices: &crate::quant_weights::DequantMatrices,
-    used: &[bool; 12],
+    used: &[bool; 13],
     w: &mut BitWriter,
 ) {
     use crate::util::f32_to_f16_bits;
@@ -1390,7 +1390,10 @@ fn write_dequant_matrices(
     let dct2 = fine.filter(|_| used[9]).map(|f| f.dct2);
     let dct4x4 = fine.filter(|_| used[10]).map(|f| f.dct4x4);
     let afv = fine.filter(|_| used[11]).map(|f| f.afv);
+    // DCT32X8 / DCT8X32 always carry their pair-parity table.
+    let t8x32 = used[12].then(|| matrices.band_8x32());
     if (0..8).all(|slot| table(slot).is_none())
+        && t8x32.is_none()
         && identity.is_none()
         && dct2.is_none()
         && dct4x4.is_none()
@@ -1492,6 +1495,7 @@ fn write_dequant_matrices(
             write_dct_params(&pad4(&b4), 4, w);
             continue;
         }
+        let bands = if idx == 7 { t8x32 } else { bands };
         match bands {
             None => w.write(3, K_QUANT_MODE_LIBRARY),
             Some(o) => {
@@ -1517,7 +1521,7 @@ fn write_dequant_matrices(
 
 fn write_ac_global(
     matrices: &crate::quant_weights::DequantMatrices,
-    used_quant_tables: &[bool; 12],
+    used_quant_tables: &[bool; 13],
     coeff_orders: &crate::coeff_order::CoeffOrders,
     num_groups: usize,
     ac_codes: &[crate::entropy::OwnedEntropyCode],
@@ -3396,6 +3400,9 @@ fn encode_frame_core(
         &group_coords,
         &mut dc_datas,
     );
+    for dc in dc_datas.iter_mut() {
+        dc.block_quant_field = None;
+    }
 
     // Per-image quant-field threshold for the fine AC block-context layout.
     // The median splits the field into halves with genuinely different
@@ -4692,7 +4699,7 @@ fn encode_order_arm(
     plan: &crate::ac_context::AcCtxPlan,
     codes: &[crate::entropy::OwnedEntropyCode],
     orders: &crate::coeff_order::CoeffOrders,
-    used_tables: &[bool; 12],
+    used_tables: &[bool; 13],
     num_groups: usize,
     num_dc_groups: usize,
 ) -> (usize, BitWriter, Vec<(usize, BitWriter)>) {
@@ -6454,6 +6461,7 @@ fn setup_dc_group(
     );
     let mut fine_rollbacks = Vec::new();
     let mut fine_fallbacks = Vec::new();
+    dc_data.block_quant_field = Some(dc_data.raw_quant_field.clone());
     dc_data.sub8_benefit = crate::ac_strategy::fill_ac_strategy(
         ctx,
         scratch,
@@ -6978,7 +6986,7 @@ mod tests {
                 &plan,
                 &codes,
                 &natural,
-                &[false; 12],
+                &[false; 13],
                 groups,
                 1,
             );
@@ -6989,7 +6997,7 @@ mod tests {
                 &plan,
                 &codes,
                 &custom,
-                &[false; 12],
+                &[false; 13],
                 groups,
                 1,
             );
@@ -7354,7 +7362,7 @@ mod tests {
                 DequantMatrices::new_fast(distance, crate::Arbiter::Ssimulacra2),
             ] {
                 let header = MatrixHeaderCost::new(matrices);
-                for mask in 0..512u16 {
+                for mask in (0..512u16).flat_map(|m| [m, m | 1 << 12]) {
                     let used = std::array::from_fn(|slot| mask & (1 << slot) != 0);
                     let mut writer = crate::bit_writer::BitWriter::new();
                     super::write_dequant_matrices(matrices, &used, &mut writer);

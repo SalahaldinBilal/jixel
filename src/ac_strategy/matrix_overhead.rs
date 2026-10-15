@@ -64,9 +64,12 @@ fn choose_tables(header: &MatrixHeaderCost, used: u16, pinned: u16, regions: &[R
     let custom = header.custom_mask();
     let mut best = used;
     let mut best_cost = header.bits(used) as f64;
-    // At most nine custom tables. Unused library slots have no activation fee.
-    for allowed in 0..512u16 {
-        if allowed & !custom != 0 || pinned & !allowed != 0 {
+    // Every subset of the custom tables. Unused library slots have no
+    // activation fee.
+    let mut next = Some(custom);
+    while let Some(allowed) = next {
+        next = (allowed != 0).then(|| (allowed - 1) & custom);
+        if pinned & !allowed != 0 {
             continue;
         }
         let mut cost = header.bits(allowed) as f64;
@@ -83,6 +86,26 @@ fn choose_tables(header: &MatrixHeaderCost, used: u16, pinned: u16, regions: &[R
         }
     }
     best
+}
+
+/// The quantizer a transform placed at `(x, y)` inside a split merge gets:
+/// its blocks' pre-selection field merged like `adjust_quant_field` (the
+/// merge's own field is its blocks' aggregate, not theirs).
+fn merged_quant(data: &DcGroupData, strategy: u8, x: usize, y: usize, distance: f32) -> u8 {
+    let field = data.block_quant_field.as_ref().unwrap_or(&data.raw_quant_field);
+    let w = AcStrategyImage::covered_blocks_x_of(strategy);
+    let h = AcStrategyImage::covered_blocks_y_of(strategy);
+    if w * h == 1 {
+        return field.row(y)[x];
+    }
+    let (mut max_q, mut sum) = (0u8, 0u32);
+    for row in y..y + h {
+        for &q in &field.row(row)[x..x + w] {
+            max_q = max_q.max(q);
+            sum += u32::from(q);
+        }
+    }
+    aggregate_quant(max_q, sum, w * h, distance)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -102,7 +125,7 @@ pub(crate) fn account_matrix_headers(
         return;
     }
     let mut used = 0;
-    let mut sites: [Vec<(usize, usize, usize, u8)>; 9] = std::array::from_fn(|_| Vec::new());
+    let mut sites: [Vec<(usize, usize, usize, u8)>; 13] = std::array::from_fn(|_| Vec::new());
     for (dc, data) in dc_datas.iter().enumerate() {
         for (bx, by, strategy) in data.ac_strategy.iter_first_blocks() {
             if let Some(slot) = quant_table_slot_of(strategy)
@@ -121,8 +144,9 @@ pub(crate) fn account_matrix_headers(
     }
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
     let dc_ref = &*dc_datas;
-    let families = ctx.thread_pool.steal_map(scratch, 8, |index, scratch| {
-        let slot = index + 1;
+    const FAMILIES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 12];
+    let families = ctx.thread_pool.steal_map(scratch, FAMILIES.len(), |index, scratch| {
+        let slot = FAMILIES[index];
         let mut regions = Vec::new();
         let mut unavoidable_loss = 0.0;
         for &(dc, bx, by, strategy) in &sites[slot] {
@@ -133,7 +157,14 @@ pub(crate) fn account_matrix_headers(
             let score = |scratch: &mut CoderScratch, s, x, y| {
                 let px = gx * crate::frame::K_DC_GROUP_DIM + x * 8;
                 let py = gy * crate::frame::K_DC_GROUP_DIM + y * 8;
-                let qac = scale * data.raw_quant_field.row(y)[x] as f32;
+                // The incumbent keeps its merged quantizer; an alternative
+                // would get the selection's merge of the per-block field.
+                let q = if s == strategy || width * height == 1 {
+                    data.raw_quant_field.row(y)[x]
+                } else {
+                    merged_quant(data, s, x, y, distance)
+                };
+                let qac = scale * q as f32;
                 let cmap = cmap_factors(ctx.cfl_frame(), &data.ytox_map, &data.ytob_map, x, y);
                 let cost = if matches!(s, STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64)
                 {
@@ -225,11 +256,17 @@ pub(crate) fn account_matrix_headers(
         let chosen = best_alternative(&region.alternatives, allowed).unwrap();
         let cx = AcStrategyImage::covered_blocks_x_of(chosen.strategy);
         let cy = AcStrategyImage::covered_blocks_y_of(chosen.strategy);
+        let data = &mut dc_datas[region.dc];
+        let split = region.width * region.height > 1;
         for y in (region.by..region.by + region.height).step_by(cy) {
             for x in (region.bx..region.bx + region.width).step_by(cx) {
-                dc_datas[region.dc]
-                    .ac_strategy
-                    .set_first(x, y, chosen.strategy);
+                data.ac_strategy.set_first(x, y, chosen.strategy);
+                if split {
+                    let q = merged_quant(data, chosen.strategy, x, y, distance);
+                    for row in y..y + cy {
+                        data.raw_quant_field.row_mut(row)[x..x + cx].fill(q);
+                    }
+                }
             }
         }
     }
@@ -264,7 +301,7 @@ mod tests {
     #[test]
     fn matrix_fee_is_shared_and_scan_order_independent() {
         let header = MatrixHeaderCost {
-            payload: [0, 388, 0, 0, 0, 0, 0, 0, 0],
+            payload: [0, 388, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         };
         assert_eq!(choose_tables(&header, 2, 0, &[region(1, 200.0, 0)]), 0);
         let mut regions = vec![region(1, 240.0, 0), region(1, 210.0, 0)];
@@ -276,12 +313,12 @@ mod tests {
     #[test]
     fn table_combinations_include_fallback_activation_and_shared_mode_bits() {
         let header = MatrixHeaderCost {
-            payload: [292, 388, 0, 0, 0, 0, 0, 0, 0],
+            payload: [292, 388, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         };
         assert_eq!(choose_tables(&header, 2, 0, &[region(1, 95.0, 1)]), 1);
         assert_eq!(choose_tables(&header, 2, 0, &[region(1, 97.0, 1)]), 2);
         let header = MatrixHeaderCost {
-            payload: [0, 388, 388, 0, 0, 0, 0, 0, 0],
+            payload: [0, 388, 388, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         };
         // Neither table pays the shared 51 bits on its own. Removing both
         // saves it once and wins; a greedy one-family pass misses this.
@@ -292,7 +329,7 @@ mod tests {
     #[test]
     fn matrix_optimizer_matches_exhaustive_assignments() {
         let header = MatrixHeaderCost {
-            payload: [100, 120, 170, 210, 0, 0, 0, 0, 0],
+            payload: [100, 120, 170, 210, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         };
         let mut rng = 13u32;
         for _ in 0..200 {

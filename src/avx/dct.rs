@@ -1131,6 +1131,23 @@ macro_rules! inv_dct_transposed_avx2 {
     };
 }
 
+inv_dct_natural_avx2!(
+    inv_dct8x32_avx2,
+    256,
+    8,
+    32,
+    inv_dct1d_8_flat,
+    inv_dct1d_32_flat
+);
+inv_dct_transposed_avx2!(
+    inv_dct32x8_avx2,
+    256,
+    32,
+    8,
+    inv_dct1d_32_flat,
+    inv_dct1d_8_flat
+);
+
 inv_dct_transposed_avx2!(
     inv_dct8x8_avx2,
     64,
@@ -1399,6 +1416,47 @@ pub(crate) fn dct8x4_avx2(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     output[8] = (b0 - b1) * 0.5;
 }
 
+// Both orientations run the 32-point pass first. Each transposed tile then
+// carries eight long-axis frequencies through the 8-point pass.
+#[inline]
+#[target_feature(enable = "avx2,fma")]
+fn dct32_then_8_avx2(c: &mut [__m256; 32], output: &mut [f32; 256]) {
+    dct1d_32_flat(c);
+    let scale = _mm256_set1_ps(1.0 / 256.0);
+    for t in 0..4 {
+        let mut tile: [__m256; 8] = c[t * 8..t * 8 + 8].try_into().unwrap();
+        transpose_8x8(&mut tile);
+        dct1d_8_flat(&mut tile);
+        for u in 0..8 {
+            unsafe {
+                _mm256_storeu_ps(
+                    output[u * 32 + t * 8..].as_mut_ptr(),
+                    _mm256_mul_ps(tile[u], scale),
+                );
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct32x8_avx2(input: DctInput<'_, 8, 32>, output: &mut [f32; 256]) {
+    let mut c: [__m256; 32] =
+        std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input.row(r).as_ptr()) });
+    dct32_then_8_avx2(&mut c, output);
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dct8x32_avx2(input: DctInput<'_, 32, 8>, output: &mut [f32; 256]) {
+    let mut c = [_mm256_undefined_ps(); 32];
+    for t in 0..4 {
+        let mut tile: [__m256; 8] =
+            std::array::from_fn(|r| unsafe { _mm256_loadu_ps(input.row(r)[t * 8..].as_ptr()) });
+        transpose_8x8(&mut tile);
+        c[t * 8..t * 8 + 8].copy_from_slice(&tile);
+    }
+    dct32_then_8_avx2(&mut c, output);
+}
+
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn dct32x16_avx2(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]) {
     // Column pass, then transpose each vfreq tile so the row pass loads
@@ -1505,6 +1563,14 @@ pub(super) fn transpose_4x4_avx2(rows: &mut [__m128; 4]) {
     rows[1] = _mm_movehl_ps(t2, t0);
     rows[2] = _mm_movelh_ps(t1, t3);
     rows[3] = _mm_movehl_ps(t3, t1);
+}
+
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn dc_from_dct8x32_avx2(coeffs: &[f32; 256], dc: &mut [f32; 4]) {
+    let resample = unsafe { _mm_loadu_ps(RESAMPLE_SCALE_32_TO_4.as_ptr()) };
+    let coeff = unsafe { _mm_loadu_ps(coeffs.as_ptr()) };
+    let values = dc_idct4_avx2(_mm_mul_ps(coeff, resample));
+    unsafe { _mm_storeu_ps(dc.as_mut_ptr(), values) };
 }
 
 #[target_feature(enable = "avx2,fma")]

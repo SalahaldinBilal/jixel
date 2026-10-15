@@ -27,7 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild};
+use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, LeafChoice, Recon64Scratch, SavedChild};
 use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
@@ -159,6 +159,18 @@ pub(crate) struct RerankDowngrade {
     pub(crate) restore: [u8; 16],
 }
 
+/// Reconstruction replacement of a 64-family footprint. Kept separate from
+/// the smaller rerank's 4x4 layouts and boundary-aware fine mosaics.
+#[derive(Clone, Copy)]
+pub(crate) struct Rerank64Downgrade {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) cov_x: usize,
+    pub(crate) cov_y: usize,
+    /// First-block strategies at `iy * 8 + ix`; 0xFF marks covered cells.
+    pub(crate) restore: [u8; 64],
+}
+
 /// A large transform that was split only because an Identity/DCT2x2 mosaic
 /// won the joint boundary-aware rerank. The frame-level metadata gate can
 /// restore `strategy` and the `quant` it was scored at exactly when the full
@@ -204,6 +216,8 @@ pub(crate) struct AcStrategyBandScratch {
     pub(crate) chosen32: Vec<Chosen32Cost>,
     pub(crate) saved_children: Vec<SavedChild>,
     pub(crate) rerank_downgrades: Vec<RerankDowngrade>,
+    pub(crate) rerank64_downgrades: Vec<Rerank64Downgrade>,
+    pub(crate) recon64: Recon64Scratch,
     pub(crate) fine_rollbacks: Vec<FineMergeRollback>,
     pub(crate) current_costs: Vec<CachedQuantCost>,
     pub(crate) quant_refinements: Vec<QuantRefinement>,
@@ -223,6 +237,8 @@ impl Default for AcStrategyBandScratch {
             chosen32: Vec::new(),
             saved_children: Vec::new(),
             rerank_downgrades: Vec::new(),
+            rerank64_downgrades: Vec::new(),
+            recon64: Recon64Scratch::default(),
             fine_rollbacks: Vec::new(),
             current_costs: Vec::new(),
             quant_refinements: Vec::new(),
@@ -248,6 +264,7 @@ impl AcStrategyBandScratch {
         self.chosen32.clear();
         self.saved_children.clear();
         self.rerank_downgrades.clear();
+        self.rerank64_downgrades.clear();
         self.fine_rollbacks.clear();
         self.current_costs.clear();
         self.quant_refinements.clear();
@@ -257,6 +274,7 @@ impl AcStrategyBandScratch {
 
     fn prepare_rerank(&mut self, max_blocks: usize) {
         self.rerank_downgrades.clear();
+        self.rerank64_downgrades.clear();
         self.fine_rollbacks.clear();
         self.current_costs.clear();
         if self.rerank_downgrades.capacity() < max_blocks {
@@ -287,6 +305,9 @@ pub(crate) struct AcStrategyPipelineScratch {
     /// Leaf-first selector: full-image sub-8 gate credit per block, valid for
     /// blocks whose committed strategy is a sub-8 leaf (`by * xsize + bx`).
     pub(crate) leaf_gain: Vec<f32>,
+    /// Source leaves across all selection bands, including those hidden by
+    /// a 64-family merge spanning a band boundary.
+    pub(crate) rerank_leaves: Vec<u8>,
 }
 
 impl AcStrategyPipelineScratch {
@@ -329,7 +350,8 @@ pub(crate) struct CoderScratch {
     pub(crate) lz_candidate: Vec<LzToken>,
     /// Entropy tables allocated on demand; Fast group workers never use them.
     pub(crate) lz_entropy: LazyScratch<Box<LzEntropyScratch>>,
-    pub(crate) recon: LazyScratch<HeapMatrix<f32, 8, 1024>>,
+    /// Reconstruction planes through 64x64, allocated on first use.
+    pub(crate) recon: LazyScratch<HeapMatrix<f32, 8, 4096>>,
     pub(crate) huffman_pool: Vec<HuffmanNode>,
     pub(crate) alpha_tokens: Vec<Token>,
     pub(crate) ac_group: LazyScratch<AcGroupScratch>,
@@ -435,7 +457,8 @@ mod tests {
     #[test]
     fn scratch_structs_are_only_small_heap_handles() {
         // MA split scoring keeps four buffers (plans, LUTs, histogram, counts).
-        assert!(size_of::<CoderScratch>() <= 1184);
+        // The 64-family rerank adds one Vec handle for cross-band leaves.
+        assert!(size_of::<CoderScratch>() <= 1208);
         assert!(size_of::<LazyScratch<FineMosaicScratch>>() <= 32);
         assert!(size_of::<DcPredictorScratch>() <= 32);
         assert!(size_of::<LzEntropyScratch>() <= 128);

@@ -29,7 +29,7 @@
 
 use crate::dct::{
     DCT64_SPLIT_COS, DCT64_SPLIT_SIN, DctInput, INV_WC4, INV_WC8, INV_WC16, INV_WC32, INV_WC64,
-    RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
+    RESAMPLE_SCALE_32_TO_4, RESAMPLE_SCALE_64_TO_8, WC4, WC8, WC16, WC32,
 };
 use crate::dct128::{DCT128_SPLIT_COS, DCT128_SPLIT_SIN, INV_WC128, RESAMPLE_SCALE_128_TO_16};
 use core::arch::wasm32::*;
@@ -1041,6 +1041,63 @@ pub(crate) fn dct8x4_wasm(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     output[8] = (b0 - b1) * 0.5;
 }
 
+// Transpose the long-axis frequencies into tiles for the 8-point pass.
+#[inline]
+#[target_feature(enable = "simd128")]
+fn dct32x8_long_pass_wasm(c: &mut [v128; 32], tiles: &mut [[v128; 8]; 8], strip: usize) {
+    dct1d_32_s(c);
+    for (t, tile) in tiles.iter_mut().enumerate() {
+        let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
+        tile[strip * 4..strip * 4 + 4].copy_from_slice(&[a, b, cc, d]);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "simd128")]
+fn dct32x8_short_pass_wasm(tiles: &mut [[v128; 8]; 8], output: &mut [f32; 256]) {
+    for (t, tile) in tiles.iter_mut().enumerate() {
+        dct1d_8_s(tile);
+        for (u, value) in tile.iter().enumerate() {
+            unsafe {
+                v128_store(
+                    output[u * 32 + t * 4..].as_mut_ptr().cast(),
+                    f32x4_mul(*value, f32x4_splat(1.0 / 256.0)),
+                );
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct32x8_wasm(input: DctInput<'_, 8, 32>, output: &mut [f32; 256]) {
+    let mut tiles = [[f32x4_splat(0.0); 8]; 8];
+    for strip in 0..2 {
+        let mut c: [v128; 32] =
+            std::array::from_fn(|r| load_strip(input.row(r)[strip * 4..].as_ptr()));
+        dct32x8_long_pass_wasm(&mut c, &mut tiles, strip);
+    }
+    dct32x8_short_pass_wasm(&mut tiles, output);
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dct8x32_wasm(input: DctInput<'_, 32, 8>, output: &mut [f32; 256]) {
+    let mut tiles = [[f32x4_splat(0.0); 8]; 8];
+    for strip in 0..2 {
+        let mut c = [f32x4_splat(0.0); 32];
+        for t in 0..8 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(input.row(strip * 4)[t * 4..].as_ptr()),
+                load_strip(input.row(strip * 4 + 1)[t * 4..].as_ptr()),
+                load_strip(input.row(strip * 4 + 2)[t * 4..].as_ptr()),
+                load_strip(input.row(strip * 4 + 3)[t * 4..].as_ptr()),
+            );
+            c[t * 4..t * 4 + 4].copy_from_slice(&[a, b, cc, d]);
+        }
+        dct32x8_long_pass_wasm(&mut c, &mut tiles, strip);
+    }
+    dct32x8_short_pass_wasm(&mut tiles, output);
+}
+
 #[target_feature(enable = "simd128")]
 pub(crate) fn dct32x16_wasm(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]) {
     let mut scratch_uninit = MaybeUninit::<[f32; 512]>::uninit();
@@ -1117,6 +1174,31 @@ pub(crate) fn dct16x32_wasm(input: DctInput<'_, 32, 16>, output: &mut [f32; 512]
             unsafe { v128_store(p.as_mut_ptr() as *mut v128, f32x4_mul(c[v], scale)) };
         }
     }
+}
+
+#[target_feature(enable = "simd128")]
+pub(crate) fn dc_from_dct8x32_wasm(coeffs: &[f32; 256], dc: &mut [f32; 4]) {
+    let resample = load_strip(RESAMPLE_SCALE_32_TO_4.as_ptr());
+    let v = f32x4_mul(load_strip(coeffs.as_ptr()), resample);
+    let v0 = i32x4_shuffle::<0, 0, 0, 0>(v, v);
+    let v1 = i32x4_shuffle::<1, 1, 1, 1>(v, v);
+    let v2 = i32x4_shuffle::<2, 2, 2, 2>(v, v);
+    let v3 = i32x4_shuffle::<3, 3, 3, 3>(v, v);
+    let e0 = f32x4_add(v0, v2);
+    let e1 = f32x4_sub(v0, v2);
+    let t2 = f32x4_mul(v1, f32x4_splat(std::f32::consts::SQRT_2));
+    let t3 = f32x4_add(v3, v1);
+    let o0 = f32x4_add(t2, t3);
+    let o1 = f32x4_sub(t2, t3);
+    let even = i32x4_shuffle::<0, 4, 4, 0>(e0, e1);
+    let odd = i32x4_shuffle::<0, 4, 4, 0>(o0, o1);
+    let weights = f32x4(WC4[0], WC4[1], -WC4[1], -WC4[0]);
+    unsafe {
+        v128_store(
+            dc.as_mut_ptr().cast(),
+            f32x4_add(even, f32x4_mul(odd, weights)),
+        )
+    };
 }
 
 // Restore the natural frequency order of the 64-point split-radix kernel.
@@ -1476,6 +1558,9 @@ macro_rules! inv_dct_transposed_wasm {
         }
     };
 }
+
+inv_dct_natural_wasm!(inv_dct8x32_wasm, 256, 8, 32, inv_dct1d_8_s, inv_dct1d_32_s);
+inv_dct_transposed_wasm!(inv_dct32x8_wasm, 256, 32, 8, inv_dct1d_32_s, inv_dct1d_8_s);
 
 #[target_feature(enable = "simd128")]
 fn inv_dct1d_128(c: &mut [v128; 128]) {

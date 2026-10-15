@@ -53,7 +53,11 @@ pub(crate) const STRATEGY_DCT128X128: u8 = 19;
 pub(crate) const STRATEGY_DCT128X64: u8 = 20;
 /// 64 rows x 128 columns.
 pub(crate) const STRATEGY_DCT64X128: u8 = 21;
-pub(crate) const NUM_STRATEGIES: usize = 22;
+/// 32 rows x 8 columns.
+pub(crate) const STRATEGY_DCT32X8: u8 = 22;
+/// 8 rows x 32 columns.
+pub(crate) const STRATEGY_DCT8X32: u8 = 23;
+pub(crate) const NUM_STRATEGIES: usize = 24;
 
 #[inline]
 pub(crate) fn is_128_strategy(strategy: u8) -> bool {
@@ -87,9 +91,9 @@ pub(crate) fn is_sub8_strategy(strategy: u8) -> bool {
 /// Map raw strategy -> JXL HfTransformType code (= what the bitstream stores).
 /// DCT8=0, DCT16X16=4, DCT32X32=5, DCT16X8=6, DCT8X16=7, DCT4X4=3, DCT4X8=12, DCT8X4=13,
 /// DCT32X16=10, DCT16X32=11, AFV0..3=14..17, DCT64 family=18..20,
-/// IDENTITY=1, DCT2X2=2.
+/// IDENTITY=1, DCT2X2=2, DCT32X8=8, DCT8X32=9.
 pub(crate) static STRATEGY_CODE_LUT: [u8; NUM_STRATEGIES] = [
-    0, 6, 7, 4, 5, 3, 12, 13, 10, 11, 14, 15, 16, 17, 18, 19, 20, 1, 2, 21, 22, 23,
+    0, 6, 7, 4, 5, 3, 12, 13, 10, 11, 14, 15, 16, 17, 18, 19, 20, 1, 2, 21, 22, 23, 8, 9,
 ];
 
 const FIRST_BLOCK_BIT: u8 = 1;
@@ -165,7 +169,7 @@ impl AcStrategyImage {
         // {DCT: 1, DCT16X8: 1, DCT8X16: 2, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1,
         //  DCT4X8: 1, DCT8X4: 1, DCT32X16: 2, DCT16X32: 4, AFV0..3: 1}
         static LUT: [u8; NUM_STRATEGIES] = [
-            1, 1, 2, 2, 4, 1, 1, 1, 2, 4, 1, 1, 1, 1, 8, 4, 8, 1, 1, 16, 8, 16,
+            1, 1, 2, 2, 4, 1, 1, 1, 2, 4, 1, 1, 1, 1, 8, 4, 8, 1, 1, 16, 8, 16, 1, 4,
         ];
         LUT[strategy as usize] as usize
     }
@@ -175,7 +179,7 @@ impl AcStrategyImage {
         // {DCT: 1, DCT16X8: 2, DCT8X16: 1, DCT16X16: 2, DCT32X32: 4, DCT4X4: 1,
         //  DCT4X8: 1, DCT8X4: 1, DCT32X16: 4, DCT16X32: 2, AFV0..3: 1}
         static LUT: [u8; NUM_STRATEGIES] = [
-            1, 2, 1, 2, 4, 1, 1, 1, 4, 2, 1, 1, 1, 1, 8, 8, 4, 1, 1, 16, 16, 8,
+            1, 2, 1, 2, 4, 1, 1, 1, 4, 2, 1, 1, 1, 1, 8, 8, 4, 1, 1, 16, 16, 8, 4, 1,
         ];
         LUT[strategy as usize] as usize
     }
@@ -294,6 +298,9 @@ pub(crate) struct DcGroupData {
     /// Unrounded X DC, kept with `source_dc_b` for the chroma DC coding choice.
     pub(crate) source_dc_x: Option<crate::image::Plane<f32>>,
     pub(crate) raw_quant_field: ImageB,
+    /// Per-block field from before selection merged it over each transform,
+    /// retained until the frame-level matrix gate has re-tiled any region.
+    pub(crate) block_quant_field: Option<ImageB>,
     pub(crate) ac_strategy: AcStrategyImage,
     pub(crate) ytox_map: ImageSB,
     pub(crate) ytob_map: ImageSB,
@@ -315,6 +322,7 @@ impl DcGroupData {
             source_dc_y: None,
             source_dc_x: None,
             raw_quant_field: ImageB::try_new_fill(xsize_blocks, ysize_blocks, 1)?,
+            block_quant_field: None,
             ac_strategy: AcStrategyImage::try_new(xsize_blocks, ysize_blocks)?,
             ytox_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,
             ytob_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,

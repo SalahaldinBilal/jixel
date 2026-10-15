@@ -36,8 +36,9 @@ use crate::coder_scratch::{
 use crate::dc_group_data::{
     AcStrategyImage, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3, STRATEGY_DCT,
     STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4, STRATEGY_DCT8X16,
-    STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16, STRATEGY_DCT32X32,
-    STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_IDENTITY,
+    STRATEGY_DCT8X32, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X8,
+    STRATEGY_DCT32X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64,
+    STRATEGY_IDENTITY,
 };
 use crate::dct::{DctInput, fmla};
 use crate::encoding_context::EncodingContext;
@@ -56,7 +57,8 @@ pub(crate) use rate_prices::RatePrices;
 use rate_prices::RatePricesScope;
 
 pub(crate) use selection::{
-    Chosen32Cost, FineMosaicScratch, LeafChoice, SavedChild, aggregate_quant, fill_ac_strategy,
+    Chosen32Cost, FineMosaicScratch, LeafChoice, Recon64Scratch, SavedChild, aggregate_quant,
+    fill_ac_strategy,
 };
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
@@ -144,7 +146,7 @@ const BIAS_4X8: f32 = 1.09;
 const BIAS_AFV: Banded = Banded::new(1.15, 1.25);
 
 /// Sub-8 is skipped entirely above this distance.
-const SUB8_MAX_DISTANCE: f32 = 1.5;
+const SUB8_MAX_DISTANCE: f32 = 2.0;
 /// AFV keeps competing (alone — the DCT4 family stays gated at
 /// [`SUB8_MAX_DISTANCE`]) up to this distance. At the default the extension
 /// band is empty and AFV shares the sub-8 gate exactly.
@@ -353,7 +355,8 @@ fn merge_upgrade_margin(distance: f32) -> f32 {
         MERGE_UPGRADE_MARGIN,
     )
 }
-const LEAF_FIRST_MAX_DISTANCE: f32 = SUB8_MAX_DISTANCE;
+/// The legacy (fixed-price) leaf-first band; it stays below the DCT4/AFV gate.
+const LEAF_FIRST_MAX_DISTANCE: f32 = 1.5;
 /// With learned prices the fine transforms are leaves, so the leaf-first
 /// selector runs wherever they are searched.
 const LEARNED_LEAF_FIRST_MAX_DISTANCE: f32 = FINE_TRANSFORM_MAX_DISTANCE;
@@ -479,6 +482,16 @@ fn forward_transform(
             let dst: &mut [f32; 512] = out.first_chunk_mut::<512>().unwrap();
             (ctx.dct16x32)(dct_input(plane, tmp, px, py), dst);
             (4, 2)
+        }
+        STRATEGY_DCT32X8 => {
+            let dst: &mut [f32; 256] = out.first_chunk_mut::<256>().unwrap();
+            (ctx.dct32x8)(dct_input(plane, tmp, px, py), dst);
+            (4, 1)
+        }
+        STRATEGY_DCT8X32 => {
+            let dst: &mut [f32; 256] = out.first_chunk_mut::<256>().unwrap();
+            (ctx.dct8x32)(dct_input(plane, tmp, px, py), dst);
+            (4, 1)
         }
         STRATEGY_DCT64X64 => {
             let dst = out.first_chunk_mut::<4096>().unwrap();
@@ -823,6 +836,9 @@ fn inverse_matrix_for(ctx: &EncodingContext, strategy: u8, channel: usize) -> &[
         STRATEGY_DCT16X16 => &matrices.inv_matrix_16x16(channel)[..],
         STRATEGY_DCT32X32 => &matrices.inv_matrix_32x32(channel)[..],
         STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(channel)[..],
+        STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => &matrices.inv_matrix_8x32(channel)[..],
+        STRATEGY_DCT64X64 => &matrices.inv_matrix_64x64(channel)[..],
+        STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(channel)[..],
         _ => &matrices.inv_matrix_16x8(channel)[..],
     }
 }
@@ -983,7 +999,7 @@ fn prepare_strategy_coeffs(
 #[allow(clippy::too_many_arguments)]
 fn reconstruction_dist_and_rate(
     ctx: &EncodingContext,
-    recon: &mut [[f32; 1024]; 8],
+    recon: &mut [[f32; 4096]; 8],
     coeffs: &[[f32; 4096]; 3],
     strategy: u8,
     opsin: &Image3F,

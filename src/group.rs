@@ -36,9 +36,10 @@ use crate::ac_context::{
 use crate::dc_group_data::{
     AcStrategyImage, DcGroupData, STRATEGY_AFV0, STRATEGY_AFV1, STRATEGY_AFV2, STRATEGY_AFV3,
     STRATEGY_DCT, STRATEGY_DCT2X2, STRATEGY_DCT4X4, STRATEGY_DCT4X8, STRATEGY_DCT8X4,
-    STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32, STRATEGY_DCT32X16,
-    STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32, STRATEGY_DCT64X64, STRATEGY_DCT64X128,
-    STRATEGY_DCT128X64, STRATEGY_DCT128X128, STRATEGY_IDENTITY,
+    STRATEGY_DCT8X16, STRATEGY_DCT8X32, STRATEGY_DCT16X8, STRATEGY_DCT16X16, STRATEGY_DCT16X32,
+    STRATEGY_DCT32X8, STRATEGY_DCT32X16, STRATEGY_DCT32X32, STRATEGY_DCT32X64, STRATEGY_DCT64X32,
+    STRATEGY_DCT64X64, STRATEGY_DCT64X128, STRATEGY_DCT128X64, STRATEGY_DCT128X128,
+    STRATEGY_IDENTITY,
 };
 use crate::dct::{DctInput, dc_from_dct8x16, dc_from_dct16x8, dc_from_dct16x16, fmla};
 use crate::encoding_context::EncodingContext;
@@ -297,6 +298,7 @@ fn rdoq_block(
     raw_strategy: u8,
     strategy_code: u8,
     c: usize,
+    bias: DequantBias,
     predicted: u8,
     cx: usize,
     cy: usize,
@@ -330,6 +332,7 @@ fn rdoq_block(
                 block,
                 strategy_code,
                 c,
+                bias,
                 predicted,
                 cx,
                 cy,
@@ -363,6 +366,7 @@ fn rdoq_block_banded<const FACTORED: bool>(
     block: &mut [i32],
     strategy_code: u8,
     c: usize,
+    bias: DequantBias,
     predicted: u8,
     cx: usize,
     cy: usize,
@@ -452,15 +456,13 @@ fn rdoq_block_banded<const FACTORED: bool>(
             * rdoq_distortion_weight(window_index.min(base_window_len), base_window_len, distance);
         let (candidates, candidate_count) =
             rdoq_candidates(ideal, block[idx], window_index < restore_len);
-        // Distortion uses the encoder's shared Y-bias approximation to decoder
-        // dequantization: +-1 -> +-0.9299, q -> q - 0.145/q. X/B may signal
-        // different biases; changing that approximation also needs RD retuning.
+        // Distortion against the decoder's dequantization of each candidate.
         let mut candidate_distortion = [0.0f32; 5];
         for (d, &level) in candidate_distortion[..candidate_count]
             .iter_mut()
             .zip(candidates.iter())
         {
-            *d = distortion_weight * (ideal - dequantized_level(level)).powi(2);
+            *d = distortion_weight * (ideal - bias.level(level)).powi(2);
         }
         let processed_after = window_len - 1 - window_index;
         let min_remaining = suffix_nzeros + original_after_nzeros.saturating_sub(MAX_NZERO_DELTA);
@@ -672,6 +674,7 @@ fn rdoq_block_wide_oracle(
     raw_strategy: u8,
     strategy_code: u8,
     c: usize,
+    bias: DequantBias,
     predicted: u8,
     cx: usize,
     cy: usize,
@@ -691,6 +694,8 @@ fn rdoq_block_wide_oracle(
             | STRATEGY_DCT32X32
             | STRATEGY_DCT32X16
             | STRATEGY_DCT16X32
+            | STRATEGY_DCT32X8
+            | STRATEGY_DCT8X32
             | STRATEGY_DCT64X64
             | STRATEGY_DCT64X32
             | STRATEGY_DCT32X64
@@ -772,15 +777,13 @@ fn rdoq_block_wide_oracle(
                 distance,
             );
         let (candidates, candidate_count) = rdoq_candidates(ideal, block[idx], true);
-        // Distortion uses the encoder's shared Y-bias approximation to decoder
-        // dequantization: +-1 -> +-0.9299, q -> q - 0.145/q. X/B may signal
-        // different biases; changing that approximation also needs RD retuning.
+        // Distortion against the decoder's dequantization of each candidate.
         let mut candidate_distortion = [0.0f32; 5];
         for (d, &level) in candidate_distortion[..candidate_count]
             .iter_mut()
             .zip(candidates.iter())
         {
-            *d = distortion_weight * (ideal - dequantized_level(level)).powi(2);
+            *d = distortion_weight * (ideal - bias.level(level)).powi(2);
         }
         let processed_after = window_len - 1 - window_index;
         let min_remaining = suffix_nzeros + original_after_nzeros.saturating_sub(MAX_NZERO_DELTA);
@@ -1274,40 +1277,87 @@ pub(crate) fn chroma_rdoq_weight(distance: f32) -> f32 {
     CHROMA_RDOQ_WEIGHT_HQ + t * (1.0 - CHROMA_RDOQ_WEIGHT_HQ)
 }
 
-pub(crate) const DEFAULT_QUANT_BIAS_1: f32 = 1.0 - 0.07005449891748593;
+/// libjxl `kDefaultQuantBias` (X, Y, B, numerator): what an `all_default`
+/// CustomTransformData signals.
+pub(crate) static DEFAULT_QUANT_BIASES: [f32; 4] = [
+    1.0 - 0.05465007330715401,
+    1.0 - 0.07005449891748593,
+    1.0 - 0.049935103337343655,
+    0.145,
+];
 
-pub(crate) const DEFAULT_QUANT_BIAS_3: f32 = 0.145;
+/// The explicit CustomTransformData biases written with a non-default opsin
+/// matrix (as f16): X/Y keep the defaults, B's ±1 reconstructs a full step.
+pub(crate) static EXPLICIT_QUANT_BIASES: [f32; 4] =
+    [1.0 - 0.054_650_075, 1.0 - 0.070_054_5, 1.0, 0.145];
 
-/// [`dequantized_level`] for a float-valued (but integer) level, as produced by
-/// the encoder-side quantizers before conversion to `i32`.
-#[inline]
-pub(crate) fn dequantized_level_f32(quant: f32) -> f32 {
-    let aq = quant.abs();
-    if aq < 1.125 {
-        if quant == 0.0 {
-            0.0
-        } else {
-            DEFAULT_QUANT_BIAS_1.copysign(quant)
-        }
-    } else {
-        quant - DEFAULT_QUANT_BIAS_3 / quant
-    }
+/// The decoder's dequantization of one channel's integer AC levels
+/// (libjxl `AdjustQuantBias`): `±one` at |q| = 1, `q - numerator / q` above.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DequantBias {
+    pub(crate) one: f32,
+    pub(crate) numerator: f32,
 }
 
-#[inline]
-pub(crate) fn dequantized_level(quant: i32) -> f32 {
-    let aq = quant.unsigned_abs() as f32;
-    if aq < 1.125 {
-        if quant == 0 {
-            0.0
-        } else if quant > 0 {
-            DEFAULT_QUANT_BIAS_1
-        } else {
-            -DEFAULT_QUANT_BIAS_1
+impl DequantBias {
+    pub(crate) const DEFAULT: [DequantBias; 3] = [
+        DequantBias::new(DEFAULT_QUANT_BIASES[0]),
+        DequantBias::new(DEFAULT_QUANT_BIASES[1]),
+        DequantBias::new(DEFAULT_QUANT_BIASES[2]),
+    ];
+
+    const fn new(one: f32) -> Self {
+        Self {
+            one,
+            numerator: DEFAULT_QUANT_BIASES[3],
         }
-    } else {
-        let q = quant as f32;
-        q - DEFAULT_QUANT_BIAS_3 / q
+    }
+
+    /// Per-channel biases the decoder applies: the defaults, or the explicit
+    /// bundle after its f16 round trip.
+    pub(crate) fn channels(explicit: bool) -> [DequantBias; 3] {
+        if !explicit {
+            return Self::DEFAULT;
+        }
+        let f16 = |v: f32| crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(v));
+        let numerator = f16(EXPLICIT_QUANT_BIASES[3]);
+        std::array::from_fn(|c| DequantBias {
+            one: f16(EXPLICIT_QUANT_BIASES[c]),
+            numerator,
+        })
+    }
+
+    /// [`Self::level`] for a float-valued (but integer) level, as produced by
+    /// the encoder-side quantizers before conversion to `i32`.
+    #[inline]
+    pub(crate) fn level_f32(self, quant: f32) -> f32 {
+        let aq = quant.abs();
+        if aq < 1.125 {
+            if quant == 0.0 {
+                0.0
+            } else {
+                self.one.copysign(quant)
+            }
+        } else {
+            quant - self.numerator / quant
+        }
+    }
+
+    #[inline]
+    pub(crate) fn level(self, quant: i32) -> f32 {
+        let aq = quant.unsigned_abs() as f32;
+        if aq < 1.125 {
+            if quant == 0 {
+                0.0
+            } else if quant > 0 {
+                self.one
+            } else {
+                -self.one
+            }
+        } else {
+            let q = quant as f32;
+            q - self.numerator / q
+        }
     }
 }
 
@@ -1329,12 +1379,13 @@ fn quantize_roundtrip_y_block(
         inout, 1, qm, quant, scale, 1.0, distance, xsize, ysize, quantized,
     );
     let inv_qac = 1.0 / (scale * quant as f32);
+    let bias = ctx.dequant_bias(1);
     let size = xsize * ysize * 64;
     for (out, (&q, &dq)) in inout[..size]
         .iter_mut()
         .zip(quantized[..size].iter().zip(dqm[..size].iter()))
     {
-        *out = dequantized_level(q) * dq * inv_qac;
+        *out = bias.level(q) * dq * inv_qac;
     }
 }
 
@@ -1917,6 +1968,14 @@ pub(crate) fn write_ac_group(
                             let dst: &mut [f32; 512] = coeffs[c].first_chunk_mut::<512>().unwrap();
                             (ctx.dct16x32)(DctInput::new(input, stride), dst);
                         }
+                        STRATEGY_DCT32X8 => {
+                            let dst: &mut [f32; 256] = coeffs[c].first_chunk_mut::<256>().unwrap();
+                            (ctx.dct32x8)(DctInput::new(input, stride), dst);
+                        }
+                        STRATEGY_DCT8X32 => {
+                            let dst: &mut [f32; 256] = coeffs[c].first_chunk_mut::<256>().unwrap();
+                            (ctx.dct8x32)(DctInput::new(input, stride), dst);
+                        }
                         STRATEGY_AFV0 => {
                             let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
                             (ctx.afv0)(DctInput::new(input, stride), dst);
@@ -2028,6 +2087,14 @@ pub(crate) fn write_ac_group(
                             (ctx.dc_from_dct16x32)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
                         }
                     }
+                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
+                        // Four DC values along the long axis: a 4x1 column or
+                        // 1x4 row, both in didx order.
+                        for c in 0..3 {
+                            let cb: &[f32; 256] = coeffs[c].first_chunk::<256>().unwrap();
+                            (ctx.dc_from_dct8x32)(cb, dc_vals[c].first_chunk_mut::<4>().unwrap());
+                        }
+                    }
                     STRATEGY_DCT128X128 => {
                         for c in 0..3 {
                             (ctx.dc_from_dct128x128)(
@@ -2129,6 +2196,9 @@ pub(crate) fn write_ac_group(
                 STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
                     (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
                 }
+                STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
+                    (&matrices.inv_matrix_8x32(1)[..], &matrices.matrix_8x32(1)[..])
+                }
                 _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
             };
                 if let Some(m) = memo.as_deref().filter(|_| hit[1]) {
@@ -2146,7 +2216,7 @@ pub(crate) fn write_ac_group(
                         .iter_mut()
                         .zip(quantized[1][..size].iter().zip(qm_y[..size].iter()))
                     {
-                        *out = dequantized_level(q) * dq * inv_qac;
+                        *out = ctx.dequant_bias(1).level(q) * dq * inv_qac;
                     }
                 } else {
                     if rdoq_prices.is_some() || recon_y.is_some() {
@@ -2190,6 +2260,7 @@ pub(crate) fn write_ac_group(
                             raw_strategy,
                             strategy_code,
                             1,
+                            ctx.dequant_bias(1),
                             predicted,
                             cx,
                             cy,
@@ -2206,7 +2277,7 @@ pub(crate) fn write_ac_group(
                             .iter_mut()
                             .zip(quantized[1][..size].iter().zip(qm_y[..size].iter()))
                         {
-                            *out = dequantized_level(q) * dq * inv_qac;
+                            *out = ctx.dequant_bias(1).level(q) * dq * inv_qac;
                         }
                     }
                 }
@@ -2362,6 +2433,12 @@ pub(crate) fn write_ac_group(
                         (ctx.dc_from_dct16x32)(xb, x_dc_post.first_chunk_mut::<8>().unwrap());
                         (ctx.dc_from_dct16x32)(bb, b_dc_post.first_chunk_mut::<8>().unwrap());
                     }
+                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
+                        let xb: &[f32; 256] = coeffs[0].first_chunk::<256>().unwrap();
+                        let bb: &[f32; 256] = coeffs[2].first_chunk::<256>().unwrap();
+                        (ctx.dc_from_dct8x32)(xb, x_dc_post.first_chunk_mut::<4>().unwrap());
+                        (ctx.dc_from_dct8x32)(bb, b_dc_post.first_chunk_mut::<4>().unwrap());
+                    }
                     STRATEGY_DCT128X128 => {
                         (ctx.dc_from_dct128x128)(
                             coeffs[0].first_chunk::<16384>().unwrap(),
@@ -2411,6 +2488,7 @@ pub(crate) fn write_ac_group(
                     }
                     STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(0)[..],
                     STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(0)[..],
+                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => &matrices.inv_matrix_8x32(0)[..],
                     _ => &matrices.inv_matrix_16x8(0)[..],
                 };
                 let mut chroma_dc_q = [0i16; 256];
@@ -2481,6 +2559,7 @@ pub(crate) fn write_ac_group(
                             raw_strategy,
                             strategy_code,
                             0,
+                            ctx.dequant_bias(0),
                             predicted,
                             cx,
                             cy,
@@ -2523,6 +2602,7 @@ pub(crate) fn write_ac_group(
                     }
                     STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &matrices.inv_matrix_64x32(2)[..],
                     STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &matrices.inv_matrix_32x16(2)[..],
+                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => &matrices.inv_matrix_8x32(2)[..],
                     _ => &matrices.inv_matrix_16x8(2)[..],
                 };
                 if !hit[2] {
@@ -2578,6 +2658,7 @@ pub(crate) fn write_ac_group(
                             raw_strategy,
                             strategy_code,
                             2,
+                            ctx.dequant_bias(2),
                             predicted,
                             cx,
                             cy,
@@ -2593,6 +2674,7 @@ pub(crate) fn write_ac_group(
                 }
                 if measure_chroma_distortion && !hit[0] {
                     let q_scaled_x = quantize_ac_q_scaled(quant_ac, scale, x_qm_mul);
+                    let bias_x = ctx.dequant_bias(0);
                     for i in 0..size {
                         let v = i / row_stride;
                         let u = i % row_stride;
@@ -2600,12 +2682,13 @@ pub(crate) fn write_ac_group(
                             continue;
                         }
                         let ideal = coeffs[0][i] * inv_qm_x[i] * q_scaled_x;
-                        let error = ideal - dequantized_level(quantized[0][i]);
+                        let error = ideal - bias_x.level(quantized[0][i]);
                         chroma_distortion += ctx.channel_weight(0) * error * error;
                     }
                 }
                 if measure_chroma_distortion && !hit[2] {
                     let q_scaled_b = quantize_ac_q_scaled(quant_ac, scale, ctx.b_qm_mul());
+                    let bias_b = ctx.dequant_bias(2);
                     for i in 0..size {
                         let v = i / row_stride;
                         let u = i % row_stride;
@@ -2613,7 +2696,7 @@ pub(crate) fn write_ac_group(
                             continue;
                         }
                         let ideal = coeffs[2][i] * inv_qm_b[i] * q_scaled_b;
-                        let error = ideal - dequantized_level(quantized[2][i]);
+                        let error = ideal - bias_b.level(quantized[2][i]);
                         chroma_distortion =
                             fmla(ctx.channel_weight(2), error * error, chroma_distortion);
                     }
@@ -2633,13 +2716,13 @@ pub(crate) fn write_ac_group(
                         if hit[c] {
                             continue;
                         }
+                        let bias = ctx.dequant_bias(c);
                         for i in 0..size {
                             let (v, u) = (i / row_stride, i % row_stride);
                             recon_err[i] = if v < cy && u < cx {
                                 0.0
                             } else {
-                                dequantized_level(quantized[c][i]) / (inv_qm[i] * q_scaled)
-                                    - coeffs[c][i]
+                                bias.level(quantized[c][i]) / (inv_qm[i] * q_scaled) - coeffs[c][i]
                             };
                         }
                         crate::inflated_cost::reconstruct_error(
@@ -3269,6 +3352,7 @@ mod tests {
                     raw,
                     strategy,
                     c,
+                    super::DequantBias::DEFAULT[c],
                     (case % 64) as u8,
                     cx,
                     cy,
@@ -3380,6 +3464,7 @@ mod tests {
                     block,
                     strategy,
                     c,
+                    super::DequantBias::DEFAULT[c],
                     (case % 64) as u8,
                     cx,
                     cy,
@@ -3402,6 +3487,7 @@ mod tests {
                 raw,
                 strategy,
                 c,
+                super::DequantBias::DEFAULT[c],
                 (case % 64) as u8,
                 cx,
                 cy,
@@ -3525,6 +3611,7 @@ mod tests {
                     raw,
                     strategy,
                     c,
+                    super::DequantBias::DEFAULT[c],
                     17,
                     cx,
                     cy,
@@ -3547,6 +3634,7 @@ mod tests {
                     &mut actual,
                     strategy,
                     c,
+                    super::DequantBias::DEFAULT[c],
                     17,
                     cx,
                     cy,
@@ -3661,6 +3749,7 @@ mod tests {
                         block,
                         strategy,
                         c,
+                        super::DequantBias::DEFAULT[c],
                         (case % 256) as u8,
                         cx,
                         cy,
@@ -3745,6 +3834,7 @@ mod tests {
                     block,
                     strategy,
                     1,
+                    super::DequantBias::DEFAULT[1],
                     17,
                     2,
                     1,
@@ -3764,9 +3854,9 @@ mod tests {
                 assert_eq!(a.to_bits(), b.to_bits());
             }
             let rate = 2. * super::rdoq_lambda(crate::Arbiter::Ssimulacra2, 1.);
-            let minus = (ideal - super::dequantized_level(-1)).powi(2)
+            let minus = (ideal - super::DequantBias::DEFAULT[1].level(-1)).powi(2)
                 + rate * prices.token_bits(Token::new(0, pack_signed(-1)));
-            let plus = (ideal - super::dequantized_level(1)).powi(2)
+            let plus = (ideal - super::DequantBias::DEFAULT[1].level(1)).powi(2)
                 + rate * prices.token_bits(Token::new(0, pack_signed(1)));
             let tail = costs0[0][1];
             if plus < minus && plus + tail == minus + tail {

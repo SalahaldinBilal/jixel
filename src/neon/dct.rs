@@ -906,6 +906,9 @@ macro_rules! inv_dct_transposed_neon {
 }
 
 inv_dct_transposed_neon!(inv_dct8x8_neon, 64, 8, 8, inv_dct1d_8_s, inv_dct1d_8_s);
+inv_dct_natural_neon!(inv_dct8x32_neon, 256, 8, 32, inv_dct1d_8_s, inv_dct1d_32_s);
+inv_dct_transposed_neon!(inv_dct32x8_neon, 256, 32, 8, inv_dct1d_32_s, inv_dct1d_8_s);
+
 inv_dct_transposed_neon!(
     inv_dct16x16_neon,
     256,
@@ -1366,6 +1369,67 @@ pub(crate) fn dct8x4_neon(input: DctInput<'_, 8, 8>, output: &mut [f32; 64]) {
     output[8] = (b0 - b1) * 0.5;
 }
 
+// Transpose the long-axis frequencies into tiles for the 8-point pass.
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct32x8_long_pass_neon(
+    c: &mut [float32x4_t; 32],
+    tiles: &mut [[float32x4_t; 8]; 8],
+    strip: usize,
+) {
+    dct1d_32_s(c);
+    for (t, tile) in tiles.iter_mut().enumerate() {
+        let (a, b, cc, d) = transpose_4x4(c[t * 4], c[t * 4 + 1], c[t * 4 + 2], c[t * 4 + 3]);
+        tile[strip * 4..strip * 4 + 4].copy_from_slice(&[a, b, cc, d]);
+    }
+}
+
+#[inline]
+#[target_feature(enable = "neon")]
+fn dct32x8_short_pass_neon(tiles: &mut [[float32x4_t; 8]; 8], output: &mut [f32; 256]) {
+    for (t, tile) in tiles.iter_mut().enumerate() {
+        dct1d_8_s(tile);
+        for (u, value) in tile.iter().enumerate() {
+            unsafe {
+                vst1q_f32(
+                    output[u * 32 + t * 4..].as_mut_ptr(),
+                    vmulq_n_f32(*value, 1.0 / 256.0),
+                );
+            }
+        }
+    }
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct32x8_neon(input: DctInput<'_, 8, 32>, output: &mut [f32; 256]) {
+    let mut tiles = [[vdupq_n_f32(0.0); 8]; 8];
+    for strip in 0..2 {
+        let mut c: [float32x4_t; 32] =
+            std::array::from_fn(|r| load_strip(input.row(r)[strip * 4..].as_ptr()));
+        dct32x8_long_pass_neon(&mut c, &mut tiles, strip);
+    }
+    dct32x8_short_pass_neon(&mut tiles, output);
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dct8x32_neon(input: DctInput<'_, 32, 8>, output: &mut [f32; 256]) {
+    let mut tiles = [[vdupq_n_f32(0.0); 8]; 8];
+    for strip in 0..2 {
+        let mut c = [vdupq_n_f32(0.0); 32];
+        for t in 0..8 {
+            let (a, b, cc, d) = transpose_4x4(
+                load_strip(input.row(strip * 4)[t * 4..].as_ptr()),
+                load_strip(input.row(strip * 4 + 1)[t * 4..].as_ptr()),
+                load_strip(input.row(strip * 4 + 2)[t * 4..].as_ptr()),
+                load_strip(input.row(strip * 4 + 3)[t * 4..].as_ptr()),
+            );
+            c[t * 4..t * 4 + 4].copy_from_slice(&[a, b, cc, d]);
+        }
+        dct32x8_long_pass_neon(&mut c, &mut tiles, strip);
+    }
+    dct32x8_short_pass_neon(&mut tiles, output);
+}
+
 #[target_feature(enable = "neon")]
 pub(crate) fn dct32x16_neon(input: DctInput<'_, 16, 32>, output: &mut [f32; 512]) {
     // Column pass then row pass, 4-wide strips; scratch is column-major
@@ -1468,6 +1532,13 @@ fn dc_idct4_neon(v: float32x4_t) -> float32x4_t {
     let odd = vcombine_f32(vget_low_f32(odd01), vget_high_f32(vrev64q_f32(odd01)));
     let weights = load_strip([WC4[0], WC4[1], -WC4[1], -WC4[0]].as_ptr());
     vfmaq_f32(even, odd, weights)
+}
+
+#[target_feature(enable = "neon")]
+pub(crate) fn dc_from_dct8x32_neon(coeffs: &[f32; 256], dc: &mut [f32; 4]) {
+    let resample = load_strip(RESAMPLE_SCALE_32_TO_4.as_ptr());
+    let values = dc_idct4_neon(vmulq_f32(load_strip(coeffs.as_ptr()), resample));
+    unsafe { vst1q_f32(dc.as_mut_ptr(), values) };
 }
 
 #[target_feature(enable = "neon")]

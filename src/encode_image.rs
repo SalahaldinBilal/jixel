@@ -2823,10 +2823,9 @@ fn write_image_metadata(
         // dying ±1 B residuals are exactly the desaturating ones. Measured
         // free (+0.03..0.05 SS2 at byte-identical streams) on every class
         // probed — fractal, blue-rotated victim, smooth-yellow photos;
-        // overshoot past 1.0 was noise. The RDOQ dequant model keeps the
-        // shared Y bias (its mismatch grows 0.05→0.07, same scale as the
-        // pre-existing X mismatch).
-        for v in [1.0 - 0.054_650_075, 1.0 - 0.070_054_5, 1.0, 0.145] {
+        // overshoot past 1.0 was noise. The encoder's dequantization model
+        // follows via `DequantBias::channels`.
+        for v in crate::group::EXPLICIT_QUANT_BIASES {
             w.write(16, crate::util::f32_to_f16_bits(v) as u64);
         }
         w.write(3, 0); // custom_weights_mask = 0 (default upsampling kernels)

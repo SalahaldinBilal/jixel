@@ -110,14 +110,16 @@ pub(crate) fn tokenize_permutation(zigzag: &[u32], skip: usize, tokens: &mut Vec
 ///
 /// Indices come from `K_STRATEGY_ORDER`: 0 = DCT8, 1 = the 8x8-sized family
 /// (IDENTITY/DCT2X2/DCT4X4/4X8/8X4/AFV), 2 = DCT16X16, 3 = DCT32X32, 4 = DCT16X8/8X16,
-/// 6 = DCT32X16/16X32. DCT64X64 uses group 7 but intentionally stays on its
-/// natural order, so it has no entry here and is never signaled.
-pub(crate) static ORDER_SPECS: [(usize, usize, usize); 6] = [
+/// 5 = DCT32X8/8X32, 6 = DCT32X16/16X32. DCT64X64 uses group 7 but
+/// intentionally stays on its natural order, so it has no entry here and is
+/// never signaled.
+pub(crate) static ORDER_SPECS: [(usize, usize, usize); 7] = [
     (0, 1, 64),
     (1, 1, 64),
     (2, 4, 256),
     (3, 16, 1024),
     (4, 2, 128),
+    (5, 4, 256),
     (6, 8, 512),
 ];
 
@@ -264,6 +266,35 @@ fn natural_scan_128x64() -> &'static [u32] {
 /// Natural scan position of every raw coefficient index, for one order group —
 /// the inverse of jixel's `K_COEFF_ORDER_*` tables (which map scan position to
 /// raw index). This is the space permutations are expressed in.
+pub(crate) fn natural_position_lut_for_order(order: usize) -> Vec<u32> {
+    if order == 5 {
+        let scan = natural_scan_8x32();
+        let mut lut = vec![0u32; scan.len()];
+        for (k, &raw) in scan.iter().enumerate() {
+            lut[raw as usize] = k as u32;
+        }
+        return lut;
+    }
+    natural_position_lut(match order {
+        0 | 1 => 64,
+        2 => 256,
+        3 => 1024,
+        4 => 128,
+        6 => 512,
+        7 => 4096,
+        8 => 2048,
+        9 => 16384,
+        10 => 8192,
+        _ => unreachable!("no natural order for group {order}"),
+    })
+}
+
+/// DCT32X8 / DCT8X32 natural order in the shared 8-row x 32-column layout.
+pub(crate) fn natural_scan_8x32() -> &'static [u32] {
+    static SCAN: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
+    SCAN.get_or_init(|| natural_scan_generic(4, 1))
+}
+
 pub(crate) fn natural_position_lut(size: usize) -> Vec<u32> {
     use crate::ac_context::{
         K_COEFF_ORDER_8X8, K_COEFF_ORDER_16X8, K_COEFF_ORDER_16X16, K_COEFF_ORDER_32X16,
@@ -326,6 +357,8 @@ pub(crate) fn scan_pos_lut(width: usize, height: usize) -> &'static [u32] {
             (8, 8),
             (16, 8),
             (8, 16),
+            (32, 8),
+            (8, 32),
             (16, 16),
             (32, 16),
             (16, 32),
@@ -341,10 +374,15 @@ pub(crate) fn scan_pos_lut(width: usize, height: usize) -> &'static [u32] {
             .iter()
             .map(|&(w, h)| {
                 let size = w * h;
-                let lut = if w >= h {
-                    natural_position_lut(size)
+                let canonical = if (w.max(h), w.min(h)) == (32, 8) {
+                    natural_position_lut_for_order(5)
                 } else {
-                    let c = natural_position_lut(size);
+                    natural_position_lut(size)
+                };
+                let lut = if w >= h {
+                    canonical
+                } else {
+                    let c = canonical;
                     let mut t = vec![0u32; size];
                     for y in 0..h {
                         for x in 0..w {
@@ -378,44 +416,26 @@ impl CoeffOrders {
     pub(crate) fn natural() -> Self {
         // Widen the spec tables once. Frames and channels borrow the same
         // natural scans; only accepted learned scans need owned buffers.
-        static NATURAL: std::sync::OnceLock<[Vec<u32>; 5]> = std::sync::OnceLock::new();
+        static NATURAL: std::sync::OnceLock<[Vec<u32>; ORDER_SPECS.len()]> =
+            std::sync::OnceLock::new();
         let natural = NATURAL.get_or_init(|| {
-            std::array::from_fn(|i| match [64, 128, 256, 512, 1024][i] {
-                64 => crate::ac_context::K_COEFF_ORDER_8X8
-                    .iter()
-                    .map(|&r| r as u32)
-                    .collect(),
-                128 => crate::ac_context::K_COEFF_ORDER_16X8
-                    .iter()
-                    .map(|&r| r as u32)
-                    .collect(),
-                256 => crate::ac_context::K_COEFF_ORDER_16X16
-                    .iter()
-                    .map(|&r| r as u32)
-                    .collect(),
-                512 => crate::ac_context::K_COEFF_ORDER_32X16
-                    .iter()
-                    .map(|&r| r as u32)
-                    .collect(),
-                1024 => crate::ac_context::K_COEFF_ORDER_32X32
-                    .iter()
-                    .map(|&r| r as u32)
-                    .collect(),
-                _ => unreachable!(),
+            std::array::from_fn(|i| {
+                use crate::ac_context as a;
+                match ORDER_SPECS[i].0 {
+                    0 | 1 => a::K_COEFF_ORDER_8X8.iter().map(|&r| r as u32).collect(),
+                    2 => a::K_COEFF_ORDER_16X16.iter().map(|&r| r as u32).collect(),
+                    3 => a::K_COEFF_ORDER_32X32.iter().map(|&r| r as u32).collect(),
+                    4 => a::K_COEFF_ORDER_16X8.iter().map(|&r| r as u32).collect(),
+                    5 => natural_scan_8x32().to_vec(),
+                    6 => a::K_COEFF_ORDER_32X16.iter().map(|&r| r as u32).collect(),
+                    order => unreachable!("no natural scan for group {order}"),
+                }
             })
         });
         Self {
             used_mask: 0,
             orders: std::array::from_fn(|i| {
-                let slot = match ORDER_SPECS[i].2 {
-                    64 => 0,
-                    128 => 1,
-                    256 => 2,
-                    512 => 3,
-                    1024 => 4,
-                    _ => unreachable!(),
-                };
-                std::array::from_fn(|_| Cow::Borrowed(natural[slot].as_slice()))
+                std::array::from_fn(|_| Cow::Borrowed(natural[i].as_slice()))
             }),
         }
     }
@@ -457,7 +477,7 @@ pub(crate) fn write_coeff_orders(
         if orders.used_mask & (1 << order_index) == 0 {
             continue;
         }
-        let natural_pos = natural_position_lut(size);
+        let natural_pos = natural_position_lut_for_order(order_index);
         for channel_order in &orders.orders[i] {
             debug_assert_eq!(channel_order.len(), size);
             // Into natural-scan space, so the default order is the identity.
@@ -619,7 +639,7 @@ pub(crate) fn derive_orders(stats: &OrderStats, out: &mut CoeffOrders) -> f64 {
             let gain = walk - stats.expected_walk(slot, channel, &candidate, llf);
             natural_walk += walk * f64::from(blocks);
             let mut tokens = Vec::new();
-            let natural_pos = natural_position_lut(natural.len());
+            let natural_pos = natural_position_lut_for_order(order_index);
             let zigzag: Vec<u32> = candidate
                 .iter()
                 .map(|&raw| natural_pos[raw as usize])
@@ -693,6 +713,27 @@ impl CoeffOrders {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generic_natural_scan_reproduces_the_spec_tables() {
+        use crate::ac_context as a;
+        let widen = |t: &[u16]| t.iter().map(|&r| u32::from(r)).collect::<Vec<_>>();
+        assert_eq!(natural_scan_generic(4, 2), widen(&a::K_COEFF_ORDER_32X16));
+        assert_eq!(
+            natural_scan_generic(2, 1),
+            a::K_COEFF_ORDER_16X8.iter().map(|&r| u32::from(r)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            natural_scan_generic(2, 2),
+            a::K_COEFF_ORDER_16X16.iter().map(|&r| u32::from(r)).collect::<Vec<_>>()
+        );
+        assert_eq!(natural_scan_generic(8, 4), natural_scan_64x32());
+        let scan = natural_scan_8x32();
+        assert_eq!(&scan[..4], &[0, 1, 2, 3]);
+        let mut seen = scan.to_vec();
+        seen.sort_unstable();
+        assert!(seen.iter().enumerate().all(|(i, &r)| r as usize == i));
+    }
 
     #[test]
     fn entropy_candidates_do_not_use_the_walk_or_permutation_gate() {

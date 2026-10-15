@@ -84,6 +84,8 @@ pub(crate) struct EncodingContext {
     pub(crate) xyb: xyb::XybMatrix,
     /// Color transform of lossy VarDCT frames.
     pub(crate) coding: crate::coding::CodingTransform,
+    /// Per-channel AC dequantization the header signals for `xyb` and `coding`.
+    dequant_bias: [crate::group::DequantBias; 3],
     /// Resolved EPF channel scales; `None` uses the spec XYB weights.
     pub(crate) epf_channel_scale: Option<[f32; 3]>,
     /// Tables of the non-XYB frame, resolved from its coded planes; unset
@@ -182,6 +184,9 @@ pub(crate) struct EncodingContext {
     pub(crate) dct64x128: &'static dct::DctFn<128, 64, 8192>,
     pub(crate) dct32x16: &'static dct::DctFn<16, 32, 512>,
     pub(crate) dct16x32: &'static dct::DctFn<32, 16, 512>,
+    pub(crate) dct32x8: &'static dct::DctFn<8, 32, 256>,
+    pub(crate) dct8x32: &'static dct::DctFn<32, 8, 256>,
+    pub(crate) dc_from_dct8x32: dct::DcFromDct8x32Fn,
     pub(crate) dc_from_dct32x32: dct::DcFromDct32x32Fn,
     pub(crate) dc_from_dct32x16: dct::DcFromDct32x16Fn,
     pub(crate) dc_from_dct16x32: dct::DcFromDct16x32Fn,
@@ -327,6 +332,7 @@ impl EncodingContext {
     /// so they share one luma-shaped table set and equal distortion weights.
     pub(crate) fn set_coding(&mut self, coding: crate::coding::CodingTransform, distance: f32) {
         self.coding = coding;
+        self.refresh_dequant_bias();
         self.set_cfl_frame(crate::color_correlation::CflFrame {
             base_x: coding.base_correlation_x(),
             base_b: coding.base_correlation_b(),
@@ -412,12 +418,26 @@ impl EncodingContext {
         default_weights: bool,
     ) {
         self.xyb = matrix;
+        self.refresh_dequant_bias();
         let weight_bias = if default_weights {
             xyb::B_BIAS
         } else {
             matrix.fwd[8]
         };
         self.channel_weights = channel_weights_for_bias(weight_bias, distance);
+    }
+
+    /// An explicit CustomTransformData bundle is written exactly when an XYB
+    /// frame uses a non-default opsin matrix.
+    fn refresh_dequant_bias(&mut self) {
+        let explicit = self.coding.is_xyb() && !self.xyb.is_decoder_default();
+        self.dequant_bias = crate::group::DequantBias::channels(explicit);
+    }
+
+    /// The decoder's AC dequantization of `channel`.
+    #[inline]
+    pub(crate) fn dequant_bias(&self, channel: usize) -> crate::group::DequantBias {
+        self.dequant_bias[channel]
     }
 
     #[inline]
@@ -460,6 +480,7 @@ impl EncodingContext {
             dots: false,
             xyb,
             coding: crate::coding::CodingTransform::Xyb,
+            dequant_bias: crate::group::DequantBias::channels(!xyb.is_decoder_default()),
             epf_channel_scale: None,
             plain_matrices: std::sync::OnceLock::new(),
             plain_distance: 0.0,
@@ -561,6 +582,9 @@ impl EncodingContext {
             dct64x128: crate::dct128::selected_dct64x128(),
             dct32x16: dct::selected_dct32x16(),
             dct16x32: dct::selected_dct16x32(),
+            dct32x8: dct::selected_dct32x8(),
+            dct8x32: dct::selected_dct8x32(),
+            dc_from_dct8x32: dc_from_dct.dct8x32,
             dc_from_dct32x32: dc_from_dct.dct32x32,
             dc_from_dct32x16: dc_from_dct.dct32x16,
             dc_from_dct16x32: dc_from_dct.dct16x32,
@@ -717,5 +741,31 @@ mod tests {
         ctx.set_xyb_matrix(mild, 2.0, true);
         assert_eq!(ctx.xyb, mild);
         assert_eq!(ctx.channel_weights(), [0.30, 1.0, 0.28]);
+    }
+
+    #[test]
+    fn dequant_bias_follows_the_signaled_bundle() {
+        use super::{EncodingContext, Speed, xyb};
+        use crate::group::{DequantBias, EXPLICIT_QUANT_BIASES};
+        let mut ctx = EncodingContext::new(
+            Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            xyb::XybMatrix::SPEC,
+            1.0,
+            1,
+        );
+        let biases = |ctx: &EncodingContext| std::array::from_fn(|c| ctx.dequant_bias(c));
+        assert_eq!(biases(&ctx), DequantBias::DEFAULT);
+        ctx.set_xyb_matrix(crate::yellow_opsin::matrix_for_bias(0.85), 1.0, false);
+        let explicit: [DequantBias; 3] = biases(&ctx);
+        assert_eq!(explicit[2].one, 1.0);
+        for (c, bias) in explicit.iter().enumerate() {
+            let f16 = crate::util::f32_to_f16_bits(EXPLICIT_QUANT_BIASES[c]);
+            assert_eq!(bias.one, crate::util::f16_bits_to_f32(f16));
+            assert!((bias.numerator - 0.145).abs() < 1e-4);
+        }
+        // Non-XYB frames never write the explicit bundle.
+        ctx.set_coding(crate::coding::CodingTransform::YCbCr, 1.0);
+        assert_eq!(biases(&ctx), DequantBias::DEFAULT);
     }
 }

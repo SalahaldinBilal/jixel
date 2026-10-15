@@ -58,7 +58,7 @@ use crate::coeff_order::{CoeffOrders, OrderStats, derive_orders, order_slot_of};
 use crate::dc_group_data::{NUM_STRATEGIES, STRATEGY_CODE_LUT};
 use crate::entropy::{pack_signed, uint_encode};
 use std::cell::RefCell;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Token symbols priced individually; rarer ones share the last price.
 const SYMBOLS: usize = 64;
@@ -110,6 +110,54 @@ struct Table {
     /// Bits of a channel without nonzero coefficients, by channel and
     /// quant class.
     empty: [[f32; QUANT_CLASSES]; 3],
+    /// Lower bound from the count token and the mandatory nonzero tokens.
+    minimum_channel_bits: OnceLock<[[f32; QUANT_CLASSES]; 3]>,
+}
+
+// Compute only when a large reconstruction rerank actually needs this table.
+// Ordinary selection and groups without selected 64-family transforms pay none
+// of the scan over coefficient-token prices.
+fn minimum_channel_bits(table: &Table, strategy: u8) -> [[f32; QUANT_CLASSES]; 3] {
+    let covered = AcStrategyImage::covered_blocks_x_of(strategy)
+        * AcStrategyImage::covered_blocks_y_of(strategy);
+    let size = covered * 64;
+    let mut result = [[f32::INFINITY; QUANT_CLASSES]; 3];
+    for c in 0..3 {
+        for qf_hi in 0..QUANT_CLASSES {
+            let base = (c * QUANT_CLASSES + qf_hi) * CONTEXTS;
+            let minimum_coefficient = table.rows[base + K_NON_ZERO_BUCKETS..base + CONTEXTS]
+                .iter()
+                .map(|&row| {
+                    table.bits[usize::from(row) * SYMBOLS + 1..(usize::from(row) + 1) * SYMBOLS]
+                        .iter()
+                        .copied()
+                        .fold(f32::INFINITY, f32::min)
+                })
+                .fold(f32::INFINITY, f32::min) as f64;
+            // A stream with N nonzero levels must pay for N nonzero
+            // coefficient tokens, in addition to its count token. Extra
+            // magnitude bits and any intervening zero tokens only add rate.
+            // Reserve the worst f32 summation error over this footprint.
+            let max_nonzero = size - covered;
+            let rounding = 1.0 - (max_nonzero + 2) as f64 * f32::EPSILON as f64;
+            let mut minimum = table.empty[c][qf_hi];
+            for nzeros in 1..=max_nonzero {
+                let coefficient_bits = nzeros as f64 * minimum_coefficient;
+                if coefficient_bits * rounding >= minimum as f64 {
+                    break;
+                }
+                let predicted = nzeros.div_ceil(covered).min(32) as u32;
+                let context = fine_non_zero_context(predicted, 0) as usize / K_NUM_FINE_BLOCK_CTXS;
+                let (symbol, extra) = token_symbol(nzeros as u32);
+                let bits =
+                    table.bits[usize::from(table.rows[base + context]) * SYMBOLS + symbol] + extra;
+                let lower = (((bits as f64 + coefficient_bits) * rounding) as f32).next_down();
+                minimum = minimum.min(lower);
+            }
+            result[c][qf_hi] = minimum;
+        }
+    }
+    result
 }
 
 /// One transform's table and, for DCT8, the bits of its sampled blocks
@@ -320,6 +368,8 @@ fn selectable(speed: crate::Speed, distance: f32) -> impl Iterator<Item = u8> {
         STRATEGY_DCT32X16,
         STRATEGY_DCT16X32,
         STRATEGY_DCT32X32,
+        STRATEGY_DCT32X8,
+        STRATEGY_DCT8X32,
     ];
     let fine = [STRATEGY_IDENTITY, STRATEGY_DCT2X2];
     let sub8 = [
@@ -419,7 +469,7 @@ fn sample_position(index: usize, count: usize, total: usize) -> usize {
 /// large transforms once quantization coarsens.
 fn learned_calibration(strategy: u8, distance: f32) -> f32 {
     let row: [f32; 3] = match strategy {
-        STRATEGY_DCT16X16 => [0.98, 0.99, 0.92],
+        STRATEGY_DCT16X16 | STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => [0.98, 0.99, 0.92],
         STRATEGY_DCT32X32 | STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => [1.0, 0.93, 0.83],
         STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => [0.98, 0.88, 0.74],
         _ => return 1.0,
@@ -478,6 +528,7 @@ impl RatePrices {
                         &coeffs[..size],
                         inverse_matrix_of(ctx, strategy, c),
                         qac * qm,
+                        ctx.dequant_bias(c),
                         width,
                         height,
                         width / 2,
@@ -579,6 +630,20 @@ impl RatePrices {
             bits
         });
         Some(bits * self.norm * learned_calibration(strategy, distance))
+    }
+
+    /// Lower bound on a transform's rate without transforming any pixels.
+    pub(crate) fn minimum_rate(&self, strategy: u8, qac: f32, distance: f32) -> Option<f32> {
+        let table = self.tables[strategy as usize].as_ref()?;
+        let qf_hi = usize::from((qac * self.inv_scale).round() as u32 > self.qf_threshold);
+        let mut bits = 0.0;
+        for row in table
+            .minimum_channel_bits
+            .get_or_init(|| minimum_channel_bits(table, strategy))
+        {
+            bits += row[qf_hi];
+        }
+        Some((bits * self.norm * learned_calibration(strategy, distance)).next_down())
     }
 
     /// One transform's table and the bits of its sampled blocks.
@@ -727,6 +792,7 @@ impl RatePrices {
             rows,
             orders,
             empty: [[0.0; QUANT_CLASSES]; 3],
+            minimum_channel_bits: OnceLock::new(),
         };
         let zeros = vec![0i32; size];
         for (c, empty) in table.empty.clone().iter().enumerate() {
@@ -872,6 +938,47 @@ impl Drop for RatePricesScope<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mandatory_token_bound_does_not_exceed_complete_rates() {
+        let distance = 1.0;
+        let prices = learn(&checkerboard(256), distance);
+        for (strategy, table) in prices.tables.iter().enumerate() {
+            let Some(table) = table else {
+                continue;
+            };
+            let strategy = strategy as u8;
+            let w = AcStrategyImage::covered_blocks_x_of(strategy);
+            let h = AcStrategyImage::covered_blocks_y_of(strategy);
+            let (cx, cy) = (w.max(h), w.min(h));
+            let size = cx * cy * 64;
+            for (class, qac) in [(false, 0.16), (true, 0.24)] {
+                let lower = prices.minimum_rate(strategy, qac, distance).unwrap();
+                for stride in [1, 2, 7, 31, size] {
+                    let mut bits = 0.0;
+                    for c in 0..3 {
+                        let block: Vec<i32> = (0..size)
+                            .map(|i| {
+                                if i / (cx * 8) < cy && i % (cx * 8) < cx {
+                                    0
+                                } else if i % stride == 0 {
+                                    if (i + c) % 2 == 0 { 1 } else { -3 }
+                                } else {
+                                    0
+                                }
+                            })
+                            .collect();
+                        bits += RatePrices::channel_bits(table, strategy, c, &block, cx, cy, class);
+                    }
+                    let actual = bits * prices.norm * learned_calibration(strategy, distance);
+                    assert!(
+                        lower <= actual,
+                        "strategy={strategy}, class={class}, stride={stride}: {lower} > {actual}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn contiguous_nonzero_count_preserves_every_learned_rate_token() {

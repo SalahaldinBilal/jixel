@@ -32,7 +32,7 @@
 //! stored in the normalized layout (short axis = rows, long axis = columns;
 //! square blocks are stored transposed, `horizontal * 128 + vertical`).
 
-use crate::dct::{DctInput, dct1d_64, fmla, inv_dct1d_64};
+use crate::dct::DctInput;
 #[cfg(any(
     test,
     not(any(
@@ -40,7 +40,9 @@ use crate::dct::{DctInput, dct1d_64, fmla, inv_dct1d_64};
         all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
     ))
 ))]
-use crate::dct::{RESAMPLE_SCALE_64_TO_8, inv_dct1d_8, inv_dct1d_16, inv_dct16x16};
+use crate::dct::{
+    RESAMPLE_SCALE_64_TO_8, dct1d_64, fmla, inv_dct1d_8, inv_dct1d_16, inv_dct1d_64, inv_dct16x16,
+};
 use std::sync::OnceLock;
 
 /// libjxl `DCTResampleScales<128, 16>`.
@@ -64,6 +66,13 @@ pub(crate) const RESAMPLE_SCALE_128_TO_16: [f32; 16] = [
 ];
 
 /// `1 / (2 cos((2i + 1) pi / 256))`, the 128-point butterfly weights.
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) const WC128: [f32; 64] = [
     0.50003767,
     0.500339031,
@@ -204,6 +213,11 @@ pub(crate) const INV_WC128: [f32; 64] = [
     all(target_arch = "x86_64", feature = "avx"),
     all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
 ))]
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "x86_64", feature = "avx"),
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+))]
 pub(crate) const DCT128_SPLIT_COS: [f32; 32] = [
     0.999924719,
     0.999322355,
@@ -239,6 +253,11 @@ pub(crate) const DCT128_SPLIT_COS: [f32; 32] = [
     0.715730846,
 ];
 
+#[cfg(any(
+    all(target_arch = "aarch64", feature = "neon"),
+    all(target_arch = "x86_64", feature = "avx"),
+    all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+))]
 #[cfg(any(
     all(target_arch = "aarch64", feature = "neon"),
     all(target_arch = "x86_64", feature = "avx"),
@@ -301,6 +320,13 @@ pub(crate) const fn dct64_natural_index(frequency: usize) -> usize {
     }
 }
 
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) fn dct1d_128(buf: &mut [f32; 128]) {
     let wc = &WC128;
     let mut tmp = [0.0f32; 128];
@@ -320,6 +346,13 @@ pub(crate) fn dct1d_128(buf: &mut [f32; 128]) {
     }
 }
 
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) fn inv_dct1d_128(buf: &mut [f32; 128]) {
     let inv_wc = &INV_WC128;
     let mut tmp = [0.0f32; 128];
@@ -342,6 +375,13 @@ pub(crate) fn inv_dct1d_128(buf: &mut [f32; 128]) {
     }
 }
 
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) fn dct128x128_scalar_input(input: DctInput<'_, 128, 128>, output: &mut [f32; 16384]) {
     let mut after_col_dct = vec![0.0f32; 16384];
     let mut col = [0.0f32; 128];
@@ -366,6 +406,13 @@ pub(crate) fn dct128x128_scalar_input(input: DctInput<'_, 128, 128>, output: &mu
 
 /// 128 rows x 64 columns, stored as 64 rows x 128 columns
 /// (`horizontal_frequency * 128 + vertical_frequency`).
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) fn dct128x64_scalar_input(input: DctInput<'_, 64, 128>, output: &mut [f32; 8192]) {
     let mut after_col_dct = vec![0.0f32; 8192];
     let mut col = [0.0f32; 128];
@@ -389,6 +436,13 @@ pub(crate) fn dct128x64_scalar_input(input: DctInput<'_, 64, 128>, output: &mut 
 }
 
 /// 64 rows x 128 columns, stored directly in the normalized layout.
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) fn dct64x128_scalar_input(input: DctInput<'_, 128, 64>, output: &mut [f32; 8192]) {
     let mut after_row_dct = vec![0.0f32; 8192];
     for y in 0..64 {
@@ -409,6 +463,13 @@ pub(crate) fn dct64x128_scalar_input(input: DctInput<'_, 128, 64>, output: &mut 
     }
 }
 
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) fn inv_dct128x128(coeff: DctInput<'_, 128, 128>, out: &mut [f32; 16384]) {
     for a in 0..128 {
         for b in 0..128 {
@@ -431,6 +492,13 @@ pub(crate) fn inv_dct128x128(coeff: DctInput<'_, 128, 128>, out: &mut [f32; 1638
 }
 
 /// Inverse of [`dct128x64`]: 128 rows x 64 columns of pixels.
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) fn inv_dct128x64(coeff: DctInput<'_, 128, 64>, out: &mut [f32; 8192]) {
     let mut after_row = vec![0.0f32; 8192];
     let mut row = [0.0f32; 64];
@@ -454,6 +522,13 @@ pub(crate) fn inv_dct128x64(coeff: DctInput<'_, 128, 64>, out: &mut [f32; 8192])
 }
 
 /// Inverse of [`dct64x128`]: 64 rows x 128 columns of pixels.
+#[cfg(any(
+    test,
+    not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    ))
+))]
 pub(crate) fn inv_dct64x128(coeff: DctInput<'_, 128, 64>, out: &mut [f32; 8192]) {
     for y in 0..64 {
         for x in 0..128 {
@@ -563,17 +638,20 @@ static DCT_METHOD_128X128: OnceLock<crate::dct::DctFn<128, 128, 16384>> = OnceLo
 fn select_dct_128x128() -> crate::dct::DctFn<128, 128, 16384> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        return |input, output| unsafe { crate::neon::dct128x128_neon(input, output) };
+        |input, output| unsafe { crate::neon::dct128x128_neon(input, output) }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        return |input, output| crate::wasm::dct128x128_wasm(input, output);
+        crate::wasm::dct128x128_wasm
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
         return |input, output| unsafe { crate::avx::dct128x128_avx2(input, output) };
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
     dct128x128_scalar_input
 }
 
@@ -590,17 +668,20 @@ static DCT_METHOD_128X64: OnceLock<crate::dct::DctFn<64, 128, 8192>> = OnceLock:
 fn select_dct_128x64() -> crate::dct::DctFn<64, 128, 8192> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        return |input, output| unsafe { crate::neon::dct128x64_neon(input, output) };
+        |input, output| unsafe { crate::neon::dct128x64_neon(input, output) }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        return |input, output| crate::wasm::dct128x64_wasm(input, output);
+        crate::wasm::dct128x64_wasm
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
         return |input, output| unsafe { crate::avx::dct128x64_avx2(input, output) };
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
     dct128x64_scalar_input
 }
 
@@ -617,17 +698,20 @@ static DCT_METHOD_64X128: OnceLock<crate::dct::DctFn<128, 64, 8192>> = OnceLock:
 fn select_dct_64x128() -> crate::dct::DctFn<128, 64, 8192> {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        return |input, output| unsafe { crate::neon::dct64x128_neon(input, output) };
+        |input, output| unsafe { crate::neon::dct64x128_neon(input, output) }
     }
     #[cfg(all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm"))]
     {
-        return |input, output| crate::wasm::dct64x128_wasm(input, output);
+        crate::wasm::dct64x128_wasm
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
         return |input, output| unsafe { crate::avx::dct64x128_avx2(input, output) };
     }
-    #[allow(unreachable_code)]
+    #[cfg(not(any(
+        all(target_arch = "aarch64", feature = "neon"),
+        all(target_arch = "wasm32", target_feature = "simd128", feature = "wasm")
+    )))]
     dct64x128_scalar_input
 }
 

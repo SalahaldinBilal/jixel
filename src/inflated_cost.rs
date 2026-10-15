@@ -78,6 +78,7 @@ pub(crate) type SseAndRateFn = unsafe fn(
     &[f32],
     &[f32],
     f32,
+    crate::group::DequantBias,
     usize,
     usize,
     usize,
@@ -126,6 +127,7 @@ pub(crate) type SseAndQuantizeFn = unsafe fn(
     &[f32],
     &[f32],
     f32,
+    crate::group::DequantBias,
     usize,
     usize,
     usize,
@@ -260,6 +262,7 @@ fn fused_coefficient_scoring_preserves_distortion_and_coding_levels() {
                                 &coeffs,
                                 &inverse,
                                 qac * qm,
+                                crate::group::DequantBias::DEFAULT[c],
                                 width,
                                 height,
                                 width / 2,
@@ -275,6 +278,7 @@ fn fused_coefficient_scoring_preserves_distortion_and_coding_levels() {
                                 &coeffs,
                                 &inverse,
                                 qac * qm,
+                                crate::group::DequantBias::DEFAULT[c],
                                 width,
                                 height,
                                 width / 2,
@@ -324,6 +328,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
             let coeff: Vec<f32> = (0..n).map(|_| (random() - 0.5) * coeff_scale).collect();
             let inv: Vec<f32> = (0..n).map(|_| 0.001 + random() * 0.5).collect();
             let q_scaled = 0.5 + random() * 3.0;
+            let bias = crate::group::DequantBias::DEFAULT[case % 3];
             let thr = [
                 random() * 0.6,
                 random() * 0.6,
@@ -349,11 +354,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
                     } else {
                         0.0
                     };
-                    let d = if biased {
-                        a - crate::group::dequantized_level_f32(q)
-                    } else {
-                        a - q
-                    };
+                    let d = if biased { a - bias.level_f32(q) } else { a - q };
                     expected_sse += d * d;
                     if q != 0.0 {
                         expected_nzeros += 1;
@@ -368,6 +369,7 @@ pub(crate) fn assert_sse_and_rate_matches_reference(kernel: SseAndRateFn, biased
                     &coeff,
                     &inv,
                     q_scaled,
+                    bias,
                     width,
                     height,
                     half,
@@ -454,6 +456,7 @@ pub(crate) fn assert_coefficient_kernel_preserves_original(
                     &coeff,
                     &inv,
                     scale,
+                    crate::group::DequantBias::DEFAULT[case % 3],
                     width,
                     height,
                     width / 2,
@@ -487,6 +490,7 @@ pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -500,6 +504,7 @@ pub(crate) fn sse_and_rate_scalar<const BIASED: bool>(
         coeff,
         inv_matrix,
         q_scaled,
+        bias,
         width,
         height,
         half,
@@ -517,6 +522,7 @@ pub(crate) fn sse_and_rate_scalar_impl<const BIASED: bool, const SAVE_LEVELS: bo
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -552,11 +558,7 @@ pub(crate) fn sse_and_rate_scalar_impl<const BIASED: bool, const SAVE_LEVELS: bo
             if SAVE_LEVELS {
                 levels[y * width + x] = q as i32;
             }
-            let d = if BIASED {
-                a - crate::group::dequantized_level_f32(q)
-            } else {
-                a - q
-            };
+            let d = if BIASED { a - bias.level_f32(q) } else { a - q };
             sse += d * d;
             if q != 0.0 {
                 nzeros += 1;
@@ -587,6 +589,7 @@ pub(crate) fn channel_rd(
     coeff: &[f32],
     inv_matrix: &[f32],
     channel: usize,
+    bias: crate::group::DequantBias,
     qac: f32,
     qm_mult: f32,
     distance: f32,
@@ -603,6 +606,7 @@ pub(crate) fn channel_rd(
             coeff,
             inv_matrix,
             qac * qm_mult,
+            bias,
             width,
             height,
             half,
@@ -634,6 +638,8 @@ pub(crate) fn strategy_pixel_dims(strategy: u8) -> (usize, usize) {
         STRATEGY_DCT16X16 => (16, 16),
         STRATEGY_DCT32X16 => (16, 32),
         STRATEGY_DCT16X32 => (32, 16),
+        crate::dc_group_data::STRATEGY_DCT32X8 => (8, 32),
+        crate::dc_group_data::STRATEGY_DCT8X32 => (32, 8),
         STRATEGY_DCT32X32 => (32, 32),
         STRATEGY_DCT64X64 => (64, 64),
         STRATEGY_DCT64X32 => (32, 64),
@@ -746,22 +752,22 @@ pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
         }};
     }
     macro_rules! fwd_input {
-        ($f:path, $n:literal, $w:literal, $h:literal) => {{
+        ($f:expr, $n:literal, $w:literal, $h:literal) => {{
             let i: &[f32; $n] = input.first_chunk::<$n>().unwrap();
             let o: &mut [f32; $n] = out.first_chunk_mut::<$n>().unwrap();
-            $f(DctInput::<$w, $h>::from_flat(i), o);
+            ($f)(DctInput::<$w, $h>::from_flat(i), o);
         }};
     }
     match strategy {
         STRATEGY_IDENTITY => {
             let i: &[f32; 64] = input.first_chunk::<64>().unwrap();
             let o: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
-            dct::identity8x8(DctInput::from_flat(i), o);
+            dct::selected_identity8x8()(DctInput::from_flat(i), o);
         }
         STRATEGY_DCT2X2 => {
             let i: &[f32; 64] = input.first_chunk::<64>().unwrap();
             let o: &mut [f32; 64] = out.first_chunk_mut::<64>().unwrap();
-            dct::dct2x2_8x8(DctInput::from_flat(i), o);
+            dct::selected_dct2x2_8x8()(DctInput::from_flat(i), o);
         }
         STRATEGY_DCT4X4 => fwd!(dct::dct4x4, 64),
         STRATEGY_DCT4X8 => fwd!(dct::dct4x8, 64),
@@ -776,9 +782,11 @@ pub(crate) fn forward_for(strategy: u8, input: &[f32], out: &mut [f32]) {
         STRATEGY_DCT32X32 => fwd!(dct::dct32x32, 1024),
         STRATEGY_DCT32X16 => fwd!(dct::dct32x16, 512),
         STRATEGY_DCT16X32 => fwd!(dct::dct16x32, 512),
-        STRATEGY_DCT64X64 => fwd_input!(dct::dct64x64_scalar_input, 4096, 64, 64),
-        STRATEGY_DCT64X32 => fwd_input!(dct::dct64x32_scalar_input, 2048, 32, 64),
-        STRATEGY_DCT32X64 => fwd_input!(dct::dct32x64_scalar_input, 2048, 64, 32),
+        crate::dc_group_data::STRATEGY_DCT32X8 => fwd_input!(dct::dct32x8, 256, 8, 32),
+        crate::dc_group_data::STRATEGY_DCT8X32 => fwd_input!(dct::dct8x32, 256, 32, 8),
+        STRATEGY_DCT64X64 => fwd_input!(dct::selected_dct64x64(), 4096, 64, 64),
+        STRATEGY_DCT64X32 => fwd_input!(dct::selected_dct64x32(), 2048, 32, 64),
+        STRATEGY_DCT32X64 => fwd_input!(dct::selected_dct32x64(), 2048, 64, 32),
         crate::dc_group_data::STRATEGY_DCT128X128 => {
             crate::dct128::dct128x128(DctInput::new(input, 128), out)
         }
@@ -833,6 +841,8 @@ pub(crate) fn reconstruct_error(
         STRATEGY_DCT16X16 => inverse!(idct.idct16x16, 256, 16, 16),
         STRATEGY_DCT16X32 => inverse!(idct.idct16x32, 512, 32, 16),
         STRATEGY_DCT32X16 => inverse!(idct.idct32x16, 512, 32, 16),
+        crate::dc_group_data::STRATEGY_DCT32X8 => inverse!(idct.idct32x8, 256, 32, 8),
+        crate::dc_group_data::STRATEGY_DCT8X32 => inverse!(idct.idct8x32, 256, 32, 8),
         STRATEGY_DCT32X32 => inverse!(idct.idct32x32, 1024, 32, 32),
         STRATEGY_DCT64X64 => inverse!(idct.idct64x64, 4096, 64, 64),
         STRATEGY_DCT64X32 => inverse!(idct.idct64x32, 2048, 64, 32),
@@ -876,6 +886,7 @@ pub(crate) type ReconQuantizeFn = unsafe fn(
     &[f32],
     &[f32],
     f32,
+    crate::group::DequantBias,
     &[f32; 4],
     usize,
     usize,
@@ -904,6 +915,7 @@ pub(crate) struct ReconQuantization<'a> {
     pub(crate) qm_mult_x: f32,
     pub(crate) qm_mult_b: f32,
     pub(crate) distance: f32,
+    pub(crate) dequant_bias: [crate::group::DequantBias; 3],
 }
 
 pub(crate) struct ReconTransform {
@@ -973,7 +985,7 @@ impl ReconCost {
 }
 
 pub(crate) type ReconDistAndRateFn = for<'a, 'input, 'kernels> fn(
-    &mut [[f32; 1024]; 8],
+    &mut [[f32; 4096]; 8],
     &'input ReconDistInput<'a>,
     &'kernels ReconErrorKernels,
 ) -> ReconCost;
@@ -1104,7 +1116,7 @@ pub(crate) fn select_recon_dist_and_rate_fn() -> ReconDistAndRateFn {
 }
 
 fn recon_dist_and_rate_default(
-    scratch: &mut [[f32; 1024]; 8],
+    scratch: &mut [[f32; 4096]; 8],
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
 ) -> ReconCost {
@@ -1127,7 +1139,7 @@ fn recon_dist_and_rate_default(
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) fn recon_dist_and_rate_scalar<const BIASED: bool>(
-    scratch: &mut [[f32; 1024]; 8],
+    scratch: &mut [[f32; 4096]; 8],
     input: &ReconDistInput<'_>,
 ) -> ReconCost {
     let error = ReconErrorKernels {
@@ -1259,7 +1271,7 @@ fn gradient_peak_floor(distance: f32) -> f32 {
 }
 
 pub(crate) fn recon_dist_and_rate_with_kernels(
-    scratch: &mut [[f32; 1024]; 8],
+    scratch: &mut [[f32; 4096]; 8],
     input: &ReconDistInput<'_>,
     kernels: &ReconKernels<'_>,
 ) -> ReconCost {
@@ -1335,6 +1347,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
             &coeffs[1][..n],
             &inverse_matrices[1][..n],
             quant_scales[1],
+            quantization.dequant_bias[1],
             &thresholds[1],
             width,
             height,
@@ -1359,6 +1372,7 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
                 &combined_error[..n],
                 &inverse_matrices[c][..n],
                 quant_scales[c],
+                quantization.dequant_bias[c],
                 &thresholds[c],
                 width,
                 height,
@@ -1742,6 +1756,7 @@ fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
+    bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
     width: usize,
     height: usize,
@@ -1789,7 +1804,7 @@ fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool>(
                 0.0
             };
             *error = if BIASED {
-                (scaled - crate::group::dequantized_level_f32(quantized)) / denominator
+                (scaled - bias.level_f32(quantized)) / denominator
             } else {
                 (scaled - quantized) / denominator
             };
@@ -2149,6 +2164,7 @@ mod tests {
                         qm_mult_x: 1.2,
                         qm_mult_b: 1.6,
                         distance: 1.5,
+                        dequant_bias: crate::group::DequantBias::DEFAULT,
                     },
                     transform: ReconTransform {
                         blocks_x: cx / 8,
@@ -2171,7 +2187,7 @@ mod tests {
                         keep_spatial_errors: false,
                     },
                 };
-                recon_dist_and_rate_default(&mut [[0.0; 1024]; 8], &input, &error)
+                recon_dist_and_rate_default(&mut [[0.0; 4096]; 8], &input, &error)
             };
             let (visible, padded) = (cost(&narrow), cost(&wide));
             assert_eq!(visible.rate.to_bits(), padded.rate.to_bits());
@@ -2194,10 +2210,10 @@ mod tests {
                 *value = ((i * 17 + c * 7) % 29) as f32 * 0.013;
             }
         }
-        let coeffs: [[f32; 1024]; 3] = std::array::from_fn(|c| {
+        let coeffs: [[f32; 4096]; 3] = std::array::from_fn(|c| {
             std::array::from_fn(|i| ((i * 17 + c * 7) % 29) as f32 * 0.13 - 1.8)
         });
-        let inverse: [f32; 1024] = std::array::from_fn(|i| 0.1 + (i % 7) as f32 * 0.15);
+        let inverse: [f32; 4096] = std::array::from_fn(|i| 0.1 + (i % 7) as f32 * 0.15);
         let error = ReconErrorKernels {
             gradient_energy: select_error_gradient_energy_fn(),
             gradient_peak_energy: select_error_gradient_peak_energy_fn(),
@@ -2209,9 +2225,8 @@ mod tests {
             recon_dist_and_rate_default,
             |scratch, input, _| recon_dist_and_rate_scalar::<false>(scratch, input),
         ];
-        for strategy in (0..NUM_STRATEGIES as u8)
-            .filter(|&s| !matches!(s, STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64))
-            .filter(|&s| !crate::dc_group_data::is_128_strategy(s))
+        for strategy in
+            (0..NUM_STRATEGIES as u8).filter(|&s| !crate::dc_group_data::is_128_strategy(s))
         {
             let (w, h) = strategy_pixel_dims(strategy);
             let (cx, cy) = (w.max(h), w.min(h));
@@ -2228,6 +2243,7 @@ mod tests {
                             qm_mult_x: 1.2,
                             qm_mult_b: 1.6,
                             distance: 1.5,
+                            dequant_bias: crate::group::DequantBias::DEFAULT,
                         },
                         transform: ReconTransform {
                             blocks_x: cx / 8,
@@ -2251,7 +2267,7 @@ mod tests {
                         },
                     };
                     for kernel in kernels {
-                        let mut expected = [[-123.0; 1024]; 8];
+                        let mut expected = [[-123.0; 4096]; 8];
                         let mut actual = expected;
                         input.quantization.compute_rate = true;
                         let full = kernel(&mut expected, &input, &error);
@@ -2312,6 +2328,7 @@ mod tests {
                 qm_mult_x: 1.2,
                 qm_mult_b: 1.6,
                 distance: 4.0,
+                dequant_bias: crate::group::DequantBias::DEFAULT,
             },
             transform: ReconTransform {
                 blocks_x: 1,
@@ -2341,7 +2358,7 @@ mod tests {
             rgb_hue_chroma_edge_loss: select_rgb_hue_chroma_edge_loss_fn(),
         };
         let reconstruct = select_recon_dist_and_rate_fn();
-        let mut scratch = [[0.0; 1024]; 8];
+        let mut scratch = [[0.0; 4096]; 8];
         let base = reconstruct(&mut scratch, &input, &error);
         assert_eq!(base.hue_distortion, 0.0);
         input.scoring.rgb_hue_alpha = 800.0;

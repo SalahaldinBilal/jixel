@@ -33,7 +33,14 @@ use super::ac_strategy::{avx_dequantized_level_f32, avx2_log2p1_f32, hsum256};
 use crate::color_correlation::{CFL_MAGNITUDE_BITS, CFL_NONZERO_BITS, cfl_rd_cost_scalar};
 
 #[target_feature(enable = "avx2,fma")]
-pub(crate) fn cfl_rd_cost_avx2(m: &[f32], s: &[f32], factor: f32, weight: f32, lambda: f32) -> f32 {
+pub(crate) fn cfl_rd_cost_avx2(
+    m: &[f32],
+    s: &[f32],
+    factor: f32,
+    weight: f32,
+    lambda: f32,
+    bias: crate::group::DequantBias,
+) -> f32 {
     let len = m.len().min(s.len());
     let (m_chunks, m_tail) = m[..len].as_chunks::<8>();
     let (s_chunks, s_tail) = s[..len].as_chunks::<8>();
@@ -61,7 +68,7 @@ pub(crate) fn cfl_rd_cost_avx2(m: &[f32], s: &[f32], factor: f32, weight: f32, l
         let signed_one = _mm256_or_ps(one, _mm256_and_ps(sign, residual));
         let level = _mm256_add_ps(truncated, _mm256_and_ps(signed_one, at_least_half));
 
-        let coded_err = _mm256_sub_ps(residual, avx_dequantized_level_f32(level));
+        let coded_err = _mm256_sub_ps(residual, avx_dequantized_level_f32(level, bias));
         let abs_level = _mm256_andnot_ps(sign, level);
         // Clamp zero levels before taking log2; their coded cost is masked out.
         let log2_level = avx2_log2p1_f32(_mm256_max_ps(_mm256_sub_ps(abs_level, one), zero));
@@ -75,7 +82,7 @@ pub(crate) fn cfl_rd_cost_avx2(m: &[f32], s: &[f32], factor: f32, weight: f32, l
         acc = _mm256_add_ps(acc, best);
     }
 
-    hsum256(acc) + cfl_rd_cost_scalar(m_tail, s_tail, factor, weight, lambda)
+    hsum256(acc) + cfl_rd_cost_scalar(m_tail, s_tail, factor, weight, lambda, bias)
 }
 
 #[inline]

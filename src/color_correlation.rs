@@ -62,7 +62,7 @@ pub(crate) type CflRdoBlockFn = fn(
 );
 
 pub(crate) type CflRdoStatsFn = fn(&[f32], &[f32]) -> [f32; 4];
-pub(crate) type CflRdCostFn = fn(&[f32], &[f32], f32, f32, f32) -> f32;
+pub(crate) type CflRdCostFn = fn(&[f32], &[f32], f32, f32, f32, crate::group::DequantBias) -> f32;
 
 /// Context-free rate of a coded residual coefficient in bits: a nonzero plus
 /// its magnitude. The tile is scored before any entropy code exists.
@@ -81,6 +81,7 @@ pub(crate) fn cfl_rd_cost_scalar(
     factor: f32,
     weight: f32,
     lambda: f32,
+    bias: crate::group::DequantBias,
 ) -> f32 {
     let mut cost = 0.0f32;
     for (&mv, &sv) in m.iter().zip(s) {
@@ -88,7 +89,7 @@ pub(crate) fn cfl_rd_cost_scalar(
         let mut best = weight * residual * residual;
         let level = residual.round();
         if level != 0.0 {
-            let coded_err = residual - crate::group::dequantized_level_f32(level);
+            let coded_err = residual - bias.level_f32(level);
             let coded = weight * coded_err * coded_err
                 + lambda * (CFL_NONZERO_BITS + CFL_MAGNITUDE_BITS * dirty_log2f(level.abs()));
             best = best.min(coded);
@@ -101,20 +102,20 @@ pub(crate) fn cfl_rd_cost_scalar(
 pub(crate) fn selected_cfl_rd_cost_fn() -> CflRdCostFn {
     #[cfg(all(target_arch = "aarch64", feature = "neon"))]
     {
-        |m, s, factor, weight, lambda| unsafe {
-            crate::neon::cfl_rd_cost_neon(m, s, factor, weight, lambda)
+        |m, s, factor, weight, lambda, bias| unsafe {
+            crate::neon::cfl_rd_cost_neon(m, s, factor, weight, lambda, bias)
         }
     }
     #[cfg(all(target_arch = "x86_64", feature = "avx"))]
     if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
-        return |m, s, factor, weight, lambda| unsafe {
-            crate::avx::cfl_rd_cost_avx2(m, s, factor, weight, lambda)
+        return |m, s, factor, weight, lambda, bias| unsafe {
+            crate::avx::cfl_rd_cost_avx2(m, s, factor, weight, lambda, bias)
         };
     }
     #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
     if std::arch::is_x86_feature_detected!("sse4.1") {
-        return |m, s, factor, weight, lambda| unsafe {
-            crate::sse::cfl_rd_cost_sse41(m, s, factor, weight, lambda)
+        return |m, s, factor, weight, lambda, bias| unsafe {
+            crate::sse::cfl_rd_cost_sse41(m, s, factor, weight, lambda, bias)
         };
     }
     #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
@@ -453,6 +454,7 @@ fn cmap_residual_bits(res: i32) -> f32 {
 fn optimize_channel_rdo(
     stats_fn: CflRdoStatsFn,
     cost_fn: CflRdCostFn,
+    bias: crate::group::DequantBias,
     m: &[f32],
     s: &[f32],
     weight: f32,
@@ -494,7 +496,8 @@ fn optimize_channel_rdo(
     let mut best = (f32::MAX, 0i32);
     for &cand in &cands[..num_cands] {
         let factor = fmla(cand as f32, 1.0 / color_factor, base);
-        let cost = cost_fn(m, s, factor, weight, lambda) + lambda * cmap_residual_bits(cand - pred);
+        let cost =
+            cost_fn(m, s, factor, weight, lambda, bias) + lambda * cmap_residual_bits(cand - pred);
         if cost < best.0 {
             best = (cost, cand);
         }
@@ -625,6 +628,7 @@ fn compute_cmap_tile_rdo(
     let ytox = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
         ctx.cfl_rd_cost,
+        ctx.dequant_bias(0),
         &rdo.m_x[..rdo.len],
         &rdo.s_x[..rdo.len],
         weight_x * chroma_weight,
@@ -636,6 +640,7 @@ fn compute_cmap_tile_rdo(
     let ytob = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
         ctx.cfl_rd_cost,
+        ctx.dequant_bias(2),
         &rdo.m_b[..rdo.len],
         &rdo.s_b[..rdo.len],
         weight_b * chroma_weight,
@@ -2009,14 +2014,14 @@ mod tests {
         #[cfg(all(target_arch = "x86_64", feature = "avx"))]
         if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
         {
-            kernels.push(("avx2", |m, s, factor, weight, lambda| unsafe {
-                crate::avx::cfl_rd_cost_avx2(m, s, factor, weight, lambda)
+            kernels.push(("avx2", |m, s, factor, weight, lambda, bias| unsafe {
+                crate::avx::cfl_rd_cost_avx2(m, s, factor, weight, lambda, bias)
             }));
         }
         #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
         if std::arch::is_x86_feature_detected!("sse4.1") {
-            kernels.push(("sse4.1", |m, s, factor, weight, lambda| unsafe {
-                crate::sse::cfl_rd_cost_sse41(m, s, factor, weight, lambda)
+            kernels.push(("sse4.1", |m, s, factor, weight, lambda, bias| unsafe {
+                crate::sse::cfl_rd_cost_sse41(m, s, factor, weight, lambda, bias)
             }));
         }
         kernels
@@ -2038,8 +2043,22 @@ mod tests {
                     s.resize(len + s_extra, f32::NAN);
                     for factor in [-0.5f32, 0.0, 0.37, 1.0] {
                         for (weight, lambda) in [(0.3, 0.03), (1.0, 0.0), (0.0, 0.03), (0.3, 2.0)] {
-                            let expected = cfl_rd_cost_scalar(&m, &s, factor, weight, lambda);
-                            let actual = cost_fn(&m, &s, factor, weight, lambda);
+                            let expected = cfl_rd_cost_scalar(
+                                &m,
+                                &s,
+                                factor,
+                                weight,
+                                lambda,
+                                crate::group::DequantBias::DEFAULT[0],
+                            );
+                            let actual = cost_fn(
+                                &m,
+                                &s,
+                                factor,
+                                weight,
+                                lambda,
+                                crate::group::DequantBias::DEFAULT[0],
+                            );
                             let tolerance = 1e-4 * expected.abs().max(1.0);
                             assert!(
                                 (actual - expected).abs() <= tolerance,
@@ -2077,8 +2096,22 @@ mod tests {
                     let s = &s[1..];
                     for &(name, cost_fn) in &kernels {
                         for lambda in [0.0, 0.03] {
-                            let expected = cfl_rd_cost_scalar(m, s, 0.0, 10.0, lambda);
-                            let actual = cost_fn(m, s, 0.0, 10.0, lambda);
+                            let expected = cfl_rd_cost_scalar(
+                                m,
+                                s,
+                                0.0,
+                                10.0,
+                                lambda,
+                                crate::group::DequantBias::DEFAULT[0],
+                            );
+                            let actual = cost_fn(
+                                m,
+                                s,
+                                0.0,
+                                10.0,
+                                lambda,
+                                crate::group::DequantBias::DEFAULT[0],
+                            );
                             assert!(
                                 (actual - expected).abs() <= 2e-6 * expected.abs().max(1.0),
                                 "{name} residual {residual} lambda {lambda}: SIMD={actual}, scalar={expected}"
@@ -2094,10 +2127,24 @@ mod tests {
     fn rd_cost_codes_only_when_cheaper_than_the_error() {
         // A residual of 0.3 steps is zeroed: coding it costs lambda*bits on
         // top of the quantization error. A residual of 3 steps is coded.
-        let small = cfl_rd_cost_scalar(&[1.0], &[0.3], 0.0, 1.0, 0.03);
+        let small = cfl_rd_cost_scalar(
+            &[1.0],
+            &[0.3],
+            0.0,
+            1.0,
+            0.03,
+            crate::group::DequantBias::DEFAULT[0],
+        );
         assert!((small - 0.09).abs() < 1e-6, "{small}");
-        let large = cfl_rd_cost_scalar(&[1.0], &[3.0], 0.0, 1.0, 0.03);
-        let err = 3.0 - crate::group::dequantized_level_f32(3.0);
+        let large = cfl_rd_cost_scalar(
+            &[1.0],
+            &[3.0],
+            0.0,
+            1.0,
+            0.03,
+            crate::group::DequantBias::DEFAULT[0],
+        );
+        let err = 3.0 - crate::group::DequantBias::DEFAULT[0].level_f32(3.0);
         let coded = err * err + 0.03 * (CFL_NONZERO_BITS + CFL_MAGNITUDE_BITS * 3f32.log2());
         assert!((large - coded).abs() < 1e-4, "{large} vs {coded}");
         assert!(large < 9.0);
@@ -2244,6 +2291,7 @@ mod tests {
             optimize_channel_rdo(
                 cfl_rdo_stats_scalar,
                 cfl_rd_cost_scalar,
+                crate::group::DequantBias::DEFAULT[0],
                 &[],
                 &[],
                 0.3,

@@ -489,7 +489,7 @@ pub(crate) fn combine_error_avx2(spatial: &[f32], luma: &[f32], factor: f32, com
 /// any vector load or store.
 #[target_feature(enable = "avx2,fma")]
 pub(crate) fn recon_dist_and_rate_avx2(
-    scratch: &mut [[f32; 1024]; 8],
+    scratch: &mut [[f32; 4096]; 8],
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
 ) -> ReconCost {
@@ -498,7 +498,7 @@ pub(crate) fn recon_dist_and_rate_avx2(
 
 #[target_feature(enable = "avx2,fma")]
 fn recon_dist_and_rate_avx2_impl<const BIASED: bool>(
-    scratch: &mut [[f32; 1024]; 8],
+    scratch: &mut [[f32; 4096]; 8],
     input: &ReconDistInput<'_>,
     error: &ReconErrorKernels,
 ) -> ReconCost {
@@ -520,19 +520,13 @@ fn recon_dist_and_rate_avx2_impl<const BIASED: bool>(
 
 #[inline]
 #[target_feature(enable = "avx2,fma")]
-fn avx_dequantized_level_f32(q: __m256) -> __m256 {
+fn avx_dequantized_level_f32(q: __m256, bias: crate::group::DequantBias) -> __m256 {
     let sign_mask = _mm256_set1_ps(-0.0);
     let absq = _mm256_andnot_ps(sign_mask, q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
-    let big = _mm256_sub_ps(
-        q,
-        _mm256_div_ps(_mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_3), q),
-    );
+    let big = _mm256_sub_ps(q, _mm256_div_ps(_mm256_set1_ps(bias.numerator), q));
     let sign_bits = _mm256_and_ps(sign_mask, q);
-    let one = _mm256_or_ps(
-        sign_bits,
-        _mm256_set1_ps(crate::group::DEFAULT_QUANT_BIAS_1),
-    );
+    let one = _mm256_or_ps(sign_bits, _mm256_set1_ps(bias.one));
     let use_big = _mm256_cmp_ps::<_CMP_GE_OQ>(absq, _mm256_set1_ps(1.125));
     let dq = _mm256_blendv_ps(one, big, use_big);
     let nz = _mm256_cmp_ps::<_CMP_GT_OQ>(absq, _mm256_setzero_ps());
@@ -545,6 +539,7 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
+    bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
     width: usize,
     height: usize,
@@ -608,7 +603,7 @@ fn recon_quantize_avx2<const BIASED: bool, const COMPUTE_RATE: bool>(
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
             let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
             let dequantized = if BIASED {
-                avx_dequantized_level_f32(quantized)
+                avx_dequantized_level_f32(quantized, bias)
             } else {
                 quantized
             };
@@ -680,6 +675,7 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,
+    bias: crate::group::DequantBias,
     thresholds: &[f32; 4],
     width: usize,
     height: usize,
@@ -743,7 +739,7 @@ fn recon_quantize_avx2_reference<const BIASED: bool, const COMPUTE_RATE: bool>(
             let keep = _mm256_cmp_ps::<_CMP_GE_OQ>(absolute, threshold);
             let quantized = _mm256_and_ps(_mm256_round_ps::<ROUND>(scaled), keep);
             let dequantized = if BIASED {
-                avx_dequantized_level_f32(quantized)
+                avx_dequantized_level_f32(quantized, bias)
             } else {
                 quantized
             };
@@ -996,6 +992,7 @@ mod tests {
                             &coeff,
                             &inv,
                             scale,
+                            crate::group::DequantBias::DEFAULT[case % 3],
                             &thresholds,
                             width,
                             height,
@@ -1061,7 +1058,7 @@ mod tests {
                 }
             }
         }
-        let mut coeffs = [[0.0f32; 1024]; 3];
+        let mut coeffs = [[0.0f32; 4096]; 3];
         let mut state = 17u32;
         for channel in &mut coeffs {
             for value in channel {
@@ -1069,7 +1066,7 @@ mod tests {
                 *value = ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 2.0;
             }
         }
-        let inv_storage = [vec![1.0f32; 1024], vec![0.9f32; 1024], vec![1.1f32; 1024]];
+        let inv_storage = [vec![1.0f32; 4096], vec![0.9f32; 4096], vec![1.1f32; 4096]];
         let idct = crate::dct::IdctMethods::scalar();
         for (strategy, cx, cy) in [
             (STRATEGY_DCT, 1, 1),
@@ -1079,6 +1076,9 @@ mod tests {
             (STRATEGY_DCT16X32, 4, 2),
             (STRATEGY_DCT32X16, 4, 2),
             (STRATEGY_DCT32X32, 4, 4),
+            (crate::dc_group_data::STRATEGY_DCT64X64, 8, 8),
+            (crate::dc_group_data::STRATEGY_DCT64X32, 8, 4),
+            (crate::dc_group_data::STRATEGY_DCT32X64, 8, 4),
         ] {
             let inv = [
                 &inv_storage[0][..],
@@ -1096,6 +1096,7 @@ mod tests {
                     qm_mult_x: 1.2,
                     qm_mult_b: 1.6,
                     distance: 1.5,
+                    dequant_bias: crate::group::DequantBias::DEFAULT,
                 },
                 transform: ReconTransform {
                     blocks_x: cx,
@@ -1119,7 +1120,7 @@ mod tests {
                 },
             };
             for biased in [false, true] {
-                let mut scalar_scratch = [[0.0f32; 1024]; 8];
+                let mut scalar_scratch = [[0.0f32; 4096]; 8];
                 let scalar = if biased {
                     recon_dist_and_rate_scalar::<true>(&mut scalar_scratch, &input)
                 } else {
@@ -1137,7 +1138,7 @@ mod tests {
                     },
                     rgb_hue_chroma_edge_loss: rgb_hue_chroma_edge_loss_avx2,
                 };
-                let mut simd_scratch = [[0.0f32; 1024]; 8];
+                let mut simd_scratch = [[0.0f32; 4096]; 8];
                 let simd = unsafe {
                     if biased {
                         recon_dist_and_rate_avx2_impl::<true>(
@@ -1153,7 +1154,9 @@ mod tests {
                         )
                     }
                 };
-                let rate_tolerance = 2e-4f32.max(scalar.rate.abs() * 3e-6);
+                // Larger footprints accumulate more scalar/SIMD sum-order error.
+                let relative_rate_tolerance = if cx * cy > 16 { 6e-6 } else { 3e-6 };
+                let rate_tolerance = 2e-4f32.max(scalar.rate.abs() * relative_rate_tolerance);
                 assert!(
                     (simd.rate - scalar.rate).abs() <= rate_tolerance,
                     "strategy {strategy} biased={biased} rate: simd={} scalar={}",

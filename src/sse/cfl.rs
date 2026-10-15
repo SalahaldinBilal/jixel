@@ -42,6 +42,7 @@ pub(crate) fn cfl_rd_cost_sse41(
     factor: f32,
     weight: f32,
     lambda: f32,
+    bias: crate::group::DequantBias,
 ) -> f32 {
     let len = m.len().min(s.len());
     let (m_chunks, m_tail) = m[..len].as_chunks::<4>();
@@ -70,7 +71,7 @@ pub(crate) fn cfl_rd_cost_sse41(
         let signed_one = _mm_or_ps(one, _mm_and_ps(sign, residual));
         let level = _mm_add_ps(truncated, _mm_and_ps(signed_one, at_least_half));
 
-        let coded_err = _mm_sub_ps(residual, sse_dequantized_level_f32(level));
+        let coded_err = _mm_sub_ps(residual, sse_dequantized_level_f32(level, bias));
         let abs_level = _mm_andnot_ps(sign, level);
         // Clamp zero levels before taking log2; their coded cost is masked out.
         let log2_level = sse_log2p1_f32(_mm_max_ps(_mm_sub_ps(abs_level, one), zero));
@@ -81,5 +82,5 @@ pub(crate) fn cfl_rd_cost_sse41(
         acc = _mm_add_ps(acc, best);
     }
 
-    hsum(acc) + cfl_rd_cost_scalar(m_tail, s_tail, factor, weight, lambda)
+    hsum(acc) + cfl_rd_cost_scalar(m_tail, s_tail, factor, weight, lambda, bias)
 }

@@ -45,6 +45,7 @@ pub(crate) fn quant_table_slot_of(strategy: u8) -> Option<usize> {
         STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => 6,
         STRATEGY_DCT64X64 => 7,
         STRATEGY_IDENTITY => 8,
+        STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => 12,
         _ => return None,
     })
 }
@@ -52,12 +53,13 @@ pub(crate) fn quant_table_slot_of(strategy: u8) -> Option<usize> {
 /// Exact, unaligned matrix-header size. Mode bits are a shared frame cost;
 /// payload bits are paid once per active custom table, regardless of usage.
 pub(crate) struct MatrixHeaderCost {
-    pub(crate) payload: [usize; 9],
+    /// By `quant_table_slot_of` slot; 9..=11 (the fine tables) carry no fee here.
+    pub(crate) payload: [usize; 13],
 }
 
 impl MatrixHeaderCost {
     pub(crate) fn new(matrices: &DequantMatrices) -> Self {
-        let mut payload = [0; 9];
+        let mut payload = [0; 13];
         for (slot, table) in matrices.custom_tables.iter().enumerate() {
             if let Some(table) = table {
                 payload[slot] = 4 + 3 * 16 * table.num_bands + usize::from(slot == 5) * 48;
@@ -66,6 +68,7 @@ impl MatrixHeaderCost {
         if matrices.identity_weights.is_some() {
             payload[8] = 9 * 16;
         }
+        payload[12] = 4 + 3 * 16 * matrices.band_8x32().num_bands;
         Self { payload }
     }
 
@@ -1703,6 +1706,112 @@ fn compute_dct32x16_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 
     out
 }
 
+/// DCT32X8 / DCT8X32 dequant matrix at the normalized 8-row x 32-column
+/// layout, with its reciprocals.
+/// The DCT32X8 / DCT8X32 table at parity with the frame's DCT16X8 table: the
+/// pair's band curve sampled at the same normalized frequencies, scaled by
+/// sqrt(2) for the doubled area (equal per-pixel error per step), F16-rounded
+/// as signaled.
+pub(crate) type Tables8x32 = (BandOverride, HeapMatrix<f32, 3, 256>, HeapMatrix<f32, 3, 256>);
+
+fn derive_8x32(pair: &[[f32; 7]; 3]) -> Tables8x32 {
+    const PAIR_BANDS: usize = 7;
+    const NUM_BANDS: usize = 8;
+    let f16 = |x: f32| crate::util::f16_bits_to_f32(crate::util::f32_to_f16_bits(x));
+    let mut bands_out = [[0.0f32; 16]; 3];
+    let mut matrix = HeapMatrix::new(0.0f32);
+    for c in 0..3 {
+        let mut pair_curve = [0.0f32; PAIR_BANDS];
+        pair_curve[0] = pair[c][0];
+        for i in 1..PAIR_BANDS {
+            pair_curve[i] = pair_curve[i - 1] * band_mult(pair[c][i]);
+        }
+        // Node i of the 8-band grid sits at normalized distance i*sqrt2/7,
+        // which is position i*6/7 on the pair's 7-band grid.
+        let sample = |pos: f32| -> f32 {
+            if pos >= (PAIR_BANDS - 1) as f32 {
+                pair_curve[PAIR_BANDS - 1]
+            } else {
+                interpolate_vec_bands(pos, &pair_curve)
+            }
+        };
+        let gain = std::f32::consts::SQRT_2;
+        let nodes: [f32; NUM_BANDS] =
+            std::array::from_fn(|i| sample(i as f32 * 6.0 / 7.0) * gain);
+        // Wire form: base, then multiplicative steps (band_mult inverse).
+        let mut params = [0.0f32; NUM_BANDS];
+        params[0] = f16(nodes[0] / 64.0) * 64.0;
+        for i in 1..NUM_BANDS {
+            let r = nodes[i] / nodes[i - 1];
+            params[i] = f16(if r >= 1.0 { r - 1.0 } else { 1.0 - 1.0 / r });
+        }
+        bands_out[c][..NUM_BANDS].copy_from_slice(&params);
+        let mut bands = [0.0f32; NUM_BANDS];
+        bands[0] = params[0];
+        for i in 1..NUM_BANDS {
+            bands[i] = bands[i - 1] * band_mult(params[i]);
+        }
+        let scale = (NUM_BANDS as f32 - 1.0) / (std::f32::consts::SQRT_2 + 1e-6);
+        let (rcprow, rcpcol) = (scale / 7.0, scale / 31.0);
+        for y in 0..8 {
+            let dy = y as f32 * rcprow;
+            for x in 0..32 {
+                let dx = x as f32 * rcpcol;
+                matrix[c][y * 32 + x] = 1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
+            }
+        }
+    }
+    let mut inv = HeapMatrix::new(0.0f32);
+    for c in 0..3 {
+        fill_ac_reciprocals(&matrix[c], &mut inv[c]);
+    }
+    (BandOverride { num_bands: NUM_BANDS, bands: bands_out }, matrix, inv)
+}
+
+/// Parity tables for a pair table, cached per distinct pair table.
+fn tables_8x32_for(pair: &[[f32; 7]; 3]) -> &'static Tables8x32 {
+    type Cache = Vec<([u32; 21], &'static Tables8x32)>;
+    static CACHE: std::sync::Mutex<Cache> = std::sync::Mutex::new(Vec::new());
+    let key: [u32; 21] = std::array::from_fn(|i| pair[i / 7][i % 7].to_bits());
+    let mut cache = CACHE.lock().unwrap();
+    if let Some((_, t)) = cache.iter().find(|(k, _)| *k == key) {
+        return t;
+    }
+    let t: &'static Tables8x32 = Box::leak(Box::new(derive_8x32(pair)));
+    cache.push((key, t));
+    t
+}
+
+/// DCT4X8 / DCT8X4 chroma refit for XYB frames (X, Y, B weight multipliers):
+/// the library table quantizes X coarser and B finer than DCT8 at the same
+/// frequency. AFV keeps the library 4x8 parameters it is decoded with.
+const QM_4X8_SCALE: [f32; 3] = [1.2, 1.0, 0.45];
+
+/// The signaled DCT4X8 table (F16-rounded as written) with its matrices.
+fn tables_4x8() -> &'static (BandOverride, HeapMatrix<f32, 3, 64>, HeapMatrix<f32, 3, 64>) {
+    static TABLES: std::sync::OnceLock<(BandOverride, HeapMatrix<f32, 3, 64>, HeapMatrix<f32, 3, 64>)> =
+        std::sync::OnceLock::new();
+    TABLES.get_or_init(|| {
+        let mut o = BandOverride {
+            num_bands: 4,
+            bands: [[0.0; 16]; 3],
+        };
+        for c in 0..3 {
+            o.bands[c][0] =
+                f16_bits_to_f32(f32_to_f16_bits(DCT4X8_BANDS[c][0] * QM_4X8_SCALE[c] / 64.0)) * 64.0;
+            for i in 1..4 {
+                o.bands[c][i] = f16_bits_to_f32(f32_to_f16_bits(DCT4X8_BANDS[c][i]));
+            }
+        }
+        let matrix = compute_dct4x8_matrix(Some(&o));
+        let mut inv = HeapMatrix::new(0.0f32);
+        for c in 0..3 {
+            fill_ac_reciprocals(&matrix[c], &mut inv[c]);
+        }
+        (o, matrix, inv)
+    })
+}
+
 /// Quant tables that do not depend on the SS2-retune distance gate, computed
 /// once per process and cloned into both `DequantMatrices` variants.
 /// Spec (JPEG XL library) IDENTITY / Hornuss table: per channel
@@ -1843,8 +1952,6 @@ struct SharedTables {
     inv_matrix_16x8: HeapMatrix<f32, 3, 128>,
     matrix_4x4: HeapMatrix<f32, 3, 64>,
     inv_matrix_4x4: HeapMatrix<f32, 3, 64>,
-    matrix_4x8: HeapMatrix<f32, 3, 64>,
-    inv_matrix_4x8: HeapMatrix<f32, 3, 64>,
     matrix_afv: HeapMatrix<f32, 3, 64>,
     inv_matrix_afv: HeapMatrix<f32, 3, 64>,
     matrix_64x64: HeapMatrix<f32, 3, 4096>,
@@ -1879,13 +1986,6 @@ fn shared_tables() -> &'static SharedTables {
             fill_ac_reciprocals(&matrix_4x4[c], &mut inv_matrix_4x4[c]);
         }
 
-        let matrix_4x8 = compute_dct4x8_matrix(None);
-        let mut inv_matrix_4x8 = HeapMatrix::new(0.);
-        for c in 0..3 {
-            // Only [0] is the DC (handled by the DC plane); [8] (the vertical
-            // half-difference after the Hadamard) and all others are regular AC.
-            fill_ac_reciprocals(&matrix_4x8[c], &mut inv_matrix_4x8[c]);
-        }
 
         let matrix_afv = compute_afv_matrix();
         let mut inv_matrix_afv = HeapMatrix::new(0.);
@@ -1921,8 +2021,6 @@ fn shared_tables() -> &'static SharedTables {
             inv_matrix_16x8,
             matrix_4x4,
             inv_matrix_4x4,
-            matrix_4x8,
-            inv_matrix_4x8,
             matrix_afv,
             inv_matrix_afv,
             matrix_64x64,
@@ -2297,9 +2395,9 @@ impl DequantMatrices {
             inv_matrix_64x32,
             custom_tables: heap_array_from_fn(|i| match i {
                 0 => o8,
-                // DCT8X16 and DCT4X8 measured best at the spec defaults, so
-                // they remain unsignalled.
-                5 => None,
+                // DCT8X16 measured best at the spec default and stays
+                // unsignalled; DCT4X8 carries its chroma refit.
+                5 => Some(tables_4x8().0),
                 3 => o3,
                 1 => o16,
                 2 => o32,
@@ -2310,8 +2408,8 @@ impl DequantMatrices {
             }),
             matrix_4x4: &shared.matrix_4x4,
             inv_matrix_4x4: &shared.inv_matrix_4x4,
-            matrix_4x8: &shared.matrix_4x8,
-            inv_matrix_4x8: &shared.inv_matrix_4x8,
+            matrix_4x8: &tables_4x8().1,
+            inv_matrix_4x8: &tables_4x8().2,
             matrix_32x16: &large.matrix_32x16,
             inv_matrix_32x16: &large.inv_matrix_32x16,
             matrix_afv: &shared.matrix_afv,
@@ -2641,6 +2739,26 @@ impl DequantMatrices {
     pub(crate) fn inv_matrix_32x16(&self, c: usize) -> &[f32; 512] {
         &self.inv_matrix_32x16[c]
     }
+    /// DCT32X8 / DCT8X32 dequant matrix (library default, never signaled).
+    #[inline]
+    pub(crate) fn matrix_8x32(&self, c: usize) -> &[f32; 256] {
+        &self.tables_8x32().1[c]
+    }
+    #[inline]
+    pub(crate) fn inv_matrix_8x32(&self, c: usize) -> &[f32; 256] {
+        &self.tables_8x32().2[c]
+    }
+    /// The signaled DCT8X32 table (always custom: at parity with the pair table).
+    pub(crate) fn band_8x32(&self) -> &BandOverride {
+        &self.tables_8x32().0
+    }
+    fn tables_8x32(&self) -> &'static Tables8x32 {
+        let pair: [[f32; 7]; 3] = match self.custom_tables[3].as_ref() {
+            Some(o) => std::array::from_fn(|c| o.bands[c][..7].try_into().unwrap()),
+            None => DCT16X8_BANDS,
+        };
+        tables_8x32_for(&pair)
+    }
     /// AFV dequant matrix (64 floats per channel, shared by AFV0..AFV3).
     #[inline]
     pub(crate) fn matrix_afv(&self, c: usize) -> &[f32; 64] {
@@ -2665,6 +2783,20 @@ fn fill_ac_reciprocals(matrix: &[f32], inv: &mut [f32]) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn dct8x32_table_sits_at_parity_with_the_pair_table() {
+        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2);
+        // Weights (1/step) at matched physical frequency, 8x32 vs 16x8 x sqrt2.
+        for c in 0..3 {
+            for (y, x16) in [(0usize, 1usize), (0, 4), (2, 3), (4, 8), (7, 15)] {
+                let w16 = 1.0 / m.matrix_16x8(c)[y * 16 + x16];
+                let w32 = 1.0 / m.matrix_8x32(c)[y * 32 + 2 * x16];
+                let ratio = w32 / (w16 * std::f32::consts::SQRT_2);
+                assert!((0.85..1.18).contains(&ratio), "c={c} y={y} x={x16} ratio={ratio}");
+            }
+        }
+    }
     use super::*;
 
     #[test]
@@ -2810,7 +2942,13 @@ mod tests {
             (tail / (1.2 * CHROMATIC_DCT8_ROWS[2]) - 1.0).abs() < 3e-3,
             "{tail}"
         );
-        assert!(hue.custom_tables[1..].iter().all(Option::is_none));
+        // Besides DCT8 only the XYB-wide DCT4X8 refit is signaled.
+        assert!(
+            hue.custom_tables[1..]
+                .iter()
+                .enumerate()
+                .all(|(i, t)| (i + 1 == 5) == t.is_some())
+        );
         // Ordinary and opsin-proxy tables remain independently selected.
         assert!(!std::ptr::eq(
             hue,
@@ -3180,10 +3318,12 @@ mod tests {
             assert_eq!(mc[16], 1.0 / AFV_BANDS[c][2], "c={c} [16]");
             assert_eq!(mc[2], 1.0 / AFV_BANDS[c][3], "c={c} [2]");
             assert_eq!(mc[18], 1.0 / AFV_BANDS[c][4], "c={c} [18]");
-            // Odd rows replicate the DCT4X8 weights, even rows / odd columns
-            // the DCT4X4 weights.
+            // Odd rows replicate the library DCT4X8 weights (AFV is decoded
+            // with them even when the frame signals its own 4x8 table), even
+            // rows / odd columns the DCT4X4 weights.
+            let library_4x8 = compute_dct4x8_matrix(None);
             for x in 1..8 {
-                assert_eq!(mc[8 + x], m.matrix_4x8(c)[x], "c={c} 4x8 col {x}");
+                assert_eq!(mc[8 + x], library_4x8[c][x], "c={c} 4x8 col {x}");
             }
             for x in 1..4 {
                 assert_eq!(mc[2 * x + 1], m.matrix_4x4(c)[2 * x], "c={c} 4x4 col {x}");
@@ -3289,11 +3429,11 @@ mod shared_storage_tests {
                 ));
                 assert!(std::ptr::eq(
                     set.matrix_4x8.as_ptr(),
-                    shared.matrix_4x8.as_ptr()
+                    tables_4x8().1.as_ptr()
                 ));
                 assert!(std::ptr::eq(
                     set.inv_matrix_4x8.as_ptr(),
-                    shared.inv_matrix_4x8.as_ptr()
+                    tables_4x8().2.as_ptr()
                 ));
                 assert!(std::ptr::eq(
                     set.matrix_afv.as_ptr(),

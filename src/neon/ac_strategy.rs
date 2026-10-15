@@ -146,6 +146,7 @@ pub(crate) fn sse_and_rate_neon<const BIASED: bool>(
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -159,6 +160,7 @@ pub(crate) fn sse_and_rate_neon<const BIASED: bool>(
         coeff,
         inv_matrix,
         q_scaled,
+        bias,
         width,
         height,
         half,
@@ -177,6 +179,7 @@ pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool
     coeff: &[f32],
     inv_matrix: &[f32],
     q_scaled: f32,
+    bias: crate::group::DequantBias,
     width: usize,
     height: usize,
     half: usize,
@@ -239,7 +242,7 @@ pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool
             let q = vreinterpretq_f32_u32(vandq_u32(vreinterpretq_u32_f32(rounded), keep));
 
             let d = if BIASED {
-                vsubq_f32(a, neon_dequantized_level_f32(q))
+                vsubq_f32(a, neon_dequantized_level_f32(q, bias))
             } else {
                 vsubq_f32(a, q)
             };
@@ -291,22 +294,22 @@ pub(crate) fn sse_and_rate_neon_impl<const BIASED: bool, const SAVE_LEVELS: bool
     )
 }
 
-/// NEON counterpart of `enc_group::dequantized_level_f32`: the decoder's biased
-/// dequant of an integer-valued float level (0 -> 0, +-1 -> +-0.9299455,
-/// q -> q - 0.145/q)
+/// NEON counterpart of `DequantBias::level_f32`: the decoder's biased
+/// dequant of an integer-valued float level (0 -> 0, +-1 -> +-bias.one,
+/// q -> q - bias.numerator/q)
 #[inline]
 #[target_feature(enable = "neon")]
-pub(crate) fn neon_dequantized_level_f32(q: float32x4_t) -> float32x4_t {
+pub(crate) fn neon_dequantized_level_f32(
+    q: float32x4_t,
+    bias: crate::group::DequantBias,
+) -> float32x4_t {
     let absq = vabsq_f32(q);
     // q - 0.145/q (q == 0 lanes produce non-finite values, masked out below).
-    let big = vsubq_f32(
-        q,
-        vdivq_f32(vdupq_n_f32(crate::group::DEFAULT_QUANT_BIAS_3), q),
-    );
+    let big = vsubq_f32(q, vdivq_f32(vdupq_n_f32(bias.numerator), q));
     let sign = vandq_u32(vreinterpretq_u32_f32(q), vdupq_n_u32(0x8000_0000));
     let one = vreinterpretq_f32_u32(vorrq_u32(
         sign,
-        vreinterpretq_u32_f32(vdupq_n_f32(crate::group::DEFAULT_QUANT_BIAS_1)),
+        vreinterpretq_u32_f32(vdupq_n_f32(bias.one)),
     ));
     let use_big = vcgeq_f32(absq, vdupq_n_f32(1.125));
     let dq = vbslq_f32(use_big, big, one);
@@ -365,6 +368,7 @@ mod tests {
         coeff: &[f32],
         inv: &[f32],
         qs: f32,
+        bias: crate::group::DequantBias,
         w: usize,
         h: usize,
         half: usize,
@@ -386,11 +390,7 @@ mod tests {
                 let threshold = if x >= half { thr[yfix + 1] } else { thr[yfix] };
                 let a = inv[i] * qs * coeff[i];
                 let q = if a.abs() >= threshold { a.round() } else { 0.0 };
-                let d = if biased {
-                    a - crate::group::dequantized_level_f32(q)
-                } else {
-                    a - q
-                };
+                let d = if biased { a - bias.level_f32(q) } else { a - q };
                 sse += d * d;
                 if q != 0.0 {
                     nzeros += 1;
@@ -427,6 +427,7 @@ mod tests {
                 let coeff: Vec<f32> = (0..n).map(|_| (random() - 0.5) * coeff_scale).collect();
                 let inv: Vec<f32> = (0..n).map(|_| 0.001 + random() * 0.5).collect();
                 let qs = 0.5 + random() * 3.0;
+                let bias = crate::group::DequantBias::DEFAULT[case % 3];
                 let thr = [
                     random() * 0.6,
                     random() * 0.6,
@@ -435,8 +436,9 @@ mod tests {
                 ];
                 let scan_pos = crate::coeff_order::scan_pos_lut(w, h);
                 for biased in [false, true] {
-                    let expected =
-                        reference(&coeff, &inv, qs, w, h, half, cx, cy, &thr, scan_pos, biased);
+                    let expected = reference(
+                        &coeff, &inv, qs, bias, w, h, half, cx, cy, &thr, scan_pos, biased,
+                    );
                     let kernel = if biased {
                         sse_and_rate_neon::<true>
                     } else {
@@ -447,6 +449,7 @@ mod tests {
                             &coeff,
                             &inv,
                             qs,
+                            bias,
                             w,
                             h,
                             half,

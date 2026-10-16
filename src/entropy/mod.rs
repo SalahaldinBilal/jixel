@@ -41,7 +41,8 @@ mod token_stream;
 mod write;
 
 pub(crate) use ans::{
-    ANS_LOG_TAB_SIZE, ANS_TAB_SIZE, AnsCoder, AnsEncSymbolInfo, AnsHistogram, write_ans_tokens,
+    ANS_LOG_TAB_SIZE, ANS_SIGNATURE, ANS_TAB_SIZE, AnsCoder, AnsEncSymbolInfo, AnsHistogram,
+    write_ans_tokens,
 };
 pub(crate) use cluster::{
     CLUSTERS_LIMIT, FixedClusterScratch, cluster_histograms, cluster_histograms_ans,

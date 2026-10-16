@@ -2061,6 +2061,29 @@ impl ExtraSqueeze {
         })
     }
 
+    /// The plane a decoder reconstructs, before clamping to the sample range.
+    #[cfg(test)]
+    pub(crate) fn reconstruct(&self) -> Vec<i32> {
+        use crate::squeeze::{Channel, apply_step_inverse};
+        let mut channels: Vec<Channel> = self
+            .channels
+            .iter()
+            .zip(&self.quants)
+            .map(|(ch, &q)| Channel {
+                data: ch.data.iter().map(|&v| v * q as i32).collect(),
+                w: ch.w,
+                h: ch.h,
+                hshift: ch.hshift,
+                vshift: ch.vshift,
+            })
+            .collect();
+        for s in self.steps.iter().rev() {
+            apply_step_inverse(&mut channels, s);
+        }
+        debug_assert_eq!(channels.len(), 1);
+        channels.swap_remove(0).data
+    }
+
     /// The GlobalModular image: its header (with the squeeze transform) and
     /// the channels that fit one group.
     pub(crate) fn write_global(&self, scratch: &mut CoderScratch, w: &mut BitWriter) {
@@ -2496,5 +2519,50 @@ mod lm_plain_tests {
             );
         }
         assert_eq!(interpolate_knots(&[(1.0, 2.0), (3.0, 4.0)], 2.0), 3.0);
+    }
+}
+
+#[cfg(test)]
+mod extra_squeeze_tests {
+    use super::*;
+
+    /// A soft-edged disc: the anti-aliased, feathered alpha lossy coding is for.
+    fn soft_disc(w: usize, h: usize) -> AlphaPlane {
+        AlphaPlane::U8(
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = ((i % w) as f32, (i / w) as f32);
+                    let r = ((x - w as f32 / 2.0).hypot(y - h as f32 / 2.0)) / (w.min(h) as f32);
+                    (255.0 * ((0.45 - r) / 0.2).clamp(0.0, 1.0)).round() as u8
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn unit_steps_reconstruct_the_plane_exactly() {
+        let (w, h) = (300, 270);
+        let plane = soft_disc(w, h);
+        let squeezed = ExtraSqueeze::new(&plane, w, h, 1e-3, false).unwrap();
+        assert!(squeezed.quants.iter().all(|&q| q == 1));
+        let want: Vec<i32> = (0..w * h).map(|i| plane.get_i32(i)).collect();
+        assert_eq!(squeezed.reconstruct(), want);
+    }
+
+    #[test]
+    fn quantized_reconstruction_stays_close() {
+        let (w, h) = (300, 270);
+        let plane = soft_disc(w, h);
+        let squeezed = ExtraSqueeze::new(&plane, w, h, 4.0, false).unwrap();
+        assert!(squeezed.quants.iter().any(|&q| q > 1));
+        let rec = squeezed.reconstruct();
+        let err: Vec<i32> = rec
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| (v.clamp(0, 255) - plane.get_i32(i)).abs())
+            .collect();
+        let mean = err.iter().sum::<i32>() as f32 / err.len() as f32;
+        assert!(err.iter().any(|&e| e > 0), "distance 4 should be lossy");
+        assert!(mean < 2.0, "mean alpha error {mean}");
     }
 }

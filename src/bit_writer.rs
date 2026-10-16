@@ -27,6 +27,7 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
+#[derive(Clone)]
 pub(crate) struct BitWriter {
     storage: Vec<u8>,
     /// Pending low-order bits not yet committed to `storage`.

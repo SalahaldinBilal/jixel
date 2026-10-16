@@ -131,6 +131,8 @@ effort_gates! {
     lossy_modular_auto,
     splines,
     patches_default,
+    /// Lossy tile patches also match near-duplicate tiles, not only exact ones.
+    near_patch_tiles,
     /// Any config strictly cheaper than the default hybrid-uint wins (else a 0.5% bar).
     huc_strict,
     // --- modular (lossless, lossy squeeze, patch atlases) ---

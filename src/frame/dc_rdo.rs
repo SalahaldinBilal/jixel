@@ -363,6 +363,176 @@ fn refine_channel_core<const NATIVE_ROUND: bool>(
     }
 }
 
+/// Rate price of the X DC step choice, in squared low-passed default-step
+/// error per bit.
+const X_DC_STEP_LAMBDA: f64 = 0.02;
+/// Spread, in DC blocks, of the low-pass the X DC step choice measures error
+/// through.
+const X_DC_STEP_SIGMA: f32 = 3.0;
+/// Finest X DC step multiplier the choice considers.
+const X_DC_STEP_FINEST: f32 = 0.5;
+/// X DC step multipliers are searched this far apart.
+const X_DC_STEP_SPACING: f32 = 0.02;
+
+/// Choose a finer X DC step for the frame when its rate-distortion cost
+/// beats the default's, and re-quantize X from its source under it.
+///
+/// A smooth, nearly neutral region holds one X value. Where that value sits
+/// between two levels every block rounds the same way: the plane costs no
+/// bits and the whole region shifts hue. Squared error per block cannot tell
+/// that shift from rounding noise in texture, which the eye masks, so the
+/// error plane is low-passed first, as chroma vision is: noise averages out,
+/// a shared offset does not. Returns the frame's DC steps.
+pub(super) fn choose_x_dc_step(
+    groups: &mut [DcGroupData],
+    distp: &DistanceParams,
+    cfl: CflFrame,
+    quantize: crate::group::QuantizeDcCflFn,
+) -> [f32; 3] {
+    let mut dc_step = distp.dc_step;
+    if groups.is_empty() || groups.iter().any(|dc| dc.source_dc_x.is_none()) {
+        return dc_step;
+    }
+    let base = dc_step[0];
+    let kernel = gaussian_kernel(X_DC_STEP_SIGMA);
+    let mut price = DcPlanePrice::default();
+    let (mut levels, mut errors, mut blurred) = (Vec::new(), Vec::new(), Vec::new());
+    let mut cost = |m: f32, apply: bool, groups: &mut [DcGroupData]| -> f64 {
+        let mut step = dc_step;
+        step[0] = base * m;
+        let scale = INV_DC_QUANT[0] / step[0] * distp.scale_dc;
+        let factor = dc_cfl_factor_x(step, cfl.base_x);
+        price.clear();
+        let mut distortion = 0.0f64;
+        for dc in groups.iter_mut() {
+            let source = dc.source_dc_x.as_ref().unwrap();
+            let (w, h) = (source.xsize(), source.ysize());
+            levels.resize(w * h, 0i16);
+            errors.resize(w * h, 0.0f32);
+            for y in 0..h {
+                let luma = dc.quant_dc.plane_row(1, y);
+                let row = &mut levels[y * w..][..w];
+                quantize(source.row(y), luma, scale, factor, row);
+                for (((&src, &luma), &level), error) in source
+                    .row(y)
+                    .iter()
+                    .zip(luma)
+                    .zip(row.iter())
+                    .zip(&mut errors[y * w..][..w])
+                {
+                    *error = (fmla(src, scale, -(luma as f32) * factor) - f32::from(level)) * m;
+                }
+            }
+            distortion += lowpass_energy(&errors, w, h, &kernel, &mut blurred);
+            price.add(&levels, w, h, w);
+            if apply {
+                for y in 0..h {
+                    dc.quant_dc
+                        .plane_row_mut(0, y)
+                        .copy_from_slice(&levels[y * w..][..w]);
+                }
+            }
+        }
+        distortion + X_DC_STEP_LAMBDA * price.bits()
+    };
+    let candidates = ((1.0 - X_DC_STEP_FINEST) / X_DC_STEP_SPACING).round() as usize;
+    let mut best = (cost(1.0, false, groups), 1.0f32);
+    for k in 1..=candidates {
+        let multiplier = 1.0 - X_DC_STEP_SPACING * k as f32;
+        let m = crate::color_correlation::signaled_dc_step(0, base * multiplier) / base;
+        let candidate = cost(m, false, groups);
+        if candidate < best.0 {
+            best = (candidate, m);
+        }
+    }
+    if best.1 != 1.0 {
+        cost(best.1, true, groups);
+        dc_step[0] = base * best.1;
+    }
+    dc_step
+}
+
+/// Normalized Gaussian taps out to three spreads.
+fn gaussian_kernel(sigma: f32) -> Vec<f32> {
+    let radius = (3.0 * sigma).ceil() as i32;
+    let taps: Vec<f32> = (-radius..=radius)
+        .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let sum: f32 = taps.iter().sum();
+    taps.into_iter().map(|v| v / sum).collect()
+}
+
+/// Index `i` reflected into `0..n`, edge samples repeated.
+#[inline]
+fn mirror(mut i: isize, n: usize) -> usize {
+    let n = n as isize;
+    loop {
+        if i < 0 {
+            i = -i - 1;
+        } else if i >= n {
+            i = 2 * n - i - 1;
+        } else {
+            return i as usize;
+        }
+        if n == 1 {
+            return 0;
+        }
+    }
+}
+
+/// Energy of a `w`×`h` plane after a separable blur by `kernel`.
+fn lowpass_energy(plane: &[f32], w: usize, h: usize, kernel: &[f32], tmp: &mut Vec<f32>) -> f64 {
+    let n = w * h;
+    if n == 0 || kernel.is_empty() {
+        tmp.resize(n, 0.0);
+        tmp.fill(0.0);
+        return 0.0;
+    }
+    let r = kernel.len() / 2;
+    let padded_len = w + kernel.len() - 1;
+    // Reuse the plane's scratch allocation for the padded source row and
+    // vertical accumulator too. Restore its original length before returning.
+    tmp.resize(n + padded_len + w, 0.0);
+    let (horizontal, scratch) = tmp.split_at_mut(n);
+    let (padded, accum) = scratch.split_at_mut(padded_len);
+    for (src, dst) in plane[..n]
+        .chunks_exact(w)
+        .zip(horizontal.chunks_exact_mut(w))
+    {
+        let (left, rest) = padded.split_at_mut(r);
+        let (middle, right) = rest.split_at_mut(w);
+        middle.copy_from_slice(src);
+        for (i, value) in left.iter_mut().enumerate() {
+            *value = src[mirror(i as isize - r as isize, w)];
+        }
+        for (i, value) in right.iter_mut().enumerate() {
+            *value = src[mirror(w as isize + i as isize, w)];
+        }
+        dst.fill(0.0);
+        for (j, &tap) in kernel.iter().enumerate() {
+            for (value, &sample) in dst.iter_mut().zip(&padded[j..j + w]) {
+                *value += tap * sample;
+            }
+        }
+    }
+    let mut energy = 0.0f64;
+    for y in 0..h {
+        accum.fill(0.0);
+        for (j, &tap) in kernel.iter().enumerate() {
+            let row = mirror(y as isize + j as isize - r as isize, h);
+            for (value, &sample) in accum.iter_mut().zip(&horizontal[row * w..][..w]) {
+                *value += tap * sample;
+            }
+        }
+        energy = accum.iter().fold(energy, |sum, &value| {
+            let value = f64::from(value);
+            sum + value * value
+        });
+    }
+    tmp.truncate(n);
+    energy
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -613,5 +783,134 @@ mod tests {
                 .iter()
                 .all(|&q| q == 0)
         );
+    }
+
+    fn x_step_fixture(params: &DistanceParams, x_of: impl Fn(usize, usize) -> f32) -> DcGroupData {
+        use crate::image::Plane;
+        let (w, h) = (32, 32);
+        let mut dc = DcGroupData::new(w, h).unwrap();
+        let unit = params.dc_step[0] / (INV_DC_QUANT[0] * params.scale_dc);
+        let mut source = Plane::new(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                source.row_mut(y)[x] = x_of(x, y) * unit;
+            }
+        }
+        dc.source_dc_x = Some(source);
+        dc
+    }
+
+    #[test]
+    fn x_step_moves_a_level_under_a_flat_offset() {
+        let params = super::super::compute_distance_params(7.0);
+        // Every block sits 0.4 levels above level 3: all round down alike.
+        let mut groups = [x_step_fixture(&params, |_, _| 3.4)];
+        let step = choose_x_dc_step(&mut groups, &params, CflFrame::XYB, crate::group::quantize_dc_cfl_scalar);
+        assert!(step[0] < params.dc_step[0], "kept the default step");
+        assert_eq!([step[1], step[2]], [params.dc_step[1], params.dc_step[2]]);
+        // X is re-quantized under the chosen step, and lands closer.
+        let m = step[0] / params.dc_step[0];
+        let level = groups[0].quant_dc.plane(0).as_slice()[0];
+        assert!(groups[0].quant_dc.plane(0).as_slice().iter().all(|&q| q == level));
+        assert!((f32::from(level) * m - 3.4).abs() < 0.4 * 0.5);
+    }
+
+    #[test]
+    fn x_step_keeps_the_default_for_unbiased_texture() {
+        let params = super::super::compute_distance_params(7.0);
+        let mut state = 0x9e37_79b9u32;
+        let mut noise = vec![0.0f32; 32 * 32];
+        for v in &mut noise {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *v = (state >> 8) as f32 / (1u32 << 24) as f32 * 40.0 - 20.0;
+        }
+        let mut groups = [x_step_fixture(&params, |x, y| noise[y * 32 + x])];
+        let step = choose_x_dc_step(&mut groups, &params, CflFrame::XYB, crate::group::quantize_dc_cfl_scalar);
+        assert_eq!(step, params.dc_step);
+        assert!(groups[0].quant_dc.plane(0).as_slice().iter().all(|&q| q == 0));
+    }
+
+    #[test]
+    fn x_step_needs_every_source() {
+        let params = super::super::compute_distance_params(7.0);
+        let mut groups = [
+            x_step_fixture(&params, |_, _| 3.4),
+            DcGroupData::new(4, 4).unwrap(),
+        ];
+        let step = choose_x_dc_step(&mut groups, &params, CflFrame::XYB, crate::group::quantize_dc_cfl_scalar);
+        assert_eq!(step, params.dc_step);
+        assert!(groups[0].quant_dc.plane(0).as_slice().iter().all(|&q| q == 0));
+    }
+
+    #[test]
+    fn lowpass_keeps_offsets_and_averages_out_alternation() {
+        let kernel = gaussian_kernel(X_DC_STEP_SIGMA);
+        assert!((kernel.iter().sum::<f32>() - 1.0).abs() < 1e-5);
+        let (w, h) = (24, 20);
+        let mut tmp = Vec::new();
+        let flat = vec![0.5f32; w * h];
+        let energy = lowpass_energy(&flat, w, h, &kernel, &mut tmp);
+        assert!((energy - 0.25 * (w * h) as f64).abs() < 1e-3);
+        let checker: Vec<f32> = (0..w * h)
+            .map(|i| if (i % w + i / w) % 2 == 0 { 0.5 } else { -0.5 })
+            .collect();
+        assert!(lowpass_energy(&checker, w, h, &kernel, &mut tmp) < 1e-3 * energy);
+        // A single row or column mirrors onto itself.
+        assert!((lowpass_energy(&[0.5; 7], 7, 1, &kernel, &mut tmp) - 1.75).abs() < 1e-4);
+        assert!((lowpass_energy(&[0.5; 7], 1, 7, &kernel, &mut tmp) - 1.75).abs() < 1e-4);
+    }
+
+    #[test]
+    fn lowpass_matches_reference_with_reused_scratch() {
+        fn reference(plane: &[f32], w: usize, h: usize, kernel: &[f32], tmp: &mut Vec<f32>) -> f64 {
+            let r = (kernel.len() / 2) as isize;
+            tmp.resize(w * h, 0.0);
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = 0.0;
+                    for (j, &tap) in kernel.iter().enumerate() {
+                        acc += tap * plane[y * w + mirror(x as isize + j as isize - r, w)];
+                    }
+                    tmp[y * w + x] = acc;
+                }
+            }
+            let mut energy = 0.0f64;
+            for y in 0..h {
+                for x in 0..w {
+                    let mut acc = 0.0;
+                    for (j, &tap) in kernel.iter().enumerate() {
+                        acc += tap * tmp[mirror(y as isize + j as isize - r, h) * w + x];
+                    }
+                    energy += f64::from(acc).powi(2);
+                }
+            }
+            energy
+        }
+
+        let mut tmp = vec![f32::NAN; 512];
+        let mut expected_tmp = Vec::new();
+        let kernels = [
+            Vec::new(),
+            vec![0.7],
+            vec![0.3, -0.2],
+            vec![-0.1, 0.2, 0.7, -0.4],
+            gaussian_kernel(X_DC_STEP_SIGMA),
+        ];
+        for (w, h) in (0..12).flat_map(|w| (0..12).map(move |h| (w, h))).chain([
+            (64, 32),
+            (32, 64),
+            (256, 3),
+            (3, 256),
+        ]) {
+            let plane: Vec<f32> = (0..w * h)
+                .map(|i| ((i * 73 % 251) as f32 - 125.0) / 19.0)
+                .collect();
+            for kernel in &kernels {
+                let expected = reference(&plane, w, h, kernel, &mut expected_tmp);
+                let actual = lowpass_energy(&plane, w, h, kernel, &mut tmp);
+                assert_eq!(actual.to_bits(), expected.to_bits(), "{w}x{h} {kernel:?}");
+                assert_eq!(tmp, expected_tmp, "{w}x{h} {kernel:?}");
+            }
+        }
     }
 }

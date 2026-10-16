@@ -55,12 +55,15 @@ const GROUP_DIM: usize = 256;
 ///
 /// * **Large images**: writes only the 4-bit GroupHeader
 ///   (`use_global_tree=1`).  Per-AC-group pixel tokens are written later by
-///   [`write_ac_group_alpha`].
+///   [`write_ac_group_alpha`]. With an ANS `global_code` the empty stream's
+///   final state follows, as libjxl writes it: jxl-oxide reads it even when
+///   no channel is coded here.
 pub(crate) fn write_lfglobal_alpha_section(
     alpha: &AlphaPlane,
     xsize: usize,
     ysize: usize,
     step: u32,
+    global_code_ans: bool,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
@@ -92,6 +95,9 @@ pub(crate) fn write_lfglobal_alpha_section(
     } else {
         // Large path: just the GroupHeader; pixels come per AC group.
         write_group_header_global_tree(w);
+        if global_code_ans {
+            w.write(32, u64::from(crate::entropy::ANS_SIGNATURE << 16));
+        }
     }
 }
 
@@ -104,10 +110,11 @@ pub(crate) fn write_global_alpha_modular(
     xsize: usize,
     ysize: usize,
     step: u32,
+    global_code_ans: bool,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
-    write_lfglobal_alpha_section(alpha, xsize, ysize, step, scratch, w);
+    write_lfglobal_alpha_section(alpha, xsize, ysize, step, global_code_ans, scratch, w);
 }
 
 pub(crate) fn write_ac_group_alpha(
@@ -1066,7 +1073,7 @@ mod tests {
         let chan = vec![128u8; 8 * 8];
         let alpha = AlphaPlane::from_u8(chan);
         let mut scratch = CoderScratch::default();
-        write_global_alpha_modular(&alpha, 8, 8, 1, &mut scratch, &mut w);
+        write_global_alpha_modular(&alpha, 8, 8, 1, true, &mut scratch, &mut w);
         let bits = w.bits_written();
         w.zero_pad_to_byte();
         assert!(!w.into_bytes().is_empty());
@@ -1075,12 +1082,17 @@ mod tests {
 
     #[test]
     fn write_alpha_large_emits_header_only() {
-        let mut w = BitWriter::new();
         let chan = vec![200u8; 512 * 400];
         let alpha = AlphaPlane::from_u8(chan);
         let mut scratch = CoderScratch::default();
-        write_lfglobal_alpha_section(&alpha, 512, 400, 1, &mut scratch, &mut w);
-        // Large path: only 4 bits (GroupHeader).
-        assert_eq!(w.bits_written(), 4);
+        let bits = |ans: bool, scratch: &mut CoderScratch| {
+            let mut w = BitWriter::new();
+            write_lfglobal_alpha_section(&alpha, 512, 400, 1, ans, scratch, &mut w);
+            w.bits_written()
+        };
+        // Large path: only the 4-bit GroupHeader, plus the empty stream's
+        // final state when the global code is ANS.
+        assert_eq!(bits(false, &mut scratch), 4);
+        assert_eq!(bits(true, &mut scratch), 4 + 32);
     }
 }

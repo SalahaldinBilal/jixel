@@ -6925,12 +6925,10 @@ pub(crate) fn encode_modular_xyb_atlas_tree_slot(
     slot: u32,
     writer: &mut BitWriter,
 ) -> bool {
-    // Keep atlas costs used by lossy RDO at the standard budget.
-    let speed = if speed == crate::Speed::ExtraSlow {
-        crate::Speed::Slow
-    } else {
-        speed
-    };
+    // Keep atlas costs used by lossy RDO at the standard budget. Below Medium
+    // the atlas has neither a learned tree nor a palette and outweighs the
+    // frame it replaces, while the atlas itself is small.
+    let speed = speed.clamp(crate::Speed::Medium, crate::Speed::Slow);
     let Ok(mut atlas) = Image3Si::try_new(xsize, ysize) else {
         return false;
     };

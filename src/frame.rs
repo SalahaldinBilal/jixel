@@ -210,7 +210,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         epf_iters,
         epf_pass0_scale,
         gab_enabled,
-        dc_step: [X_DC_STEP, 1.0, 1.0],
+        dc_step: chroma_dc_steps(qdc),
     }
 }
 
@@ -218,6 +218,26 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
 /// finer than the X AC band it sits under; twice the step buys back 1-2% of
 /// the file at better SSIMULACRA2, butteraugli and cvvdp alike.
 const X_DC_STEP: f32 = 2.0;
+
+/// Distance from which the chroma DC steps grow slower than the luma DC step.
+const CHROMA_DC_GROWTH_DISTANCE: f32 = 3.5;
+/// Exponents of the X and B DC step growth relative to the luma DC step's.
+static CHROMA_DC_GROWTH: [f32; 2] = [0.75, 0.5];
+
+/// DC step multipliers for X, Y and B at the luma DC quantizer `qdc`.
+///
+/// Past `CHROMA_DC_GROWTH_DISTANCE` the chroma steps follow only a power of
+/// the luma step's growth: a flat, nearly neutral region otherwise sits
+/// between two chroma DC levels, and every block rounds the same way into a
+/// visible hue shift.
+fn chroma_dc_steps(qdc: f32) -> [f32; 3] {
+    let growth = (quant_dc(CHROMA_DC_GROWTH_DISTANCE) / qdc).max(1.0);
+    [
+        X_DC_STEP * growth.powf(CHROMA_DC_GROWTH[0] - 1.0),
+        1.0,
+        growth.powf(CHROMA_DC_GROWTH[1] - 1.0),
+    ]
+}
 
 const EPF_PASS0_START_D: f32 = 2.5;
 const EPF_PASS0_SCALE: f32 = 3.6;
@@ -1264,20 +1284,126 @@ fn write_block_ctx_map(
     crate::entropy::write_context_map(&cm_entropy, &mut scratch.huffman_pool, w);
 }
 
+/// Modular data of the extra channel, coded ahead of the frame sections:
+/// the LfGlobal part, one part per DC group and one per AC group.
+struct ExtraSections {
+    global: BitWriter,
+    lf: Vec<BitWriter>,
+    ac: Vec<BitWriter>,
+}
+
+impl ExtraSections {
+    fn bits(&self) -> usize {
+        self.global.bits_written()
+            + self.lf.iter().map(BitWriter::bits_written).sum::<usize>()
+            + self.ac.iter().map(BitWriter::bits_written).sum::<usize>()
+    }
+}
+
+/// Code the extra channel losslessly and, when the context asks for a lossy
+/// one, also squeezed and quantized; keep the smaller. The lossless coding
+/// wins wherever it is no larger, so solid and hard-edged planes stay exact
+/// and cost what they did. `global_code_ans` is whether the frame's global
+/// tree carries an ANS code.
+fn prepare_extra_sections(
+    ctx: &EncodingContext,
+    plane: &AlphaPlane,
+    dim: &ImageDim,
+    dc_group_coords: &[(usize, usize)],
+    global_code_ans: bool,
+    scratch: &mut CoderScratch,
+) -> ExtraSections {
+    let mut lossless = ExtraSections {
+        global: BitWriter::new(),
+        lf: (0..dc_group_coords.len())
+            .map(|_| BitWriter::new())
+            .collect(),
+        ac: Vec::new(),
+    };
+    crate::modular::write_global_alpha_modular(
+        plane,
+        dim.xsize,
+        dim.ysize,
+        ctx.extra_step,
+        global_code_ans,
+        scratch,
+        &mut lossless.global,
+    );
+    lossless.ac = ctx
+        .thread_pool
+        .steal_map(scratch, dim.num_groups, |group_id, scratch| {
+            let x0 = (group_id % dim.xsize_groups) * K_GROUP_DIM;
+            let y0 = (group_id / dim.xsize_groups) * K_GROUP_DIM;
+            let mut w = BitWriter::new();
+            crate::modular::write_ac_group_alpha(
+                plane,
+                dim.xsize,
+                dim.ysize,
+                x0,
+                y0,
+                K_GROUP_DIM.min(dim.xsize - x0),
+                K_GROUP_DIM.min(dim.ysize - y0),
+                ctx.extra_step,
+                scratch,
+                &mut w,
+            );
+            w
+        });
+    if ctx.extra_squeeze_distance <= 0.0 || plane.is_constant() {
+        return lossless;
+    }
+    let Some(squeezed) = crate::lossless::ExtraSqueeze::new(
+        plane,
+        dim.xsize,
+        dim.ysize,
+        ctx.extra_squeeze_distance,
+        ctx.extra_learned_trees,
+    ) else {
+        return lossless;
+    };
+    let mut lossy = ExtraSections {
+        global: BitWriter::new(),
+        lf: Vec::new(),
+        ac: Vec::new(),
+    };
+    squeezed.write_global(scratch, &mut lossy.global);
+    lossy.lf = ctx
+        .thread_pool
+        .steal_map(scratch, dc_group_coords.len(), |i, scratch| {
+            let (gx, gy) = dc_group_coords[i];
+            let mut w = BitWriter::new();
+            squeezed.write_lf_group(gx, gy, scratch, &mut w);
+            w
+        });
+    lossy.ac = ctx
+        .thread_pool
+        .steal_map(scratch, dim.num_groups, |group_id, scratch| {
+            let mut w = BitWriter::new();
+            squeezed.write_ac_group(
+                group_id % dim.xsize_groups,
+                group_id / dim.xsize_groups,
+                scratch,
+                &mut w,
+            );
+            w
+        });
+    if lossy.bits() < lossless.bits() {
+        lossy
+    } else {
+        lossless
+    }
+}
+
 fn write_dc_global(
     distp: &DistanceParams,
     num_dc_groups: usize,
     ac_plan: &crate::ac_context::AcCtxPlan,
     dc_tree: &DcTreeChoice,
     dc_code: &EntropyCode,
-    alpha: Option<&AlphaPlane>,
-    xsize: usize,
-    ysize: usize,
     ytox_dc: i32,
     ytob_dc: i32,
     cfl: crate::color_correlation::CflFrame,
-    extra_step: u32,
-    extra_squeeze: Option<&crate::lossless::ExtraSqueeze>,
+    extra: Option<&ExtraSections>,
     scratch: &mut CoderScratch,
     w: &mut BitWriter,
 ) {
@@ -1335,17 +1461,8 @@ fn write_dc_global(
 
     // FullModularImage::read happens HERE in the decoder. If we declared an alpha
     // extra channel, write its GroupHeader + local tree + pixel data now.
-    if let Some(squeezed) = extra_squeeze {
-        squeezed.write_global(scratch, w);
-    } else if let Some(alpha_plane) = alpha {
-        crate::modular::write_global_alpha_modular(
-            alpha_plane,
-            xsize,
-            ysize,
-            extra_step,
-            scratch,
-            w,
-        );
+    if let Some(extra) = extra {
+        w.append(&extra.global);
     }
 }
 
@@ -2108,6 +2225,7 @@ fn encode_frame_vardct(
             alpha,
             coeff_shifts,
             false,
+            None,
             true,
             #[cfg(feature = "splines")]
             stage.as_ref(),
@@ -2117,6 +2235,7 @@ fn encode_frame_vardct(
 
     // Compare bounded residual samples plus the actual atlas, dictionary and
     // spline costs. Only the selected plan receives a full-frame encode.
+    let glyphs = GlyphStage::find(ctx, scratch, distance, &xyb, alpha);
     let mut best = prepare_vardct_variant(
         ctx,
         scratch,
@@ -2126,6 +2245,7 @@ fn encode_frame_vardct(
         alpha,
         coeff_shifts,
         true,
+        glyphs.as_ref(),
         true,
         #[cfg(feature = "splines")]
         stage.as_ref(),
@@ -2151,6 +2271,7 @@ fn encode_frame_vardct(
             alpha,
             coeff_shifts,
             true,
+            glyphs.as_ref(),
             true,
             Some(&stage),
         )?;
@@ -2169,6 +2290,7 @@ fn encode_frame_vardct(
         alpha,
         coeff_shifts,
         true,
+        glyphs.as_ref(),
         false,
         #[cfg(feature = "splines")]
         stage.as_ref(),
@@ -2195,6 +2317,71 @@ struct SplineStage<'a> {
     before_tiles: bool,
 }
 
+/// A frame's glyph patches and their coded atlas. Every variant of the
+/// patch race starts from the same glyphs, so they are found and coded once.
+struct GlyphStage {
+    atlas: BitWriter,
+    base: Image3F,
+    references: Vec<crate::patches::PatchReference>,
+}
+
+impl GlyphStage {
+    fn find(
+        ctx: &EncodingContext,
+        scratch: &mut CoderScratch,
+        distance: f32,
+        xyb: &Image3F,
+        alpha: Option<&AlphaPlane>,
+    ) -> Option<Self> {
+        let free_singles = distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE;
+        let coarse = if distance < 1.5 {
+            1
+        } else if distance < 2.0 {
+            2
+        } else if distance < 6.0 {
+            4
+        } else {
+            8
+        };
+        let plan = crate::patches::find_lossy_glyph_patches(
+            ctx,
+            xyb,
+            &crate::patches::GlyphParams {
+                min_occurrences: 1,
+                min_repeat_pixels: if free_singles {
+                    0
+                } else {
+                    GLYPH_MIN_REPEAT_PIXELS
+                },
+                coarse,
+                min_contrast: GLYPH_MIN_CONTRAST_STEPS * coarse,
+                singles_min_cover: if free_singles {
+                    0.0
+                } else {
+                    GLYPH_SINGLETON_MIN_COVER
+                },
+            },
+        )?;
+        let mut atlas = BitWriter::new();
+        let atlas_alpha = zero_alpha_for_lossy(alpha, plan.atlas_width * plan.atlas_height);
+        crate::lossless::encode_modular_xyb_atlas_tree(
+            &plan.atlas,
+            plan.atlas_width,
+            plan.atlas_height,
+            atlas_alpha.as_ref(),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut atlas,
+        );
+        Some(Self {
+            atlas,
+            base: plan.base,
+            references: plan.references,
+        })
+    }
+}
+
 /// One patched or regular VarDCT frame, with or without Replace `tiles`.
 /// Atlas frames are small and encoded immediately; the full residual is deferred.
 #[allow(clippy::too_many_arguments)]
@@ -2207,6 +2394,7 @@ fn prepare_vardct_variant(
     alpha: Option<&AlphaPlane>,
     coeff_shifts: &[u32],
     patches: bool,
+    glyphs: Option<&GlyphStage>,
     tiles: bool,
     #[cfg(feature = "splines")] stage: Option<&SplineStage>,
 ) -> Result<PreparedVarDct, EncodeError> {
@@ -2236,58 +2424,18 @@ fn prepare_vardct_variant(
     // Near-duplicate tiles beyond two 8-bit levels of RMS difference match
     // noise on smooth ground; the frame without them then wins the race and
     // the plan only adds atlas and sampling work.
-    let near_tiles = distance.clamp(0.5, NEAR_TILES_MAX);
-    let glyph_plan = if patches {
-        let free_singles = distance <= GLYPH_SINGLETON_FREE_MAX_DISTANCE;
-        let coarse = if distance < 1.5 {
-            1
-        } else if distance < 2.0 {
-            2
-        } else if distance < 6.0 {
-            4
-        } else {
-            8
-        };
-        crate::patches::find_lossy_glyph_patches(
-            ctx,
-            &xyb,
-            &crate::patches::GlyphParams {
-                min_occurrences: 1,
-                min_repeat_pixels: if free_singles {
-                    0
-                } else {
-                    GLYPH_MIN_REPEAT_PIXELS
-                },
-                coarse,
-                min_contrast: GLYPH_MIN_CONTRAST_STEPS * coarse,
-                singles_min_cover: if free_singles {
-                    0.0
-                } else {
-                    GLYPH_SINGLETON_MIN_COVER
-                },
-            },
-        )
+    let near_tiles = if ctx.speed.effort().near_patch_tiles {
+        distance.clamp(0.5, NEAR_TILES_MAX)
     } else {
-        None
+        0.0
     };
-    if let Some(plan) = glyph_plan {
-        let mut patched_writer = BitWriter::new();
-        let atlas_alpha = zero_alpha_for_lossy(alpha, plan.atlas_width * plan.atlas_height);
-        crate::lossless::encode_modular_xyb_atlas_tree(
-            &plan.atlas,
-            plan.atlas_width,
-            plan.atlas_height,
-            atlas_alpha.as_ref(),
-            ctx.speed,
-            &ctx.thread_pool,
-            scratch,
-            &mut patched_writer,
-        );
+    if let Some(glyphs) = glyphs {
+        let mut patched_writer = glyphs.atlas.clone();
 
         // Repeated tiles of what is left (icons, rules, UI chrome). They are
         // Replace entries and must precede the additive glyph entries, which
         // then land on top of the replaced rectangles.
-        let mut base = plan.base;
+        let mut base = glyphs.base.clone();
         #[cfg(feature = "splines")]
         let early_splines = if before_tiles {
             select_splines(scratch, &mut base, None)
@@ -2374,7 +2522,7 @@ fn prepare_vardct_variant(
             }
         }
         let atlas_bits = patched_writer.bits_written();
-        references.extend(plan.references);
+        references.extend(glyphs.references.iter().cloned());
 
         // Additive glyph entries commute with splines; Replace tiles cut from
         // the unsubtracted image must stay clear of them.
@@ -2409,9 +2557,7 @@ fn prepare_vardct_variant(
             used_tiles,
             estimated_bits: None,
         };
-        // Without learned trees the atlas has neither the tree nor a palette
-        // and can outweigh the frame it replaces at any distance.
-        if distance >= GLYPH_CHECK_MIN_DISTANCE || !ctx.speed.effort().learned_tree {
+        if distance >= GLYPH_CHECK_MIN_DISTANCE {
             let bits = prepared.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
             if atlas_bits as f64 > bits * GLYPH_CHECK_ATLAS_SHARE {
                 let mut regular = xyb;
@@ -3335,18 +3481,6 @@ fn encode_frame_core(
         && alpha.is_none()
         && ctx.coding.is_xyb()
         && crate::lossless::dc_frame_supported(dim.xsize_blocks, dim.ysize_blocks);
-    let extra_squeeze = alpha
-        .filter(|_| ctx.extra_squeeze_distance > 0.0)
-        .and_then(|plane| {
-            crate::lossless::ExtraSqueeze::new(
-                plane,
-                dim.xsize,
-                dim.ysize,
-                ctx.extra_squeeze_distance,
-                ctx.extra_learned_trees,
-            )
-        });
-    let extra_squeeze = extra_squeeze.as_ref();
 
     let num_sections = 2 + dim.num_dc_groups + num_passes * dim.num_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
@@ -3704,6 +3838,13 @@ fn encode_frame_core(
     } else {
         0
     };
+    if ctx.coding.is_xyb() && ctx.speed.effort().chroma_dc_squeeze && !use_dc_frame {
+        let cfl = crate::color_correlation::CflFrame {
+            base_x: crate::color_correlation::y_to_x_ratio(ctx.cfl_frame(), ytox_dc as i8),
+            ..ctx.cfl_frame()
+        };
+        distp.dc_step = dc_rdo::choose_x_dc_step(&mut dc_datas, &distp, cfl, ctx.quantize_dc_cfl);
+    }
     // Only DC reconstruction uses the extra X slope. The AC map and the
     // header's base correlations retain the frame's original parameters.
     let dc_cfl = crate::color_correlation::CflFrame {
@@ -4105,6 +4246,16 @@ fn encode_frame_core(
         );
     }
     let dc_code = dc_code_owned.as_ref();
+    let extra = alpha.map(|plane| {
+        prepare_extra_sections(
+            ctx,
+            plane,
+            &dim,
+            &group_coords,
+            !dc_code.use_prefix_code,
+            scratch,
+        )
+    });
 
     // Separate scan arms before context planning: each gets its own final
     // context map, hybrid-uint configuration, clustering and ANS refinement.
@@ -4232,14 +4383,10 @@ fn encode_frame_core(
         &ac_plan,
         &dc_tree,
         &dc_code,
-        alpha,
-        dim.xsize,
-        dim.ysize,
         ytox_dc,
         ytob_dc,
         ctx.cfl_frame(),
-        ctx.extra_step,
-        extra_squeeze,
+        extra.as_ref(),
         scratch,
         &mut sections[0],
     );
@@ -4248,7 +4395,7 @@ fn encode_frame_core(
     // streams in parallel, then place their writers back in raster order.
     let dc_sections = ctx
         .thread_pool
-        .steal_map(scratch, dc_datas.len(), |i, scratch| {
+        .steal_map(scratch, dc_datas.len(), |i, _scratch| {
             let dc_data = &dc_datas[i];
             let mut w = BitWriter::new();
             // With a DC frame, the group carries no DC stream.
@@ -4271,9 +4418,8 @@ fn encode_frame_core(
                 }
             }
             // ModularLfGroup: the extra channel's coarse squeeze levels.
-            if let Some(squeezed) = extra_squeeze {
-                let (gx, gy) = group_coords[i];
-                squeezed.write_lf_group(gx, gy, scratch, &mut w);
+            if let Some(extra) = &extra {
+                w.append(&extra.lf[i]);
             }
             let num_blocks = dc_data.ac_strategy.xsize() * dc_data.ac_strategy.ysize();
             let num_ac_blocks = dc_data.ac_strategy.count_first_blocks();
@@ -4339,40 +4485,11 @@ fn encode_frame_core(
     // Modular alpha: extra-channel modular data is decoded in the last pass
     // (the only pass whose modular sub-image shift range is set when num_ds=0,
     // jxl-frame lib.rs:101-108 / pass_group.rs:93). Write it into that section.
-    if let Some(alpha_plane) = alpha {
+    if let Some(extra) = &extra {
         let last_pass = num_passes - 1;
-        let alpha_sections =
-            ctx.thread_pool
-                .steal_map(scratch, dim.num_groups, |abs_group_id, scratch| {
-                    let image_gx = abs_group_id % dim.xsize_groups;
-                    let image_gy = abs_group_id / dim.xsize_groups;
-                    let group_x0 = image_gx * K_GROUP_DIM;
-                    let group_y0 = image_gy * K_GROUP_DIM;
-                    let group_xsize = K_GROUP_DIM.min(dim.xsize.saturating_sub(group_x0));
-                    let group_ysize = K_GROUP_DIM.min(dim.ysize.saturating_sub(group_y0));
-                    let ac_group_idx =
-                        2 + dim.num_dc_groups + last_pass * dim.num_groups + abs_group_id;
-                    let mut w = BitWriter::new();
-                    if let Some(squeezed) = extra_squeeze {
-                        squeezed.write_ac_group(image_gx, image_gy, scratch, &mut w);
-                        return (ac_group_idx, w);
-                    }
-                    crate::modular::write_ac_group_alpha(
-                        alpha_plane,
-                        dim.xsize,
-                        dim.ysize,
-                        group_x0,
-                        group_y0,
-                        group_xsize,
-                        group_ysize,
-                        ctx.extra_step,
-                        scratch,
-                        &mut w,
-                    );
-                    (ac_group_idx, w)
-                });
-        for (section_idx, alpha_section) in alpha_sections {
-            sections[section_idx].append(&alpha_section);
+        for (abs_group_id, section) in extra.ac.iter().enumerate() {
+            sections[2 + dim.num_dc_groups + last_pass * dim.num_groups + abs_group_id]
+                .append(section);
         }
     }
 
@@ -7265,7 +7382,7 @@ mod tests {
 
     #[test]
     fn sampled_tile_cost_keeps_texture_and_rejects_smooth_repetition() {
-        use super::{BitWriter, prepare_vardct_variant};
+        use super::{BitWriter, GlyphStage, prepare_vardct_variant};
         use crate::coder_scratch::CoderScratch;
         use crate::encoding_context::EncodingContext;
         use crate::image::Image3F;
@@ -7308,6 +7425,7 @@ mod tests {
             }
             let mut estimates = Vec::new();
             let mut actual = Vec::new();
+            let glyphs = GlyphStage::find(&ctx, &mut scratch, distance, &source, None);
             for tiles in [false, true] {
                 let mut plan = prepare_vardct_variant(
                     &ctx,
@@ -7318,6 +7436,7 @@ mod tests {
                     None,
                     &[0],
                     true,
+                    glyphs.as_ref(),
                     tiles,
                     #[cfg(feature = "splines")]
                     None,
@@ -7377,9 +7496,9 @@ mod tests {
     }
 
     use super::{
-        DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE, EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE,
-        MIN_TOKENS_PER_DC_LEAF, choose_dc_predictors, compute_distance_params, dc_refinement,
-        epf_sharpness_id, quant_dc,
+        CHROMA_DC_GROWTH_DISTANCE, DC_REFINE_HOLD, DC_REFINE_PEAK, DC_REFINE_RELEASE,
+        EPF_PASS0_SCALE, EPF_PASS0_SPEC_SCALE, MIN_TOKENS_PER_DC_LEAF, X_DC_STEP,
+        choose_dc_predictors, compute_distance_params, dc_refinement, epf_sharpness_id, quant_dc,
     };
     use crate::coder_scratch::DcPredictorScratch;
     use crate::entropy::Token;
@@ -7696,6 +7815,34 @@ mod tests {
             !sparse[ctx as usize],
             "an underpopulated leaf must not flip"
         );
+    }
+
+    #[test]
+    fn chroma_dc_steps_grow_slower_than_luma_past_the_knee() {
+        for d in [0.1, 1.0, 2.0, 3.0, CHROMA_DC_GROWTH_DISTANCE] {
+            assert_eq!(
+                compute_distance_params(d).dc_step,
+                [X_DC_STEP, 1.0, 1.0],
+                "d={d}"
+            );
+        }
+        // Absolute steps per channel: luma coarsens fastest, B slowest, and
+        // no chroma step ever gets finer as the distance grows.
+        let absolute = |d: f32| {
+            let p = compute_distance_params(d);
+            std::array::from_fn::<f32, 3, _>(|c| p.dc_step[c] / p.scale_dc)
+        };
+        let mut prev = absolute(CHROMA_DC_GROWTH_DISTANCE);
+        for d in [4.0, 5.0, 6.0, 8.0, 11.0, 15.0, 25.0] {
+            let p = compute_distance_params(d);
+            assert!(p.dc_step[0] < X_DC_STEP && p.dc_step[2] < 1.0, "d={d}");
+            assert!(p.dc_step[0] / X_DC_STEP > p.dc_step[2], "d={d}");
+            let cur = absolute(d);
+            for c in [0, 2] {
+                assert!(cur[c] >= prev[c] * 0.999, "chroma {c} step shrank at d={d}");
+            }
+            prev = cur;
+        }
     }
 
     #[test]

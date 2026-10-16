@@ -172,6 +172,19 @@ impl AlphaPlane {
         }
     }
 
+    /// True if every sample holds the same value.
+    pub(crate) fn is_constant(&self) -> bool {
+        fn same<T: PartialEq>(v: &[T]) -> bool {
+            v.split_first()
+                .is_none_or(|(first, rest)| rest.iter().all(|x| x == first))
+        }
+        match self {
+            Self::U8(v) => same(v),
+            Self::U16 { data, .. } => same(data),
+            Self::F32(v) => same(v),
+        }
+    }
+
     /// Bit depth of the alpha samples (8, 10, or 12).
     #[inline]
     pub(crate) fn bits(&self) -> u8 {
@@ -318,6 +331,13 @@ pub struct EncodeConfig {
     /// source samples are unchanged by this preprocessing. Defaults to true.
     /// Ignored for lossless encoding and CMYK images.
     pub fill_invisible: bool,
+    /// Distance of the alpha channel in lossy frames, in the units of
+    /// `distance`. `None` (the default) codes alpha at the frame distance;
+    /// `Some(0.0)` keeps it lossless. Lossy alpha is a quantized Squeeze
+    /// pyramid; the encoder keeps lossless alpha wherever that is no larger,
+    /// so solid and hard-edged alpha stays exact. Values are clamped to
+    /// `0.0..=25.0`; NaN means lossless. Ignored when `lossless` is true.
+    pub alpha_distance: Option<f32>,
     /// If true (and lossless), use the progressive Squeeze transform: a low-res
     /// preview that refines to bit-exact. Works at any size (single- and
     /// multi-group) and with alpha.
@@ -513,6 +533,7 @@ impl Default for EncodeConfig {
             orientation: Orientation::Normal,
             lossless: false,
             fill_invisible: true,
+            alpha_distance: None,
             progressive: false,
             patches: false,
             #[cfg(feature = "splines")]
@@ -621,7 +642,7 @@ impl EncodeConfigImpl {
         self
     }
 
-    /// Attach an 8-bit alpha plane to be encoded losslessly via Modular.
+    /// Attach the alpha plane, coded in the frame's modular streams.
     /// Length must equal `xsize * ysize` of the image passed to encode.
     pub(crate) fn with_alpha(mut self, alpha: AlphaPlane) -> Self {
         self.alpha = Some(alpha);
@@ -830,6 +851,13 @@ impl EncodeConfig {
         self
     }
 
+    /// Alpha distance of lossy frames (see [`EncodeConfig::alpha_distance`]);
+    /// `0.0` keeps alpha lossless.
+    pub fn with_alpha_distance(mut self, alpha_distance: f32) -> Self {
+        self.alpha_distance = Some(alpha_distance);
+        self
+    }
+
     /// Enable progressive lossless. Only effective when `lossless`.
     pub fn with_progressive(mut self, progressive: bool) -> Self {
         self.progressive = progressive;
@@ -969,6 +997,19 @@ fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32
     ctx.raise_b_qm_scale(selection.b_qm_scale);
 }
 
+/// Squeeze quantizer distance of lossy alpha per unit of alpha distance, in
+/// the lossy-modular arm's luma units.
+const ALPHA_SQUEEZE_SCALE: f32 = 4.0;
+const MAX_ALPHA_DISTANCE: f32 = 25.0;
+
+/// Whether lossy alpha learns its context trees. The trees use no weighted
+/// predictor, so the tree-free decoding tier rules them out; they halve the
+/// alpha bits but cost encode time, so only the slow tiers learn them.
+fn alpha_learned_trees(config: &EncodeConfig) -> bool {
+    config.decoding_speed != DecodingSpeed::Fastest
+        && matches!(config.speed, Speed::Slow | Speed::ExtraSlow)
+}
+
 pub(crate) fn lossy_context(
     config: &EncodeConfig,
     distance: f32,
@@ -990,6 +1031,13 @@ pub(crate) fn lossy_context(
     ctx.progressive_dc_levels = config.progressive_dc_levels;
     ctx.group_order = config.group_order;
     ctx.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
+    let alpha_distance = match config.alpha_distance {
+        None => distance,
+        Some(d) if d.is_nan() => 0.0,
+        Some(d) => d.clamp(0.0, MAX_ALPHA_DISTANCE),
+    };
+    ctx.extra_squeeze_distance = ALPHA_SQUEEZE_SCALE * alpha_distance;
+    ctx.extra_learned_trees = alpha_learned_trees(config);
     #[cfg(feature = "splines")]
     {
         let slow = config.speed.effort().splines && config.decoding_speed == DecodingSpeed::Slow;
@@ -1885,6 +1933,7 @@ fn encode_f32_lossless_rgba(
                 grayscale: false,
                 orientation: config.orientation,
                 lossy_modular_16: false,
+                extra_16: false,
             },
             &mut metadata_scratch,
             &mut w,
@@ -2283,6 +2332,7 @@ pub(crate) fn encode_with_coded_planes(
             grayscale: config.grayscale,
             orientation: config.orientation,
             lossy_modular_16,
+            extra_16: lossy_modular_16 && ctx.extra_squeeze_distance > 0.0,
         },
         scratch,
         &mut w,
@@ -2460,6 +2510,7 @@ fn encode_lossless_planes(
                 grayscale: config.grayscale,
                 orientation: config.orientation,
                 lossy_modular_16: false,
+                extra_16: false,
             },
             &mut metadata_scratch,
             &mut w,
@@ -2687,8 +2738,10 @@ struct ImageMetadataParams<'a> {
     grayscale: bool,
     orientation: Orientation,
     /// The frame is a lossy modular frame on the 16-bit lattice: the image
-    /// (and K) declare 16 bits whatever the input depth was.
+    /// declares 16 bits whatever the input depth was.
     lossy_modular_16: bool,
+    /// The extra channel (K, or lossy alpha) sits on that lattice too.
+    extra_16: bool,
 }
 
 fn write_image_metadata(
@@ -2709,6 +2762,7 @@ fn write_image_metadata(
         grayscale,
         orientation,
         lossy_modular_16,
+        extra_16,
     } = *params;
     let bps = if lossy_modular_16 {
         BitsPerSample::Sixteen
@@ -2758,11 +2812,11 @@ fn write_image_metadata(
                 w.write(1, 0); // all_default = false
                 w.write(2, 2); // ec_type: BitsOffset(4, 2) selector
                 w.write(4, 4 - 2); // ec_type = Black (4)
-                write_int_bit_depth(if lossy_modular_16 { 16 } else { bits as u32 }, w);
+                write_int_bit_depth(if extra_16 { 16 } else { bits as u32 }, w);
                 w.write(2, 0); // dim_shift = 0
                 w.write(2, 0); // name length = 0
             }
-            8 => {
+            8 if !extra_16 => {
                 w.write(1, 1); // all_default = true → U8 alpha
             }
             bits => {
@@ -2771,7 +2825,7 @@ fn write_image_metadata(
                 if alpha.is_float() {
                     write_float_bit_depth(32, 8, w); // f32 alpha bit depth
                 } else {
-                    write_int_bit_depth(bits as u32, w);
+                    write_int_bit_depth(if extra_16 { 16 } else { bits as u32 }, w);
                 }
                 w.write(2, 0); // dim_shift = 0
                 w.write(2, 0); // name length = 0
@@ -3646,8 +3700,7 @@ mod encode_smoke_tests {
     fn fast_lossy_patches_are_rate_safe_on_unrepeated_ink() {
         // Saturated line drawings in separate 60-pixel tiles, each broken
         // by its own gaps: every tile is a singleton glyph, so the whole
-        // image lands in the atlas, which below Slow is coded without a
-        // palette or a learned tree.
+        // image lands in the atlas.
         const SIZE: usize = 256;
         let mut pixels = vec![0u8; SIZE * SIZE * 3];
         for y in 0..SIZE {
@@ -3687,7 +3740,49 @@ mod encode_smoke_tests {
     }
 
     #[test]
-    fn lossy_patches_reduce_repeated_regions() {
+    fn fast_lossy_glyph_patches_shrink_repeated_text() {
+        // Sixty dark 5x7 glyphs on white, set as lines of text off the block
+        // grid. Their atlas is too large to pay off unless it is coded with
+        // a learned tree and palette, which Fast now uses too.
+        const SIZE: usize = 256;
+        let mut state = 0x2545_f491u32;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as usize
+        };
+        let glyphs: Vec<[[bool; 5]; 7]> = (0..60)
+            .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| next() % 3 < 2)))
+            .collect();
+        let mut pixels = vec![255u8; SIZE * SIZE * 3];
+        for line in 0..SIZE / 11 {
+            for column in 0..SIZE / 7 - 1 {
+                let glyph = &glyphs[next() % glyphs.len()];
+                let (x0, y0) = (3 + column * 7 + line % 3, 2 + line * 11);
+                for (dy, row) in glyph.iter().enumerate() {
+                    for (dx, &ink) in row.iter().enumerate() {
+                        if ink {
+                            pixels[((y0 + dy) * SIZE + x0 + dx) * 3..][..3].fill(20);
+                        }
+                    }
+                }
+            }
+        }
+        let plain = EncodeConfig::default().with_distance(1.0);
+        let patched = plain.clone().with_patches(true);
+        let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
+        let patched = encode_image(&pixels, SIZE, SIZE, &patched).unwrap();
+        assert!(
+            patched.len() * 5 < plain.len(),
+            "{} vs {}",
+            patched.len(),
+            plain.len()
+        );
+    }
+
+    /// Noise with one 16x16 noise tile repeated on half of the grid.
+    fn repeated_region_pixels() -> Vec<u8> {
         const PW: usize = 256;
         const PH: usize = 256;
         let mut state = 0x89ab_cdefu32;
@@ -3710,6 +3805,14 @@ mod encode_smoke_tests {
                 }
             }
         }
+        pixels
+    }
+
+    #[test]
+    fn lossy_patches_reduce_repeated_regions() {
+        const PW: usize = 256;
+        const PH: usize = 256;
+        let pixels = repeated_region_pixels();
         let plain = encode_image(&pixels, PW, PH, &lossy().with_patches(false)).unwrap();
         let patched = encode_image(&pixels, PW, PH, &lossy().with_patches(true)).unwrap();
         assert!(
@@ -4376,5 +4479,117 @@ mod encode_smoke_tests {
     #[test]
     fn one_by_one_gray8() {
         ok(encode_image_gray(&[200u8], 1, 1, &lossy()));
+    }
+}
+
+#[cfg(test)]
+mod lossy_alpha_tests {
+    use super::*;
+
+    const W: usize = 320;
+    const H: usize = 280;
+
+    fn rgba(alpha: impl Fn(usize, usize) -> u8) -> Vec<u8> {
+        (0..W * H)
+            .flat_map(|i| {
+                let (x, y) = (i % W, i / W);
+                [(x * 255 / W) as u8, (y * 255 / H) as u8, 96, alpha(x, y)]
+            })
+            .collect()
+    }
+
+    fn disc_radius(x: usize, y: usize) -> f32 {
+        (x as f32 - W as f32 / 2.0).hypot(y as f32 - H as f32 / 2.0) / H as f32
+    }
+
+    fn soft(x: usize, y: usize) -> u8 {
+        (255.0 * ((0.45 - disc_radius(x, y)) / 0.25).clamp(0.0, 1.0)).round() as u8
+    }
+
+    fn hard(x: usize, y: usize) -> u8 {
+        if disc_radius(x, y) < 0.4 { 255 } else { 0 }
+    }
+
+    fn encode(pixels: &[u8], config: &EncodeConfig) -> Vec<u8> {
+        encode_image_with_alpha(pixels, W, H, config).unwrap()
+    }
+
+    fn fast() -> EncodeConfig {
+        EncodeConfig::default()
+            .with_distance(1.5)
+            .with_num_threads(1)
+    }
+
+    #[test]
+    fn solid_alpha_is_coded_as_before() {
+        for value in [255, 77, 0] {
+            let pixels = rgba(|_, _| value);
+            assert_eq!(
+                encode(&pixels, &fast()),
+                encode(&pixels, &fast().with_alpha_distance(0.0)),
+                "constant alpha {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn soft_alpha_is_smaller_than_lossless() {
+        let pixels = rgba(soft);
+        for config in [fast(), fast().with_speed(Speed::Slow)] {
+            let lossy = encode(&pixels, &config).len();
+            let lossless = encode(&pixels, &config.clone().with_alpha_distance(0.0)).len();
+            assert!(
+                lossy * 10 < lossless * 9,
+                "{:?}: lossy alpha {lossy} vs lossless {lossless}",
+                config.speed
+            );
+        }
+    }
+
+    #[test]
+    fn lossy_alpha_never_grows_the_file() {
+        let noisy = |x: usize, y: usize| {
+            let h = (x * 7919 + y * 104_729) % 251;
+            if h < 5 { 200 + h as u8 } else { 255 }
+        };
+        for alpha in [hard as fn(usize, usize) -> u8, noisy] {
+            let pixels = rgba(alpha);
+            assert!(
+                encode(&pixels, &fast()).len()
+                    <= encode(&pixels, &fast().with_alpha_distance(0.0)).len()
+            );
+        }
+    }
+
+    #[test]
+    fn alpha_distance_follows_the_frame_by_default() {
+        let pixels = rgba(soft);
+        assert_eq!(
+            encode(&pixels, &fast()),
+            encode(&pixels, &fast().with_alpha_distance(1.5))
+        );
+        let lossless = encode(&pixels, &fast().with_alpha_distance(0.0));
+        for odd in [f32::NAN, -1.0] {
+            assert_eq!(encode(&pixels, &fast().with_alpha_distance(odd)), lossless);
+        }
+        assert!(encode(&pixels, &fast().with_alpha_distance(4.0)).len() < lossless.len());
+    }
+
+    #[test]
+    fn gray_and_deep_alpha_go_lossy_too() {
+        let gray: Vec<u8> = rgba(soft)
+            .chunks_exact(4)
+            .flat_map(|px| [px[0], px[3]])
+            .collect();
+        let gray_lossy = encode_image_gray_alpha(&gray, W, H, &fast()).unwrap();
+        let gray_lossless =
+            encode_image_gray_alpha(&gray, W, H, &fast().with_alpha_distance(0.0)).unwrap();
+        assert!(gray_lossy.len() < gray_lossless.len());
+
+        let deep: Vec<u16> = rgba(soft).iter().map(|&v| u16::from(v) * 257).collect();
+        let deep_lossy = encode_image_with_alpha_16bit(&deep, W, H, &fast()).unwrap();
+        let deep_lossless =
+            encode_image_with_alpha_16bit(&deep, W, H, &fast().with_alpha_distance(0.0)).unwrap();
+        assert!(deep_lossy.len() < deep_lossless.len());
     }
 }

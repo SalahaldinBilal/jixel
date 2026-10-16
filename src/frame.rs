@@ -3785,38 +3785,37 @@ fn encode_frame_core(
             distp = chosen;
             groups
         });
-        let dc_ref = &dc_datas;
         let refined = if let Some(groups) = loop_groups {
             groups
         } else {
-            ctx.thread_pool
-                .steal_map(scratch, ac_tasks.len(), |t, scratch| {
-                    let (dc_idx, gx, gy) = ac_tasks[t];
-                    let (dc_gx, dc_gy) = group_coords[dc_idx];
-                    let (p, local, _, _, _) = process_ac_group(
-                        ctx,
-                        scratch,
-                        opsin,
-                        &dim,
-                        &distp,
-                        &dc_ref[dc_idx],
-                        num_passes,
-                        coeff_shifts,
-                        dc_gx,
-                        dc_gy,
-                        gx,
-                        gy,
-                        ytob_dc,
-                        Some(&prices),
-                        &coeff_orders,
-                        &order_alternatives,
-                        false,
-                        qf_threshold,
-                        false,
-                        None,
-                    );
-                    (dc_idx, gx, gy, p, local)
-                })
+            let dc_ref = &dc_datas;
+            ctx.thread_pool.steal_map(scratch, ac_tasks.len(), |t, scratch| {
+                let (dc_idx, gx, gy) = ac_tasks[t];
+                let (dc_gx, dc_gy) = group_coords[dc_idx];
+                let (p, local, _, _, _) = process_ac_group(
+                    ctx,
+                    scratch,
+                    opsin,
+                    &dim,
+                    &distp,
+                    &dc_ref[dc_idx],
+                    num_passes,
+                    coeff_shifts,
+                    dc_gx,
+                    dc_gy,
+                    gx,
+                    gy,
+                    ytob_dc,
+                    Some(&prices),
+                    &coeff_orders,
+                    &order_alternatives,
+                    false,
+                    qf_threshold,
+                    false,
+                    None,
+                );
+                (dc_idx, gx, gy, p, local)
+            })
         };
         for (dc_idx, gx, gy, p, local) in refined {
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
@@ -3909,6 +3908,7 @@ fn encode_frame_core(
             dc_cfl,
             ctx.dc_rows.reconstruct,
         )?;
+    let epf_sharpness = epf_sharpness_id(distance, ctx.screen_content());
     // Pixel-domain decisions are finished; entropy coding only reads DC data
     // and tokens. Release the full-resolution planes before its working sets.
     drop(opsin_image);
@@ -3943,7 +3943,7 @@ fn encode_frame_core(
             let meta = collect_ac_metadata_tokens(
                 &dc_datas[i],
                 &mut meta_props,
-                epf_sharpness_id(distance, ctx.screen_content()),
+                epf_sharpness,
                 effort.dc_learned_tree,
             );
             (wp, props, grad, meta, meta_props)

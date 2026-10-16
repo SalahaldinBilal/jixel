@@ -901,6 +901,78 @@ pub(crate) struct QuantizeDcMethods {
     pub(crate) quantize_cfl_i32: QuantizeDcCflI32Fn,
 }
 
+/// The DC values of one channel's coefficient block, one per covered 8x8
+/// block in `iy * cov_x + ix` order. Single-block transforms carry their DC in
+/// `coeffs[0]`; larger ones derive it from the lowest frequencies.
+fn dc_from_coefficients(ctx: &EncodingContext, raw_strategy: u8, coeffs: &[f32], dc: &mut [f32]) {
+    match raw_strategy {
+        STRATEGY_DCT
+        | STRATEGY_IDENTITY
+        | STRATEGY_DCT2X2
+        | STRATEGY_DCT4X4
+        | STRATEGY_DCT4X8
+        | STRATEGY_DCT8X4
+        | STRATEGY_AFV0..=STRATEGY_AFV3 => dc[0] = coeffs[0],
+        STRATEGY_DCT16X8 => dc_from_dct16x8(
+            coeffs.first_chunk::<128>().unwrap(),
+            dc.first_chunk_mut::<2>().unwrap(),
+        ),
+        STRATEGY_DCT8X16 => dc_from_dct8x16(
+            coeffs.first_chunk::<128>().unwrap(),
+            dc.first_chunk_mut::<2>().unwrap(),
+        ),
+        // [TL, TR, BL, BR], the [iy][ix] grid.
+        STRATEGY_DCT16X16 => dc_from_dct16x16(
+            coeffs.first_chunk::<256>().unwrap(),
+            dc.first_chunk_mut::<4>().unwrap(),
+        ),
+        STRATEGY_DCT32X32 => (ctx.dc_from_dct32x32)(
+            coeffs.first_chunk::<1024>().unwrap(),
+            dc.first_chunk_mut::<16>().unwrap(),
+        ),
+        STRATEGY_DCT64X64 => (ctx.dc_from_dct64x64)(
+            coeffs.first_chunk::<4096>().unwrap(),
+            dc.first_chunk_mut::<64>().unwrap(),
+        ),
+        STRATEGY_DCT64X32 => (ctx.dc_from_dct64x32)(
+            coeffs.first_chunk::<2048>().unwrap(),
+            dc.first_chunk_mut::<32>().unwrap(),
+        ),
+        STRATEGY_DCT32X64 => (ctx.dc_from_dct32x64)(
+            coeffs.first_chunk::<2048>().unwrap(),
+            dc.first_chunk_mut::<32>().unwrap(),
+        ),
+        // 4 rows x 2 columns (cov_x = 2, cov_y = 4).
+        STRATEGY_DCT32X16 => (ctx.dc_from_dct32x16)(
+            coeffs.first_chunk::<512>().unwrap(),
+            dc.first_chunk_mut::<8>().unwrap(),
+        ),
+        // 2 rows x 4 columns (cov_x = 4, cov_y = 2).
+        STRATEGY_DCT16X32 => (ctx.dc_from_dct16x32)(
+            coeffs.first_chunk::<512>().unwrap(),
+            dc.first_chunk_mut::<8>().unwrap(),
+        ),
+        // Four values along the long axis, a 4x1 column or a 1x4 row.
+        STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => (ctx.dc_from_dct8x32)(
+            coeffs.first_chunk::<256>().unwrap(),
+            dc.first_chunk_mut::<4>().unwrap(),
+        ),
+        STRATEGY_DCT128X128 => (ctx.dc_from_dct128x128)(
+            coeffs.first_chunk::<16384>().unwrap(),
+            dc.first_chunk_mut::<256>().unwrap(),
+        ),
+        STRATEGY_DCT128X64 => (ctx.dc_from_dct128x64)(
+            coeffs.first_chunk::<8192>().unwrap(),
+            dc.first_chunk_mut::<128>().unwrap(),
+        ),
+        STRATEGY_DCT64X128 => (ctx.dc_from_dct64x128)(
+            coeffs.first_chunk::<8192>().unwrap(),
+            dc.first_chunk_mut::<128>().unwrap(),
+        ),
+        _ => unreachable!("invalid raw strategy {raw_strategy}"),
+    }
+}
+
 /// Wide levels used by DC-step pricing and the plain modular lattice. Keep
 /// Rust's ties-away rounding and saturating float-to-integer conversion.
 #[allow(dead_code)]
@@ -2012,114 +2084,8 @@ pub(crate) fn write_ac_group(
                 // dc_vals[c] holds up to 4 DC values (DCT16X16 = 2×2 covered blocks);
                 // indexing is didx = iy * cov_x + ix.
                 let mut dc_vals = [[0.0f32; 256]; 3];
-                match raw_strategy {
-                    STRATEGY_DCT
-                    | STRATEGY_IDENTITY
-                    | STRATEGY_DCT2X2
-                    | STRATEGY_DCT4X4
-                    | STRATEGY_DCT4X8
-                    | STRATEGY_DCT8X4
-                    | STRATEGY_AFV0..=STRATEGY_AFV3 => {
-                        for c in 0..3 {
-                            dc_vals[c][0] = coeffs[c][0];
-                        }
-                    }
-                    STRATEGY_DCT16X8 => {
-                        for c in 0..3 {
-                            let cb: &[f32; 128] = coeffs[c].first_chunk::<128>().unwrap();
-                            dc_from_dct16x8(cb, dc_vals[c].first_chunk_mut::<2>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT8X16 => {
-                        for c in 0..3 {
-                            let cb: &[f32; 128] = coeffs[c].first_chunk::<128>().unwrap();
-                            dc_from_dct8x16(cb, dc_vals[c].first_chunk_mut::<2>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT16X16 => {
-                        // dc_from_dct16x16 returns 4 DC values in [TL, TR, BL, BR]
-                        // order, matching the [iy=0,1][ix=0,1] grid the caller uses
-                        // (didx = iy * 2 + ix).
-                        for c in 0..3 {
-                            let cb: &[f32; 256] = coeffs[c].first_chunk::<256>().unwrap();
-                            dc_from_dct16x16(cb, dc_vals[c].first_chunk_mut::<4>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT32X32 => {
-                        // dc_from_dct32x32 returns 16 DC values in the 4×4 grid the
-                        // caller uses (didx = iy * 4 + ix).
-                        for c in 0..3 {
-                            let cb: &[f32; 1024] = coeffs[c].first_chunk::<1024>().unwrap();
-                            (ctx.dc_from_dct32x32)(cb, dc_vals[c].first_chunk_mut::<16>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT64X64 => {
-                        for c in 0..3 {
-                            let cb: &[f32; 4096] = coeffs[c].first_chunk::<4096>().unwrap();
-                            (ctx.dc_from_dct64x64)(cb, dc_vals[c].first_chunk_mut::<64>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT64X32 => {
-                        for c in 0..3 {
-                            let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
-                            (ctx.dc_from_dct64x32)(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT32X64 => {
-                        for c in 0..3 {
-                            let cb: &[f32; 2048] = coeffs[c].first_chunk::<2048>().unwrap();
-                            (ctx.dc_from_dct32x64)(cb, dc_vals[c].first_chunk_mut::<32>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT32X16 => {
-                        // 8 DC values in a 4-row × 2-col grid (didx = iy*2 + ix),
-                        // matching cov_x=2, cov_y=4.
-                        for c in 0..3 {
-                            let cb: &[f32; 512] = coeffs[c].first_chunk::<512>().unwrap();
-                            (ctx.dc_from_dct32x16)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT16X32 => {
-                        // 8 DC values in a 2-row × 4-col grid (didx = iy*4 + ix),
-                        // matching cov_x=4, cov_y=2.
-                        for c in 0..3 {
-                            let cb: &[f32; 512] = coeffs[c].first_chunk::<512>().unwrap();
-                            (ctx.dc_from_dct16x32)(cb, dc_vals[c].first_chunk_mut::<8>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
-                        // Four DC values along the long axis: a 4x1 column or
-                        // 1x4 row, both in didx order.
-                        for c in 0..3 {
-                            let cb: &[f32; 256] = coeffs[c].first_chunk::<256>().unwrap();
-                            (ctx.dc_from_dct8x32)(cb, dc_vals[c].first_chunk_mut::<4>().unwrap());
-                        }
-                    }
-                    STRATEGY_DCT128X128 => {
-                        for c in 0..3 {
-                            (ctx.dc_from_dct128x128)(
-                                coeffs[c].first_chunk::<16384>().unwrap(),
-                                dc_vals[c].first_chunk_mut::<256>().unwrap(),
-                            );
-                        }
-                    }
-                    STRATEGY_DCT128X64 => {
-                        for c in 0..3 {
-                            (ctx.dc_from_dct128x64)(
-                                coeffs[c].first_chunk::<8192>().unwrap(),
-                                dc_vals[c].first_chunk_mut::<128>().unwrap(),
-                            );
-                        }
-                    }
-                    STRATEGY_DCT64X128 => {
-                        for c in 0..3 {
-                            (ctx.dc_from_dct64x128)(
-                                coeffs[c].first_chunk::<8192>().unwrap(),
-                                dc_vals[c].first_chunk_mut::<128>().unwrap(),
-                            );
-                        }
-                    }
-                    _ => unreachable!(),
+                for c in 0..3 {
+                    dc_from_coefficients(ctx, raw_strategy, &coeffs[c], &mut dc_vals[c]);
                 }
 
                 // Hit channels: the DC values the skipped transform would have given.

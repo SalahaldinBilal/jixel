@@ -2927,6 +2927,27 @@ mod tests {
     }
 
     #[test]
+    fn slow_encodes_short_wide_strips() {
+        for (width, height) in [(1598usize, 9usize), (1598, 1), (9, 1598), (777, 15)] {
+            let mut pixels = Vec::with_capacity(width * height * 3);
+            for y in 0..height {
+                for x in 0..width {
+                    let v = ((x * 37 + y * 101) ^ (x * y)) as u8;
+                    pixels.extend_from_slice(&[v, v.wrapping_mul(3), 255 - v]);
+                }
+            }
+            for distance in [0.5f32, 1.0, 3.0] {
+                let config = EncodeConfig::default()
+                    .with_distance(distance)
+                    .with_speed(Speed::Slow);
+                let bytes = encode_image(&pixels, width, height, &config)
+                    .unwrap_or_else(|e| panic!("{width}x{height} d={distance}: {e:?}"));
+                assert!(!bytes.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn default_speed_is_fast() {
         assert_eq!(Speed::default(), Speed::Fast);
         assert_eq!(EncodeConfig::default().speed, Speed::Fast);

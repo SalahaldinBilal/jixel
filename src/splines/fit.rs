@@ -49,7 +49,7 @@ static SIGMA_LATTICE: [i32; 8] = [1, 2, 3, 4, 5, 6, 8, 10];
 const SEEDED_WIDTHS: usize = 2;
 const SCALE_TO_SIGMA: (f32, f32) = (0.86, -0.21);
 static FIT_CHANNEL_WEIGHT: [f64; 3] = [14.0, 1.0, 0.6];
-const MIN_EXPLAINED: f64 = 0.5;
+const MIN_EXPLAINED: f64 = 0.3;
 const REFINE_MIN_EXPLAINED: f64 = 0.6;
 const MIN_ARC: f32 = 4.0;
 const ARC_PER_COEFF: f32 = 10.0;
@@ -70,7 +70,7 @@ const COMPACT_COEFFS: usize = 6;
 const REFINE_NEIGHBOURS: usize = 3;
 const WEIGHT_LUT_STEPS: f32 = 32.0;
 /// Unrefined fits slightly below `MIN_EXPLAINED` may still get there after refinement.
-const QUICK_MIN_EXPLAINED: f64 = 0.45;
+const QUICK_MIN_EXPLAINED: f64 = 0.27;
 /// Long faint lines get the cheapest representation there is: sparse control
 /// points, luma only, one to three coefficients. Anything richer fits grain.
 const LONG_LINE_MIN_SPACING: f32 = 64.0;
@@ -1196,9 +1196,12 @@ fn expand(
             }
         }
     }
+    // A fit explaining less than half its footprint is admitted on the gate's
+    // say-so alone; weight its bits by how far below that it sits.
+    let bits_factor = (0.5 / fit.explained() as f32).max(1.0).powi(2);
     Some(Candidate {
         alts,
-        bits_factor: 1.0,
+        bits_factor,
         dot: false,
     })
 }

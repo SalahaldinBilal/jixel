@@ -39,8 +39,8 @@ fn gradient_region_stats_impl<const CHROMA: bool>(
 ) -> crate::ac_strategy::GradientRegionStats {
     if !w.is_multiple_of(4)
         || !h.is_multiple_of(4)
-        || px0 > opsin.xsize().saturating_sub(w)
-        || py0 > opsin.ysize().saturating_sub(h)
+        || px0 + w > opsin.xsize()
+        || py0 + h > opsin.ysize()
     {
         return if CHROMA {
             crate::ac_strategy::gradient_region_stats_with_chroma_scalar(opsin, px0, py0, w, h, eps)

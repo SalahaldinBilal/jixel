@@ -100,35 +100,13 @@ pub(super) fn skip_dc_smoothing(
     cfl: crate::color_correlation::CflFrame,
     reconstruct_row: ReconstructDcFn,
 ) -> Result<bool, EncodeError> {
-    const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
     let (w, h) = (dim.xsize_blocks, dim.ysize_blocks);
     // The decoder never smooths the outermost blocks.
     if w <= 2 || h <= 2 {
         return Ok(true);
     }
-    let steps: [f32; 3] = std::array::from_fn(|c| {
-        distp.dc_step[c] / (crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc)
-    });
-    let cfl_b = crate::color_correlation::dc_cfl_factor(distp.dc_step, ytob_dc, cfl);
-    let cfl_x = crate::color_correlation::dc_cfl_factor_x(distp.dc_step, cfl.base_x);
-    let mut recon = Image3F::try_new(w, h)?;
-    for (dc, &(gx, gy)) in dc_datas.iter().zip(group_coords) {
-        let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
-        let q = &dc.quant_dc;
-        for ly in 0..q.ysize() {
-            let [rx, ry, rb] = recon.all_plane_rows_mut(oy + ly);
-            reconstruct_row(
-                std::array::from_fn(|c| q.plane_row(c, ly)),
-                [cfl_x, cfl_b],
-                steps,
-                [
-                    &mut rx[ox..ox + q.xsize()],
-                    &mut ry[ox..ox + q.xsize()],
-                    &mut rb[ox..ox + q.xsize()],
-                ],
-            );
-        }
-    }
+    let steps = dc_value_steps(distp);
+    let recon = dequantized_dc(dim, dc_datas, group_coords, distp, ytob_dc, cfl, reconstruct_row)?;
 
     // Fixed bands and ordered reduction keep the decision independent of the
     // worker count. Avoid dispatch overhead on small images.
@@ -150,6 +128,49 @@ pub(super) fn skip_dc_smoothing(
             .sum::<Result<f32, EncodeError>>()?
     };
     Ok(delta >= 0.0)
+}
+
+/// Value-domain DC step per channel.
+fn dc_value_steps(distp: &DistanceParams) -> [f32; 3] {
+    std::array::from_fn(|c| {
+        distp.dc_step[c] / (crate::quant_weights::INV_DC_QUANT[c] * distp.scale_dc)
+    })
+}
+
+/// The decoder's dequantized DC (chroma-from-luma applied) of the whole
+/// frame, one value per 8x8 block, before adaptive smoothing.
+fn dequantized_dc(
+    dim: &ImageDim,
+    dc_datas: &[DcGroupData],
+    group_coords: &[(usize, usize)],
+    distp: &DistanceParams,
+    ytob_dc: i32,
+    cfl: crate::color_correlation::CflFrame,
+    reconstruct_row: ReconstructDcFn,
+) -> Result<Image3F, EncodeError> {
+    const DC_GROUP_BLOCKS: usize = K_DC_GROUP_DIM / K_BLOCK_DIM;
+    let steps = dc_value_steps(distp);
+    let cfl_b = crate::color_correlation::dc_cfl_factor(distp.dc_step, ytob_dc, cfl);
+    let cfl_x = crate::color_correlation::dc_cfl_factor_x(distp.dc_step, cfl.base_x);
+    let mut recon = Image3F::try_new(dim.xsize_blocks, dim.ysize_blocks)?;
+    for (dc, &(gx, gy)) in dc_datas.iter().zip(group_coords) {
+        let (ox, oy) = (gx * DC_GROUP_BLOCKS, gy * DC_GROUP_BLOCKS);
+        let q = &dc.quant_dc;
+        for ly in 0..q.ysize() {
+            let [rx, ry, rb] = recon.all_plane_rows_mut(oy + ly);
+            reconstruct_row(
+                std::array::from_fn(|c| q.plane_row(c, ly)),
+                [cfl_x, cfl_b],
+                steps,
+                [
+                    &mut rx[ox..ox + q.xsize()],
+                    &mut ry[ox..ox + q.xsize()],
+                    &mut rb[ox..ox + q.xsize()],
+                ],
+            );
+        }
+    }
+    Ok(recon)
 }
 
 #[inline]

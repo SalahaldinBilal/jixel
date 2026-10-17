@@ -3555,8 +3555,7 @@ mod encode_smoke_tests {
         let config = EncodeConfig::default()
             .with_distance(1.5)
             .with_ink_layer(true)
-            .with_patches(false)
-            .with_splines(false);
+            .with_patches(false);
         let single =
             encode_image(&rgb, width, height, &config.clone().with_num_threads(1)).unwrap();
         let parallel =

@@ -574,6 +574,7 @@ fn tokenize_all_with_wp(
         scratch,
         wp_params,
         None,
+        None,
     );
     let total_len = channel_tokens.iter().map(Vec::len).sum();
     let mut out = Vec::with_capacity(total_len);
@@ -602,6 +603,7 @@ pub(super) fn tokenize_channels_with_wp(
     scratch: &mut CoderScratch,
     wp_params: WpParams,
     alpha_constant: Option<i32>,
+    buckets: Option<&[WpChannelContexts]>,
 ) -> Vec<Vec<Token>> {
     let nb_chans = num_color + if alpha.is_some() { 1 } else { 0 };
     pool.steal_map(scratch, nb_chans, |chan, scratch| {
@@ -624,6 +626,7 @@ pub(super) fn tokenize_channels_with_wp(
             &mut scratch.gradient,
             &mut out,
             wp_params,
+            buckets.map(|buckets| &buckets[chan]),
         );
         out
     })
@@ -648,6 +651,7 @@ pub(super) fn tokenize_runs_with_wp(
     scratch: &mut CoderScratch,
     wp_params: WpParams,
     alpha_constant: Option<i32>,
+    buckets: Option<&[WpChannelContexts]>,
 ) -> Vec<LzToken> {
     let nb_chans = num_color + usize::from(alpha.is_some());
     let mut out = RunLzWriter::with_capacity(gw * gh * nb_chans);
@@ -670,6 +674,7 @@ pub(super) fn tokenize_runs_with_wp(
             &mut scratch.gradient,
             &mut out,
             wp_params,
+            buckets.map(|buckets| &buckets[chan]),
         );
         out.finish_channel();
     }
@@ -692,9 +697,58 @@ fn tokenize_channel_with_wp(
     gradient: &mut GradientScratch,
     out: &mut impl TokenSink,
     wp_params: WpParams,
+    buckets: Option<&WpChannelContexts>,
 ) {
     let nb_chans = num_color + usize::from(alpha.is_some());
     let ctx = channel_to_context(chan, nb_chans);
+    if let Some(buckets) = buckets {
+        debug_assert_eq!(predictors[chan], PREDICTOR_WEIGHTED);
+        let ctx = WpBucketContexts(buckets);
+        if chan < num_color {
+            tokenize_wp_row_slices(
+                ctx,
+                |gy| &linear.plane_row(chan, y0 + gy)[x0..x0 + gw],
+                gw,
+                gh,
+                out,
+                wp_params,
+                &mut gradient.wp,
+            );
+            return;
+        }
+        let alpha = alpha.expect("alpha channel must exist");
+        let row = |gy: usize| (y0 + gy) * xsize + x0;
+        match alpha {
+            AlphaPlane::U8(data) => tokenize_wp_row_slices(
+                ctx,
+                |gy| &data[row(gy)..row(gy) + gw],
+                gw,
+                gh,
+                out,
+                wp_params,
+                &mut gradient.wp,
+            ),
+            AlphaPlane::U16 { data, .. } => tokenize_wp_row_slices(
+                ctx,
+                |gy| &data[row(gy)..row(gy) + gw],
+                gw,
+                gh,
+                out,
+                wp_params,
+                &mut gradient.wp,
+            ),
+            AlphaPlane::F32(data) => tokenize_wp_row_slices(
+                ctx,
+                |gy| &data[row(gy)..row(gy) + gw],
+                gw,
+                gh,
+                out,
+                wp_params,
+                &mut gradient.wp,
+            ),
+        }
+        return;
+    }
     if chan < num_color {
         if predictors[chan] == PREDICTOR_WEIGHTED {
             tokenize_wp_row_slices(
@@ -1077,11 +1131,66 @@ fn push_wp_token(ctx: u32, value: i64, prediction: i64, out: &mut impl TokenSink
     out.push_token(Token::new(ctx, pack_signed((value - prediction) as i32)));
 }
 
+/// Cut-offs on the WP error property (libjxl property 15) of the fixed flat
+/// context tree: every other entry of libjxl's `kWPFixedDC` table.
+pub(super) const WP_CONTEXT_CUTOFFS: [i32; 17] = [
+    -500, -255, -127, -63, -31, -15, -7, -3, 0, 3, 7, 15, 31, 63, 127, 255, 500,
+];
+/// Buckets of `WP_CONTEXT_CUTOFFS`: bucket `i` holds the values above exactly
+/// `i` cut-offs.
+pub(super) const WP_CONTEXT_BUCKETS: usize = WP_CONTEXT_CUTOFFS.len() + 1;
+const WP_BUCKET_LIMIT: i64 = 501;
+static WP_BUCKET_OF: [u8; 2 * WP_BUCKET_LIMIT as usize + 1] = {
+    let mut table = [0u8; 2 * WP_BUCKET_LIMIT as usize + 1];
+    let mut i = 0;
+    while i < table.len() {
+        let value = i as i32 - WP_BUCKET_LIMIT as i32;
+        let mut bucket = 0;
+        while bucket < WP_CONTEXT_CUTOFFS.len() && value > WP_CONTEXT_CUTOFFS[bucket] {
+            bucket += 1;
+        }
+        table[i] = bucket as u8;
+        i += 1;
+    }
+    table
+};
+
+/// Context of a WP-predicted pixel from its WP error property.
+pub(super) trait WpContext: Copy {
+    fn context(self, wp_prop: i64) -> u32;
+}
+
+impl WpContext for u32 {
+    #[inline(always)]
+    fn context(self, _wp_prop: i64) -> u32 {
+        self
+    }
+}
+
+/// One channel under the fixed WP context tree: the context of every bucket
+/// of `wp_prop >> shift`.
+pub(super) struct WpChannelContexts {
+    pub(super) contexts: [u32; WP_CONTEXT_BUCKETS],
+    pub(super) shift: u32,
+}
+
+#[derive(Clone, Copy)]
+struct WpBucketContexts<'a>(&'a WpChannelContexts);
+
+impl WpContext for WpBucketContexts<'_> {
+    #[inline(always)]
+    fn context(self, wp_prop: i64) -> u32 {
+        let value = wp_prop >> self.0.shift;
+        let index = value.clamp(-WP_BUCKET_LIMIT, WP_BUCKET_LIMIT) + WP_BUCKET_LIMIT;
+        self.0.contexts[WP_BUCKET_OF[index as usize] as usize]
+    }
+}
+
 /// The first, second, and interior row kernels deliberately have separate
 /// border handling. Besides keeping branches out of the interior loop, this is
 /// the dispatch seam for a future vector implementation of the row arithmetic.
 fn tokenize_wp_first_row<T: Copy>(
-    ctx: u32,
+    ctx: impl WpContext,
     current: &[T],
     wp: &mut WpState,
     out: &mut impl TokenSink,
@@ -1104,13 +1213,13 @@ fn tokenize_wp_first_row<T: Copy>(
                 north_north: left,
             },
         );
-        push_wp_token(ctx, value, prediction, out);
+        push_wp_token(ctx.context(wp.wp_prop), value, prediction, out);
         left = value;
     }
 }
 
 fn tokenize_wp_second_row<T: Copy>(
-    ctx: u32,
+    ctx: impl WpContext,
     current: &[T],
     north: &[T],
     wp: &mut WpState,
@@ -1122,7 +1231,7 @@ fn tokenize_wp_second_row<T: Copy>(
 }
 
 fn tokenize_wp_interior_row<T: Copy>(
-    ctx: u32,
+    ctx: impl WpContext,
     y: usize,
     current: &[T],
     north: &[T],
@@ -1146,12 +1255,12 @@ fn tokenize_wp_interior_row<T: Copy>(
                 north_north: n.top_top,
             },
         );
-        push_wp_token(ctx, value, prediction, out);
+        push_wp_token(ctx.context(wp.wp_prop), value, prediction, out);
     });
 }
 
 fn tokenize_wp_row_slices<'a, T: Copy + 'a>(
-    ctx: u32,
+    ctx: impl WpContext,
     get_row: impl Fn(usize) -> &'a [T],
     gw: usize,
     gh: usize,
@@ -1186,7 +1295,7 @@ fn tokenize_wp_row_slices<'a, T: Copy + 'a>(
 }
 
 fn tokenize_wp_rows_from_get(
-    ctx: u32,
+    ctx: impl WpContext,
     get: &impl Fn(usize, usize) -> i32,
     gw: usize,
     gh: usize,
@@ -1780,6 +1889,7 @@ mod tests {
                                             &mut scratch,
                                             &mut actual,
                                             params,
+                                            None,
                                         );
                                         assert_eq!(actual.len(), reference.len());
                                         assert!(
@@ -1816,6 +1926,7 @@ mod tests {
                                             &mut scratch,
                                             &mut runs,
                                             params,
+                                            None,
                                         );
                                         assert_eq!(runs.finish(), lz77_compress_runs(&reference));
                                     }

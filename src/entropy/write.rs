@@ -531,10 +531,8 @@ fn select_exhaustive_config(
     }
     let incumbent = select_hybrid_config_ans_sampled(values, 1, stride, 0.995, scratch);
     let cost = |i: usize| {
-        let counts: Vec<u32> = scratch.counts[i]
-            .iter()
-            .map(|&count| count.saturating_mul(stride as u32))
-            .collect();
+        let counts: [u32; ALPHABET_SIZE] =
+            std::array::from_fn(|symbol| scratch.counts[i][symbol].saturating_mul(stride as u32));
         let base = optimize_ans_histogram(&counts);
         let table = refine_ans_histogram_precision(&counts, &base).unwrap_or(base);
         super::ans::ans_data_bits(&counts, &table.freqs)
@@ -559,7 +557,9 @@ fn select_exhaustive_config(
         f64::INFINITY
     };
     for (i, &config) in HYBRID_CANDIDATES.iter().enumerate() {
-        if !valid(i) {
+        // The incumbent was priced above; repeating its deterministic table
+        // search cannot improve on itself or on an intervening winner.
+        if i == incumbent_index || !valid(i) {
             continue;
         }
         let candidate_cost = cost(i);
@@ -636,6 +636,9 @@ fn select_expanded_config(
         .find(|c| c.1 == incumbent)
         .map_or(f64::INFINITY, cost);
     for candidate in candidates.iter().take(4) {
+        if candidate.1 == incumbent {
+            continue;
+        }
         let bits = cost(candidate);
         if bits < best_cost {
             best = candidate.1;

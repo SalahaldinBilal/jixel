@@ -510,6 +510,7 @@ fn local_palette_is_better(
         scratch,
         WpParams::DEFAULT,
         None,
+        None,
     );
     let plain_bits = estimated_local_lz_stream_bits(
         &plain_lz,
@@ -613,6 +614,10 @@ pub(super) fn build_local_palette_group_limited(
         h,
     })
 }
+
+/// Group step of the local-palette frame's plain-channel predictor costs
+/// under `local_palette_predictors` alone.
+const PLAIN_PREDICTOR_GROUP_STEP: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn try_encode_local_palette_multi_group(
@@ -722,7 +727,16 @@ pub(super) fn try_encode_local_palette_multi_group(
 
     // The global MA tree sees group-local channel slots. Pool predictor costs
     // for palette/index channels and ordinary YCoCg(A) channels by those slots.
-    let predictors: Vec<u32> = if speed.effort().predictor_search {
+    let predictors: Vec<u32> = if speed.effort().predictor_search
+        || speed.effort().local_palette_predictors
+    {
+        // Without `predictor_search` the plain channels are costed on a
+        // diagonal of every `PLAIN_PREDICTOR_GROUP_STEP`-th group.
+        let plain_step = if speed.effort().predictor_search {
+            1
+        } else {
+            PLAIN_PREDICTOR_GROUP_STEP
+        };
         // Split the remaining palette-meta and plain-channel work by group.
         // Each crop still resets WP; integer histogram merging leaves the
         // final costs and predictor tie-breaking unchanged.
@@ -750,6 +764,11 @@ pub(super) fn try_encode_local_palette_multi_group(
                             );
                         }
                         // Slot 1 already includes accepted palette indices.
+                        continue;
+                    }
+                    if !(group_index % xsize_groups + group_index / xsize_groups)
+                        .is_multiple_of(plain_step)
+                    {
                         continue;
                     }
 
@@ -853,6 +872,7 @@ pub(super) fn try_encode_local_palette_multi_group(
                             scratch,
                             WpParams::DEFAULT,
                             None,
+                            None,
                         );
                         deep_lz.as_ref().unwrap().with_depth(|depth| {
                             lz77_compress_channels_for_speed_with_depth(
@@ -877,6 +897,7 @@ pub(super) fn try_encode_local_palette_multi_group(
                             grad_pack_fn,
                             scratch,
                             WpParams::DEFAULT,
+                            None,
                             None,
                         )
                     }

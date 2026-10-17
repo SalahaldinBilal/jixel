@@ -104,6 +104,9 @@ effort_gates! {
     /// 16x16 transform layouts (DCT8 quad, DCT16, rectangle pairs) re-chosen by
     /// the closed loop's exact SSIMULACRA2 arbiter.
     layout_loop,
+    /// Exact DP re-tiling of closed 32x32 regions over 16-level pieces at any
+    /// offset; skipped where `layout_loop` re-chooses layouts exactly.
+    layout_retile,
     cfl_rdo,
     yellow_opsin,
     coeff_orders,
@@ -146,9 +149,19 @@ effort_gates! {
     lz_priced_search,
     predictor_search,
     rct_search,
+    /// RCT ranking scores every row (otherwise one row in `RCT_DENSE_ROW_STEP`).
+    rct_every_row,
+    /// RCT ranking scores one row in `RCT_DENSE_ROW_STEP` (otherwise one in
+    /// `RCT_SPARSE_ROW_STEP`).
+    rct_dense_rows,
     wp_search,
     /// Parallel per-group palettes behind a global coverage gate.
     local_palette_select,
+    /// Searched predictors for the local-palette frame (otherwise fixed).
+    local_palette_predictors,
+    /// Flat-path channels split their context on the WP error property at
+    /// fixed cut-offs (`WP_CONTEXT_CUTOFFS`).
+    flat_wp_contexts,
     /// Encode the normal frame too when a palette frame succeeded; keep the smaller.
     palette_dual,
     /// Meta-adaptive learned trees and the candidate-frame race.
@@ -165,6 +178,12 @@ effort_gates! {
     tree_dual_layout,
     /// Final RCT tree learns score more predictors on each side of a split.
     tree_wide_side_preds,
+    /// Final learns of sub-sampled sources keep the full leaf budget and split
+    /// candidates (otherwise `MA_LITE_MAX_LEAVES` and `MA_LITE_CANDIDATES`).
+    tree_deep_final,
+    /// Final learns sample their source afresh (otherwise they deepen the
+    /// ranking stage's sample set when it matches their own).
+    tree_fresh_final_samples,
     tree_global_palette,
     tree_group_palette,
     tree_ctx_v1,
@@ -194,11 +213,15 @@ const FAST: Effort = Effort {
     wide_clustering: true,
     ans_fast_refine: true,
     ans_recluster_coarse: true,
+    rct_search: true,
+    local_palette_predictors: true,
+    flat_wp_contexts: true,
     ..Effort::NONE
 };
 
 const MEDIUM: Effort = Effort {
     full_rerank: false,
+    layout_retile: false,
     learned_rate: false,
     coeff_orders: false,
     ac_ctx_plan: false,
@@ -209,11 +232,14 @@ const MEDIUM: Effort = Effort {
     ans_refine: false,
     lossy_modular_auto: false,
     splines: false,
+    rct_every_row: false,
     tree_rank_deep: false,
     tree_dense_sampling: false,
     tree_full_sampling: false,
     tree_dual_layout: false,
     tree_ctx_v1: false,
+    tree_deep_final: false,
+    tree_fresh_final_samples: false,
     patches_default: false,
     ..SLOW
 };

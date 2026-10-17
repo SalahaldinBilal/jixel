@@ -231,6 +231,7 @@ fn estimate_rct_cost(
     xsize: usize,
     ysize: usize,
     rct: u32,
+    row_step: usize,
     row_scratch: &mut GradientScratch,
     entropy_of_hist: EntropyOfHistFn,
 ) -> f32 {
@@ -245,6 +246,11 @@ fn estimate_rct_cost(
     let GradientScratch { prev, cur, .. } = row_scratch;
     let (mut prev, mut cur) = (prev, cur);
     for y in 0..ysize {
+        // A scored row needs its predecessor transformed as well.
+        let scored = y.is_multiple_of(row_step);
+        if !scored && !(y + 1).is_multiple_of(row_step) {
+            continue;
+        }
         let yy = &y_plane[y * xsize..][..xsize];
         let co = &co_plane[y * xsize..][..xsize];
         let cg = &cg_plane[y * xsize..][..xsize];
@@ -255,10 +261,12 @@ fn estimate_rct_cost(
         for (((&y_value, &co_value), &cg_value), ((a, b), c)) in inputs.zip(outputs) {
             (*a, *b, *c) = rct_from_ycocg_pixel(y_value, co_value, cg_value, rct);
         }
-        for (ch, chist) in hist.iter_mut().enumerate() {
-            let crow = &cur[ch * xsize..][..xsize];
-            let prow = &prev[ch * xsize..][..xsize];
-            extra_bits += rct_gradient_row(crow, prow, y == 0, chist);
+        if scored {
+            for (ch, chist) in hist.iter_mut().enumerate() {
+                let crow = &cur[ch * xsize..][..xsize];
+                let prow = &prev[ch * xsize..][..xsize];
+                extra_bits += rct_gradient_row(crow, prow, y == 0, chist);
+            }
         }
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -272,11 +280,13 @@ fn estimate_rct_cost(
 
 /// Estimate every candidate RCT and return the winner's planes when it is not
 /// YCoCg (in which case the caller keeps the input planes unchanged).
-/// Every candidate RCT with its estimated cost, cheapest first.
+/// Every candidate RCT with its estimated cost over every `row_step`-th row,
+/// cheapest first.
 pub(super) fn rank_rcts(
     linear: &Image3Si,
     xsize: usize,
     ysize: usize,
+    row_step: usize,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Vec<(u32, f32)> {
@@ -286,6 +296,7 @@ pub(super) fn rank_rcts(
             xsize,
             ysize,
             RCT_CANDIDATES[i],
+            row_step,
             &mut scratch.gradient,
             scratch.entropy_of_hist,
         )
@@ -295,20 +306,34 @@ pub(super) fn rank_rcts(
     ranked
 }
 
-/// The YCoCg planes re-expressed under `rct`.
-pub(super) fn rct_planes(linear: &Image3Si, xsize: usize, ysize: usize, rct: u32) -> Image3Si {
+/// The YCoCg planes re-expressed under `rct`, in parallel row bands.
+pub(super) fn rct_planes(
+    linear: &Image3Si,
+    xsize: usize,
+    ysize: usize,
+    rct: u32,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Image3Si {
     let mut out = Image3Si::new(xsize, ysize);
-    for y in 0..ysize {
-        let [o0, o1, o2] = out.all_plane_rows_mut(y);
-        let yy = &linear.plane_data(0)[y * xsize..][..xsize];
-        let co = &linear.plane_data(1)[y * xsize..][..xsize];
-        let cg = &linear.plane_data(2)[y * xsize..][..xsize];
-        let inputs = yy.iter().zip(co).zip(cg);
-        let outputs = o0.iter_mut().zip(o1).zip(o2);
+    let mut bands = out.row_bands_mut(pool.num_threads());
+    let mut starts = Vec::with_capacity(bands.len());
+    let mut start = 0;
+    for band in &bands {
+        starts.push(start);
+        start += band[0].len();
+    }
+    pool.steal_for_each_mut(scratch, &mut bands, |i, [o0, o1, o2], _scratch| {
+        let range = starts[i]..starts[i] + o0.len();
+        let inputs = linear.plane_data(0)[range.clone()]
+            .iter()
+            .zip(&linear.plane_data(1)[range.clone()])
+            .zip(&linear.plane_data(2)[range]);
+        let outputs = o0.iter_mut().zip(o1.iter_mut()).zip(o2.iter_mut());
         for (((&y_value, &co_value), &cg_value), ((a, b), c)) in inputs.zip(outputs) {
             (*a, *b, *c) = rct_from_ycocg_pixel(y_value, co_value, cg_value, rct);
         }
-    }
+    });
     out
 }
 
@@ -322,11 +347,11 @@ pub(super) fn select_rct(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<(u32, Image3Si)> {
-    let rct = rank_rcts(linear, xsize, ysize, pool, scratch)[0].0;
+    let rct = rank_rcts(linear, xsize, ysize, 1, pool, scratch)[0].0;
     if rct == 6 {
         return None;
     }
-    Some((rct, rct_planes(linear, xsize, ysize, rct)))
+    Some((rct, rct_planes(linear, xsize, ysize, rct, pool, scratch)))
 }
 
 #[cfg(test)]

@@ -30,6 +30,7 @@
 mod dc_rdo;
 mod dc_smoothing;
 mod loop_arbiter;
+mod loop_group_map;
 use dc_smoothing::{
     choose_chroma_dc_coding, compensate_b_dc, flatten_chroma_dc, skip_dc_smoothing,
 };
@@ -55,6 +56,7 @@ use crate::static_entropy_codes::{
 };
 use crate::util::EncodeError;
 use loop_arbiter::LoopArbiter;
+use loop_group_map::LoopGroupMap;
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM: usize = 64;
@@ -3789,33 +3791,34 @@ fn encode_frame_core(
             groups
         } else {
             let dc_ref = &dc_datas;
-            ctx.thread_pool.steal_map(scratch, ac_tasks.len(), |t, scratch| {
-                let (dc_idx, gx, gy) = ac_tasks[t];
-                let (dc_gx, dc_gy) = group_coords[dc_idx];
-                let (p, local, _, _, _) = process_ac_group(
-                    ctx,
-                    scratch,
-                    opsin,
-                    &dim,
-                    &distp,
-                    &dc_ref[dc_idx],
-                    num_passes,
-                    coeff_shifts,
-                    dc_gx,
-                    dc_gy,
-                    gx,
-                    gy,
-                    ytob_dc,
-                    Some(&prices),
-                    &coeff_orders,
-                    &order_alternatives,
-                    false,
-                    qf_threshold,
-                    false,
-                    None,
-                );
-                (dc_idx, gx, gy, p, local)
-            })
+            ctx.thread_pool
+                .steal_map(scratch, ac_tasks.len(), |t, scratch| {
+                    let (dc_idx, gx, gy) = ac_tasks[t];
+                    let (dc_gx, dc_gy) = group_coords[dc_idx];
+                    let (p, local, _, _, _) = process_ac_group(
+                        ctx,
+                        scratch,
+                        opsin,
+                        &dim,
+                        &distp,
+                        &dc_ref[dc_idx],
+                        num_passes,
+                        coeff_shifts,
+                        dc_gx,
+                        dc_gy,
+                        gx,
+                        gy,
+                        ytob_dc,
+                        Some(&prices),
+                        &coeff_orders,
+                        &order_alternatives,
+                        false,
+                        qf_threshold,
+                        false,
+                        None,
+                    );
+                    (dc_idx, gx, gy, p, local)
+                })
         };
         for (dc_idx, gx, gy, p, local) in refined {
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
@@ -4930,30 +4933,9 @@ fn run_quant_field_loop(
     let metric = |recon: &Image3F| reference.deficit_and_map(recon);
     let blocks_per_dc = K_DC_GROUP_DIM / K_BLOCK_DIM;
 
-    let locate = |bx: usize, by: usize| -> (usize, usize, usize) {
-        let dc_gx = bx * K_BLOCK_DIM / K_DC_GROUP_DIM;
-        let dc_gy = by * K_BLOCK_DIM / K_DC_GROUP_DIM;
-        let dc_idx = group_coords
-            .iter()
-            .position(|&c| c == (dc_gx, dc_gy))
-            .expect("dc group of block");
-        (
-            dc_idx,
-            bx - dc_gx * blocks_per_dc,
-            by - dc_gy * blocks_per_dc,
-        )
-    };
-    let mut task_of_block = vec![usize::MAX; xb * yb];
-    for by in 0..yb {
-        for bx in 0..xb {
-            let (dc_idx, lbx, lby) = locate(bx, by);
-            let (gx, gy) = (lbx / K_GROUP_DIM_IN_BLOCKS, lby / K_GROUP_DIM_IN_BLOCKS);
-            task_of_block[by * xb + bx] = ac_tasks
-                .iter()
-                .position(|&t| t == (dc_idx, gx, gy))
-                .expect("ac task of block");
-        }
-    }
+    let group_map = LoopGroupMap::new(w, h, group_coords, ac_tasks);
+    let locate = |bx, by| group_map.locate(bx, by);
+    let task_of_block = &group_map.task_of_block;
 
     #[derive(Clone)]
     struct Eval {
@@ -5094,38 +5076,41 @@ fn run_quant_field_loop(
         trial: false,
         hit_bits: vec![0.0; ac_tasks.len()],
     };
-    // Decoded DC of every 8x8 block from an evaluation's levels under `dp`.
+    // Trials overwrite a task's tokens and starts before reading them. Only
+    // pixels, DC and memo sync points are needed for untouched tasks.
+    let trial_eval = |e: &Eval| Eval {
+        recon: e.recon.clone(),
+        pending: vec![None; ac_tasks.len()],
+        quant_dc: e.quant_dc.clone(),
+        starts: vec![Vec::new(); ac_tasks.len()],
+        synced: e.synced.clone(),
+        trial: false,
+        hit_bits: vec![0.0; ac_tasks.len()],
+    };
+    let fill_decoded_dc =
+        |e: &Eval, dp: &DistanceParams, rect: crate::ssimulacra2::Rect, out: &mut Image3F| {
+            use crate::quant_weights::INV_DC_QUANT;
+            let steps: [f32; 3] =
+                std::array::from_fn(|c| dp.dc_step[c] / (INV_DC_QUANT[c] * dp.scale_dc));
+            let cfl = ctx.cfl_frame();
+            let cfl_b = crate::color_correlation::dc_cfl_factor(dp.dc_step, ytob_dc, cfl);
+            let cfl_x = crate::color_correlation::dc_cfl_factor_x(dp.dc_step, cfl.base_x);
+            group_map.reconstruct_dc(
+                &e.quant_dc,
+                [cfl_x, cfl_b],
+                steps,
+                ctx.dc_rows.reconstruct,
+                rect,
+                out,
+            );
+        };
     let decoded_dc = |e: &Eval, dp: &DistanceParams| -> Image3F {
-        use crate::quant_weights::INV_DC_QUANT;
-        let steps: [f32; 3] =
-            std::array::from_fn(|c| dp.dc_step[c] / (INV_DC_QUANT[c] * dp.scale_dc));
-        let cfl = ctx.cfl_frame();
-        let cfl_b = crate::color_correlation::dc_cfl_factor(dp.dc_step, ytob_dc, cfl);
-        let cfl_x = crate::color_correlation::dc_cfl_factor_x(dp.dc_step, cfl.base_x);
         let mut out = Image3F::new(xb, yb);
-        for (t, q) in e.quant_dc.iter().enumerate() {
-            let Some(q) = q else { continue };
-            let (dc_idx, gx, gy) = ac_tasks[t];
-            let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let bx0 = dc_gx * blocks_per_dc + gx * K_GROUP_DIM_IN_BLOCKS;
-            let by0 = dc_gy * blocks_per_dc + gy * K_GROUP_DIM_IN_BLOCKS;
-            let n = q.xsize();
-            for ly in 0..q.ysize() {
-                let [rx, ry, rb] = out.all_plane_rows_mut(by0 + ly);
-                (ctx.dc_rows.reconstruct)(
-                    std::array::from_fn(|c| &q.plane_row(c, ly)[..n]),
-                    [cfl_x, cfl_b],
-                    steps,
-                    [
-                        &mut rx[bx0..bx0 + n],
-                        &mut ry[bx0..bx0 + n],
-                        &mut rb[bx0..bx0 + n],
-                    ],
-                );
-            }
-        }
+        fill_decoded_dc(e, dp, crate::ssimulacra2::Rect::new(0, 0, w, h), &mut out);
         out
     };
+    // Small trials reuse one plane and reconstruct only cells the judge reads.
+    let mut trial_dc = None;
     let frame_bits = |e: &Eval| {
         prices.adaptive_bits(e.pending.iter().map(|p| {
             p.as_ref()
@@ -5224,6 +5209,16 @@ fn run_quant_field_loop(
         .map(|_| std::sync::Mutex::new(None))
         .collect();
     let memo: Option<&[_]> = Some(&memo[..]);
+    // Only between trials: layout snapshots retain offsets into these arenas.
+    let compact_memos = |tasks: &[usize]| {
+        if let Some(memo) = memo {
+            for &t in tasks {
+                if let Some(m) = memo[t].lock().expect("block memo").as_mut() {
+                    m.compact_tokens();
+                }
+            }
+        }
+    };
     let mut cur = new_eval();
     evaluate(
         ctx,
@@ -5273,23 +5268,28 @@ fn run_quant_field_loop(
     let rate_term = |bits: f32| 100.0 * (bits / ref_bits).ln();
     let pixels = (w * h) as f64;
     let mut cur_bits = ref_bits;
-    // The incremental state follows every accepted move exactly; built once
-    // here, it also provides the reference deficit and map.
+    // The incremental state follows every accepted move exactly. Defer the
+    // SSIM state until after the full-frame marginal scores: their temporary
+    // images would otherwise overlap its retained reconstruction pyramids.
     // Under the ColorVideoVDP arbiter it is also the exact metric; the
     // marginals that rank candidates still come from SSIMULACRA2.
     let cv_judge = (ctx.arbiter == Arbiter::Cvvdp && ctx.coding.is_xyb())
         .then(|| crate::cvvdp_arbiter::CvvdpArbiter::new(opsin))
         .flatten();
-    let mut loop_state: Option<LoopArbiter> = None;
-    let (mut cur_d, mut cur_map) = {
-        let state = loop_state.insert(match cv_judge {
-            Some(mut judge) => {
-                judge.reset(&cur.recon, &decoded_dc(&cur, distp));
-                LoopArbiter::Cvvdp(Box::new(judge))
-            }
-            None => LoopArbiter::Ssimulacra2(Box::new(reference.state(&cur.recon))),
-        });
-        (state.deficit(), state.map())
+    let mut loop_state = cv_judge.map(|mut judge| {
+        judge.reset(&cur.recon, &decoded_dc(&cur, distp));
+        LoopArbiter::Cvvdp(Box::new(judge))
+    });
+    if SHIFT_RDOQ && loop_state.is_none() {
+        loop_state = Some(LoopArbiter::Ssimulacra2(Box::new(
+            reference.state(&cur.recon),
+        )));
+    }
+    let mut cur_d = loop_state.as_ref().map_or(f32::NAN, LoopArbiter::deficit);
+    let mut cur_map = if SHIFT_RDOQ {
+        loop_state.as_ref().expect("shift judge").map()
+    } else {
+        Vec::new()
     };
     let mut moved = vec![0i8; n_tiles];
 
@@ -5302,8 +5302,8 @@ fn run_quant_field_loop(
     // Moves the exact arbiter already rejected are not tried again: later
     // iterations rejected them again at the cost of half the evaluations.
     let mut rejected_moves: std::collections::HashSet<(usize, i8)> = Default::default();
-    // Scratch evaluation of the greedy pass; equal to `cur` between rounds.
-    let mut cand = cur.clone();
+    // Allocate the greedy scratch after the full-frame marginal evaluations.
+    let mut greedy_eval = None;
     for iter in 0..MAX_ITERS {
         // Later iterations reuse the first iteration's marginals: the greedy
         // pass arbitrates every candidate exactly, so only the ranking is stale.
@@ -5417,12 +5417,13 @@ fn run_quant_field_loop(
             );
             restore(dc_datas, saved);
             let r_c = rate_term(frame_bits(&coarse));
-            // The three whole-frame scores are independent.
+            // Bound simultaneous whole-frame workspaces to two. This does not
+            // change any score or its reduction order; the coarse map is unused.
             let recons = [&plain.recon, &fine.recon, &coarse.recon];
             let mut scored = ctx
                 .thread_pool
-                .steal_map(scratch, 3, |i, _| metric(recons[i]));
-            let (d_c, _) = scored.pop().expect("coarse score");
+                .steal_map(scratch, 2, |i, _| metric(recons[i]));
+            let d_c = reference.deficit(recons[2]);
             let (d_f, fine_map) = scored.pop().expect("fine score");
             let (d_p, map_p) = if SHIFT_RDOQ {
                 (cur_d, cur_map.clone())
@@ -5495,9 +5496,16 @@ fn run_quant_field_loop(
             cached_moves = moves.clone();
             (slope, moves)
         };
+        if loop_state.is_none() {
+            let state = LoopArbiter::Ssimulacra2(Box::new(reference.state(&cur.recon)));
+            cur_d = state.deficit();
+            loop_state = Some(state);
+        }
         if moves.is_empty() {
             break;
         }
+        // Pixels and DC follow `cur`; evaluated tasks replace their tokens.
+        let cand = greedy_eval.get_or_insert_with(|| trial_eval(&cur));
         // Moves are ranked on SSIMULACRA2 marginals and accepted on the judge's.
         let slope = if loop_state.as_ref().is_some_and(LoopArbiter::needs_dc) {
             cv_slope
@@ -5509,14 +5517,12 @@ fn run_quant_field_loop(
         // Evaluate the top candidates one at a time with the real metric.
         // The state follows every accepted move exactly, so it is built once.
         let state = loop_state.as_mut().expect("loop judge");
-        // One scratch evaluation; the re-encoded groups' tokens and the
-        // pixels of the candidate's region are copied back and forth.
-        let copy_tasks =
+        // Tokens and starts are overwritten by the next evaluation. Restore
+        // only DC and pixels on rejection; move the token buffers on acceptance.
+        let sync_tasks =
             |from: &Eval, to: &mut Eval, tasks: &[usize], r: crate::ssimulacra2::Rect| {
                 for &task in tasks {
-                    to.pending[task] = from.pending[task].clone();
                     to.quant_dc[task] = from.quant_dc[task].clone();
-                    to.starts[task] = from.starts[task].clone();
                     to.synced[task] = from.synced[task];
                 }
                 for c in 0..3 {
@@ -5531,6 +5537,10 @@ fn run_quant_field_loop(
                 p.tokens[0].iter().map(|k| prices.token_bits(k)).sum()
             })
         };
+        // The incumbent only changes on acceptance. Preserve each reduction's
+        // exact f32 order, but do not repeat it for every rejected trial.
+        let mut cur_gbits: Vec<f32> = (0..ac_tasks.len()).map(|t| group_bits(&cur, t)).collect();
+        let mut cand_gbits = vec![0.0; ac_tasks.len()];
         // Rounds: candidates in distinct AC groups are re-encoded together in
         // one parallel pass, then arbitrated one by one with the exact metric.
         // At most `per_group` candidates per AC group per iteration: each extra
@@ -5565,6 +5575,7 @@ fn run_quant_field_loop(
             }
             remaining = deferred;
             let round_tasks: Vec<usize> = round.iter().flat_map(|r| r.2.iter().copied()).collect();
+            compact_memos(&round_tasks);
             let dirty = evaluate(
                 ctx,
                 scratch,
@@ -5583,7 +5594,7 @@ fn run_quant_field_loop(
                 Some(prices),
                 &round_tasks,
                 memo,
-                &mut cand,
+                cand,
             );
             for (t, step, tasks, saved) in round {
                 let mut region = crate::ssimulacra2::Rect {
@@ -5605,11 +5616,16 @@ fn run_quant_field_loop(
                         region.x1 = region.x1.max(r.x1);
                         region.y1 = region.y1.max(r.y1);
                     }
-                    delta_bits += group_bits(&cand, task) - group_bits(&cur, task);
+                    cand_gbits[task] = group_bits(cand, task);
+                    delta_bits += cand_gbits[task] - cur_gbits[task];
                 }
                 let d = if region.x1 > 0 {
-                    let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
-                    state.update_checkpointed(&cand.recon, dc.as_ref(), region, &mut aq_checkpoint)
+                    let dc = state.needs_dc().then(|| {
+                        let out = trial_dc.get_or_insert_with(|| Image3F::new(xb, yb));
+                        fill_decoded_dc(cand, distp, region, out);
+                        &*out
+                    });
+                    state.update_checkpointed(&cand.recon, dc, region, &mut aq_checkpoint)
                 } else {
                     cur_d
                 };
@@ -5628,7 +5644,12 @@ fn run_quant_field_loop(
                 if j > j_cur + 1e-7 {
                     moved[t] += step;
                     accepted_moves.push((t, step));
-                    copy_tasks(&cand, &mut cur, &tasks, region);
+                    for &task in &tasks {
+                        std::mem::swap(&mut cand.pending[task], &mut cur.pending[task]);
+                        std::mem::swap(&mut cand.starts[task], &mut cur.starts[task]);
+                        cur_gbits[task] = cand_gbits[task];
+                    }
+                    sync_tasks(cand, &mut cur, &tasks, region);
                     cur_bits = bits;
                     cur_d = d;
                     j_cur = j;
@@ -5638,18 +5659,22 @@ fn run_quant_field_loop(
                         state.rollback(&aq_checkpoint);
                     }
                     rejected_moves.insert((t, step));
-                    copy_tasks(&cur, &mut cand, &tasks, region);
+                    sync_tasks(&cur, cand, &tasks, region);
                     restore(dc_datas, saved);
                 }
             }
         }
         // exact frame bits after the round's approximate per-group deltas
         cur_bits = frame_bits(&cur);
-        cur_map = state.map();
+        if SHIFT_RDOQ {
+            cur_map = state.map();
+        }
         if !accepted {
             break;
         }
     }
+    drop(greedy_eval);
+    drop(cur_map);
     // ---- 128-family placement arbitrated by the loop's target ----
     // Each 128x128 site tries the 128 layouts (rect halves, rect pairs, the
     // square) on top of the current frame, re-encoded exactly (block memo,
@@ -5698,7 +5723,7 @@ fn run_quant_field_loop(
         };
         let state = loop_state.as_mut().expect("loop judge");
         let mut checkpoint = state.checkpoint();
-        let mut cand = cur.clone();
+        let mut cand = trial_eval(&cur);
         let mut j_cur = -cur_d - slope * rate_term(cur_bits);
         // Sites of each AC task, DC-group-local block coordinates.
         let sites: Vec<Vec<(usize, usize)>> = ac_tasks
@@ -5760,6 +5785,7 @@ fn run_quant_field_loop(
             let memo_snapshot = memo.and_then(|memo| {
                 let mut guard = memo[task].lock().expect("block memo");
                 let m = guard.as_mut()?;
+                m.compact_tokens();
                 let (lx, ly) = (
                     x - gx * K_GROUP_DIM_IN_BLOCKS,
                     y - gy * K_GROUP_DIM_IN_BLOCKS,
@@ -5802,10 +5828,9 @@ fn run_quant_field_loop(
                 p.tokens[0].iter().map(|k| prices.token_bits(k)).sum()
             })
         };
-        let copy_task = |from: &Eval, to: &mut Eval, task: usize, r: crate::ssimulacra2::Rect| {
-            to.pending[task] = from.pending[task].clone();
+        let mut cur_gbits: Vec<f32> = (0..ac_tasks.len()).map(|t| group_bits(&cur, t)).collect();
+        let sync_task = |from: &Eval, to: &mut Eval, task: usize, r: crate::ssimulacra2::Rect| {
             to.quant_dc[task] = from.quant_dc[task].clone();
-            to.starts[task] = from.starts[task].clone();
             to.synced[task] = from.synced[task];
             for c in 0..3 {
                 for y in r.y0..r.y1 {
@@ -5882,17 +5907,20 @@ fn run_quant_field_loop(
                 for (k, &t) in tasks.iter().enumerate() {
                     let r = dirty[k];
                     let d = if r.x1 > r.x0 {
-                        let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
-                        let d =
-                            state.update_checkpointed(&cand.recon, dc.as_ref(), r, &mut checkpoint);
+                        let dc = state.needs_dc().then(|| {
+                            let out = trial_dc.get_or_insert_with(|| Image3F::new(xb, yb));
+                            fill_decoded_dc(&cand, distp, r, out);
+                            &*out
+                        });
+                        let d = state.update_checkpointed(&cand.recon, dc, r, &mut checkpoint);
                         state.rollback(&checkpoint);
                         d
                     } else {
                         cur_d
                     };
-                    let bits = cur_bits + group_bits(&cand, t) - group_bits(&cur, t);
+                    let bits = cur_bits + group_bits(&cand, t) - cur_gbits[t];
                     out.push((t, -d - slope * rate_term(bits)));
-                    copy_task(&cur, &mut cand, t, r);
+                    sync_task(&cur, &mut cand, t, r);
                 }
                 for p in placed {
                     unplace(dc_datas, p);
@@ -5958,15 +5986,23 @@ fn run_quant_field_loop(
             for ((k, &t), p) in tasks.iter().enumerate().zip(placed) {
                 let r = dirty[k];
                 let d = if r.x1 > r.x0 {
-                    let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
-                    state.update_checkpointed(&cand.recon, dc.as_ref(), r, &mut checkpoint)
+                    let dc = state.needs_dc().then(|| {
+                        let out = trial_dc.get_or_insert_with(|| Image3F::new(xb, yb));
+                        fill_decoded_dc(&cand, distp, r, out);
+                        &*out
+                    });
+                    state.update_checkpointed(&cand.recon, dc, r, &mut checkpoint)
                 } else {
                     cur_d
                 };
-                let bits = cur_bits + group_bits(&cand, t) - group_bits(&cur, t);
+                let cand_gbits = group_bits(&cand, t);
+                let bits = cur_bits + cand_gbits - cur_gbits[t];
                 let j = -d - slope * rate_term(bits);
                 if j > j_cur + 1e-7 {
-                    copy_task(&cand, &mut cur, t, r);
+                    std::mem::swap(&mut cand.pending[t], &mut cur.pending[t]);
+                    std::mem::swap(&mut cand.starts[t], &mut cur.starts[t]);
+                    sync_task(&cand, &mut cur, t, r);
+                    cur_gbits[t] = cand_gbits;
                     cur_bits = bits;
                     cur_d = d;
                     j_cur = j;
@@ -5975,7 +6011,7 @@ fn run_quant_field_loop(
                     if r.x1 > r.x0 {
                         state.rollback(&checkpoint);
                     }
-                    copy_task(&cur, &mut cand, t, r);
+                    sync_task(&cur, &mut cand, t, r);
                     unplace(dc_datas, p);
                 }
             }
@@ -6053,7 +6089,7 @@ fn run_quant_field_loop(
         let slope = if cv_judged { cv_slope } else { cached_slope };
         let state = loop_state.as_mut().expect("loop judge");
         let mut checkpoint = state.checkpoint();
-        let mut cand = cur.clone();
+        let mut cand = trial_eval(&cur);
         let mut j_cur = -cur_d - slope * rate_term(cur_bits);
         // Only layouts whose classes the frame already uses (matrices, orders).
         let mut present = [false; NUM_STRATEGIES];
@@ -6077,18 +6113,27 @@ fn run_quant_field_loop(
         if present[STRATEGY_DCT8X16 as usize] {
             variants.push(vec![(STRATEGY_DCT8X16, 0, 0), (STRATEGY_DCT8X16, 0, 1)]);
         }
-        // Sites of each AC task, DC-group-local block coordinates.
+        // Sites of each AC task, DC-group-local block coordinates: the aligned
+        // grid first, then the three odd-offset grids (the format allows
+        // unaligned blocks; none may cross a 64px CfL tile).
         let sites: Vec<Vec<(usize, usize)>> = ac_tasks
             .iter()
             .map(|&(dc_idx, gx, gy)| {
                 let st = &dc_datas[dc_idx].ac_strategy;
                 let mut v = Vec::new();
-                for sy in (0..K_GROUP_DIM_IN_BLOCKS).step_by(2) {
-                    for sx in (0..K_GROUP_DIM_IN_BLOCKS).step_by(2) {
-                        let x = gx * K_GROUP_DIM_IN_BLOCKS + sx;
-                        let y = gy * K_GROUP_DIM_IN_BLOCKS + sy;
-                        if x + 2 <= st.xsize() && y + 2 <= st.ysize() {
-                            v.push((x, y));
+                for (px, py) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    for sy in (py..K_GROUP_DIM_IN_BLOCKS - 1).step_by(2) {
+                        for sx in (px..K_GROUP_DIM_IN_BLOCKS - 1).step_by(2) {
+                            if sx % K_TILE_DIM_IN_BLOCKS == K_TILE_DIM_IN_BLOCKS - 1
+                                || sy % K_TILE_DIM_IN_BLOCKS == K_TILE_DIM_IN_BLOCKS - 1
+                            {
+                                continue;
+                            }
+                            let x = gx * K_GROUP_DIM_IN_BLOCKS + sx;
+                            let y = gy * K_GROUP_DIM_IN_BLOCKS + sy;
+                            if x + 2 <= st.xsize() && y + 2 <= st.ysize() {
+                                v.push((x, y));
+                            }
                         }
                     }
                 }
@@ -6157,6 +6202,7 @@ fn run_quant_field_loop(
             let memo_snapshot = memo.and_then(|memo| {
                 let mut guard = memo[task].lock().expect("block memo");
                 let m = guard.as_mut()?;
+                m.compact_tokens();
                 let (lx, ly) = (
                     x - gx * K_GROUP_DIM_IN_BLOCKS,
                     y - gy * K_GROUP_DIM_IN_BLOCKS,
@@ -6281,9 +6327,12 @@ fn run_quant_field_loop(
                 for (k, &t) in tasks.iter().enumerate() {
                     let r = dirty[k];
                     let d = if r.x1 > r.x0 {
-                        let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
-                        let d =
-                            state.update_checkpointed(&cand.recon, dc.as_ref(), r, &mut checkpoint);
+                        let dc = state.needs_dc().then(|| {
+                            let out = trial_dc.get_or_insert_with(|| Image3F::new(xb, yb));
+                            fill_decoded_dc(&cand, distp, r, out);
+                            &*out
+                        });
+                        let d = state.update_checkpointed(&cand.recon, dc, r, &mut checkpoint);
                         state.rollback(&checkpoint);
                         d
                     } else {
@@ -6336,8 +6385,12 @@ fn run_quant_field_loop(
             for ((k, &t), p) in tasks.iter().enumerate().zip(placed) {
                 let r = dirty[k];
                 let d = if r.x1 > r.x0 {
-                    let dc = state.needs_dc().then(|| decoded_dc(&cand, distp));
-                    state.update_checkpointed(&cand.recon, dc.as_ref(), r, &mut checkpoint)
+                    let dc = state.needs_dc().then(|| {
+                        let out = trial_dc.get_or_insert_with(|| Image3F::new(xb, yb));
+                        fill_decoded_dc(&cand, distp, r, out);
+                        &*out
+                    });
+                    state.update_checkpointed(&cand.recon, dc, r, &mut checkpoint)
                 } else {
                     cur_d
                 };
@@ -6435,7 +6488,7 @@ fn run_quant_field_loop(
         let mut score = |e: &Eval| -> f32 {
             match judge.as_deref_mut() {
                 Some(judge) => judge.deficit_of(&e.recon, &decoded_dc(e, distp)),
-                None => metric(&e.recon).0,
+                None => reference.deficit(&e.recon),
             }
         };
         let arm_eval = |x: u32, b: u32, scratch: &mut CoderScratch| -> (Eval, f32) {
@@ -6443,6 +6496,7 @@ fn run_quant_field_loop(
             dp.x_qm_scale = x;
             ctx.set_b_qm_scale(b);
             let mut e = new_eval();
+            compact_memos(&all_tasks);
             evaluate(
                 ctx,
                 scratch,

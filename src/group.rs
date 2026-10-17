@@ -1541,9 +1541,35 @@ impl AcBlockCache {
         }
     }
 
+    /// Reclaim superseded token versions between trials, when no snapshot
+    /// holds arena offsets. Keep every referenced span, including cells hidden
+    /// by a larger transform: restoring a layout can make those cells live again.
+    pub(crate) fn compact_tokens(&mut self) {
+        let streams = self.tokens.len();
+        for (s, arena) in self.tokens.iter_mut().enumerate() {
+            let live: usize = self.spans[s..]
+                .iter()
+                .step_by(streams)
+                .map(|&(_, len)| len as usize)
+                .sum();
+            // Amortize the copy over at least one whole live set of discarded
+            // tokens. Tiny streams do not justify repeated allocations.
+            if arena.len() <= live.saturating_mul(2).max(4096) {
+                continue;
+            }
+            let mut compact = Vec::with_capacity(live);
+            for (start, len) in self.spans[s..].iter_mut().step_by(streams) {
+                let old_start = *start as usize;
+                *start = compact.len() as u32;
+                compact.extend_from_slice(&arena[old_start..old_start + *len as usize]);
+            }
+            *arena = compact;
+        }
+    }
+
     /// Everything the memo holds for the cells of a group-local block region,
-    /// so a trial layout there can be undone without re-encoding. The token
-    /// arenas are append-only, so the saved spans stay valid.
+    /// so a trial layout there can be undone without re-encoding. Between the
+    /// snapshot and its restore/discard, arenas must stay append-only.
     pub(crate) fn snapshot(&self, x: usize, y: usize, w: usize, h: usize) -> MemoSnapshot {
         let mut snap = MemoSnapshot {
             rect: (x, y, w, h),
@@ -1858,6 +1884,9 @@ pub(crate) fn write_ac_group(
         recon: recon_scratch,
     } = scratch;
 
+    // Reuse this small vector across channels and blocks. Only memo misses
+    // need the offsets; ordinary encodes never read them.
+    let mut stream_starts = Vec::new();
     for by in 0..ysize_blocks {
         let nz_by = nzeros_by0 + by;
         let global_by = group_brect.y0 + by;
@@ -2798,11 +2827,14 @@ pub(crate) fn write_ac_group(
                     }
                     continue;
                 }
-                let stream_starts: Vec<usize> = out
-                    .iter()
-                    .map(|o| o.len())
-                    .chain(alternative_out.iter().map(|o| o.len()))
-                    .collect();
+                if token_memo && memo.is_some() {
+                    stream_starts.clear();
+                    stream_starts.extend(
+                        out.iter()
+                            .map(Vec::len)
+                            .chain(alternative_out.iter().map(Vec::len)),
+                    );
+                }
                 let full_block = &quantized[c][..size];
 
                 for pass in 0..coeff_shifts.len() {
@@ -2987,6 +3019,79 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn block_memo_compaction_preserves_all_streams_and_snapshot_rollback() {
+        use super::AcBlockCache;
+        use crate::entropy::Token;
+
+        let mut memo = AcBlockCache::new(2, 2, 16, 16);
+        memo.tokens = vec![Vec::new(); 3];
+        memo.spans = vec![(0, 0); 4 * 3 * 3];
+        let write = |memo: &mut AcBlockCache, cell: usize, version: u32| {
+            for c in 0..3 {
+                for s in 0..3 {
+                    let arena = &mut memo.tokens[s];
+                    let start = arena.len() as u32;
+                    // Include empty spans and different lengths across streams.
+                    let len = (cell + c + s) * 47;
+                    arena.extend(
+                        (0..len)
+                            .map(|i| Token::new((cell * 3 + c) as u32, version * 1000 + i as u32)),
+                    );
+                    memo.spans[(cell * 3 + c) * 3 + s] = (start, len as u32);
+                }
+            }
+        };
+        let read = |memo: &AcBlockCache| -> Vec<Vec<(u32, u32)>> {
+            memo.spans
+                .iter()
+                .enumerate()
+                .map(|(i, &(start, len))| {
+                    memo.tokens[i % 3][start as usize..(start + len) as usize]
+                        .iter()
+                        .map(|t| (t.context, t.value))
+                        .collect()
+                })
+                .collect()
+        };
+        for version in 0..80 {
+            write(&mut memo, version as usize % 4, version);
+            let expected = read(&memo);
+            memo.compact_tokens();
+            assert_eq!(read(&memo), expected);
+            for s in 0..3 {
+                let live: usize = memo.spans[s..]
+                    .iter()
+                    .step_by(3)
+                    .map(|&(_, len)| len as usize)
+                    .sum();
+                assert!(memo.tokens[s].len() <= (2 * live).max(4096));
+            }
+        }
+        // Snapshot offsets must remain valid until restore, even though the
+        // trial appends replacements both inside and outside the saved region.
+        let before = read(&memo);
+        let snapshot = memo.snapshot(1, 0, 1, 1);
+        write(&mut memo, 1, 100);
+        write(&mut memo, 2, 101);
+        let changed = read(&memo);
+        memo.restore(&snapshot);
+        drop(snapshot);
+        memo.compact_tokens();
+        let restored = read(&memo);
+        assert_eq!(&restored[9..18], &before[9..18]);
+        assert_eq!(&restored[18..27], &changed[18..27]);
+
+        // An entirely dead stream releases its old arena too.
+        memo.spans.fill((0, 0));
+        for arena in &mut memo.tokens {
+            arena.resize(8192, Token::new(0, 0));
+        }
+        memo.compact_tokens();
+        assert!(memo.tokens.iter().all(|arena| arena.capacity() == 0));
+        AcBlockCache::new(0, 0, 0, 0).compact_tokens();
+    }
+
     #[test]
     fn ac_scratch_allocates_optional_buffers_only_for_active_tools_and_reuses_them() {
         use super::{AcGroupScratch, write_ac_group};

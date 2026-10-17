@@ -79,10 +79,11 @@ pub(crate) use predictor::{
     GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
 };
 use predictor::{
-    PREDICTOR_GRADIENT, PREDICTOR_WEIGHTED, PredictorNeighbors, channel_to_context,
-    choose_predictor_for_plane, choose_predictors_with_wp, choose_wp_params, fixed_predictor,
-    predictor_neighbors, predictor_value, tokenize_all, tokenize_channels_with_wp, tokenize_plane,
-    tokenize_plane_rows, tokenize_runs_with_wp,
+    PREDICTOR_GRADIENT, PREDICTOR_WEIGHTED, PredictorNeighbors, WP_CONTEXT_BUCKETS,
+    WP_CONTEXT_CUTOFFS, WpChannelContexts, channel_to_context, choose_predictor_for_plane,
+    choose_predictors_with_wp, choose_wp_params, fixed_predictor, predictor_neighbors,
+    predictor_value, tokenize_all, tokenize_channels_with_wp, tokenize_plane, tokenize_plane_rows,
+    tokenize_runs_with_wp,
 };
 pub(crate) use rct::forward_ycocg;
 use rct::{rank_rcts, rct_planes as rct_planes_fn, write_rct_transform};
@@ -133,6 +134,9 @@ const SLOW_DEEP_LZ_MAX_THREADS: usize = 8;
 /// before Slow mode trusts it enough to omit the context/flat final encodes.
 /// Near decisions retain the exact byte-level tournament.
 const MA_DECISIVE_MIN_SAVINGS: f64 = 0.18;
+/// Row steps of the RCT ranking under `rct_dense_rows` and below it.
+const RCT_DENSE_ROW_STEP: usize = 4;
+const RCT_SPARSE_ROW_STEP: usize = 16;
 /// A learned tree estimated to save at least this fraction over the flat
 /// coder also skips the v1 context-tree and flat frame candidates.
 const MA_ALTERNATIVES_MIN_SAVINGS: f64 = 0.05;
@@ -601,6 +605,8 @@ fn coarse_frame_bits(
         min_symbol,
         WpParams::DEFAULT,
         use_wp,
+        GroupLayout::LARGE,
+        MA_FULL_SAMPLING,
         pool,
         scratch,
     )?;
@@ -848,7 +854,14 @@ fn encode_frame_lossless_core_impl(
     let mut rct_planes: Option<Image3Si> = None;
     let rct_ranked: Vec<(u32, f32)> =
         if frame_kind.allows_learned_tree() && effort.rct_search && num_color == 3 {
-            rank_rcts(linear, xsize, ysize, pool, scratch)
+            let row_step = if effort.rct_every_row {
+                1
+            } else if effort.rct_dense_rows {
+                RCT_DENSE_ROW_STEP
+            } else {
+                RCT_SPARSE_ROW_STEP
+            };
+            rank_rcts(linear, xsize, ysize, row_step, pool, scratch)
         } else {
             Vec::new()
         };
@@ -856,7 +869,7 @@ fn encode_frame_lossless_core_impl(
         && t != 6
     {
         rct_type = t;
-        rct_planes = Some(rct_planes_fn(linear, xsize, ysize, t));
+        rct_planes = Some(rct_planes_fn(linear, xsize, ysize, t, pool, scratch));
     }
     // The palette candidate below needs the untransformed YCoCg planes.
     let ycocg = linear;
@@ -908,119 +921,6 @@ fn encode_frame_lossless_core_impl(
         // candidate must clear before it is grown into a complete frame.
         let mut best_source_coarse;
         let mut rank_pal = compare_tree_candidates && palette.is_some();
-        let mut final_sampling = if effort.tree_full_sampling {
-            (MA_TARGET_SAMPLES, MA_FULL_SAMPLE_LIMIT)
-        } else {
-            (MA_LITE_TARGET_SAMPLES, MA_LITE_FULL_SAMPLE_LIMIT)
-        };
-        let mut pal_wp = wp_params;
-        if compare_tree_candidates
-            && effort.tree_rank
-            && matches!(decoding_speed, crate::DecodingSpeed::Slow)
-        {
-            let rgb_stage = {
-                let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
-                rank_coarse(
-                    &source, xsize, ysize, min_symbol, wp_params, use_wp, pool, scratch,
-                )
-            };
-            let pal_stage = palette.as_ref().and_then(|p| {
-                let source = p.source(xsize, ysize);
-                rank_coarse(
-                    &source, xsize, ysize, min_symbol, wp_params, use_wp, pool, scratch,
-                )
-            });
-            let coarse_of = |stage: &Option<CoarseLearn>| {
-                stage.as_ref().map_or(f64::INFINITY, |s| {
-                    s.candidate.est_real + header_bits(wp_params)
-                })
-            };
-            let (rgb_coarse, pal_coarse) = (coarse_of(&rgb_stage), coarse_of(&pal_stage));
-            if effort.tree_dense_sampling
-                && rgb_stage.as_ref().is_some_and(|stage| {
-                    stage.candidate.est_real
-                        >= DENSE_FINAL_MIN_BITS_PER_VALUE
-                            * source_values_of(xsize, ysize, coded_chans) as f64
-                })
-            {
-                final_sampling = (MA_FINAL_TARGET_SAMPLES, MA_FINAL_FULL_SAMPLE_LIMIT);
-            }
-            rank_rgb = rgb_coarse <= pal_coarse * PALETTE_COARSE_MARGIN;
-            rank_pal = pal_stage.is_some() && pal_coarse <= rgb_coarse * PALETTE_COARSE_MARGIN;
-
-            let rank_more = source_values_of(xsize, ysize, coded_chans) >= RANK_MIN_VALUES;
-            if rank_rgb && rank_more {
-                let (mut best_bits, mut best_coarse, params) = {
-                    let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
-                    rank_presets(
-                        &source,
-                        xsize,
-                        ysize,
-                        min_symbol,
-                        use_wp,
-                        rgb_stage,
-                        wp_params,
-                        &header_bits,
-                        effort.tree_rank_deep,
-                        pool,
-                        scratch,
-                    )
-                };
-                wp_params = params;
-                // Transform runner-up with the chosen preset, same coarse prune.
-                if let Some(&(runner_up, cost)) = rct_ranked.get(1)
-                    && cost <= rct_ranked[0].1 * RCT_RANK_MARGIN
-                {
-                    let planes =
-                        (runner_up != 6).then(|| rct_planes_fn(ycocg, xsize, ysize, runner_up));
-                    let source = rgb_ma_source(
-                        planes.as_ref().unwrap_or(ycocg),
-                        alpha,
-                        xsize,
-                        runner_up,
-                        alpha_constant,
-                    );
-                    if let Some(stage) = rank_coarse(
-                        &source, xsize, ysize, min_symbol, wp_params, use_wp, pool, scratch,
-                    ) && stage.candidate.est_real + header_bits(wp_params)
-                        <= best_coarse * RANK_COARSE_PRUNE
-                    {
-                        best_coarse =
-                            best_coarse.min(stage.candidate.est_real + header_bits(wp_params));
-                        let bits = rank_bits(&stage) + header_bits(wp_params);
-                        if bits < best_bits {
-                            best_bits = bits;
-                            rct_type = runner_up;
-                            rct_planes = planes;
-                        }
-                    }
-                }
-                let _ = (best_bits, best_coarse);
-            }
-            if rank_pal
-                && rank_more
-                && effort.tree_rank_deep
-                && let Some(p) = &palette
-            {
-                let source = p.source(xsize, ysize);
-                let (_, _, params) = rank_presets(
-                    &source,
-                    xsize,
-                    ysize,
-                    min_symbol,
-                    use_wp,
-                    pal_stage,
-                    wp_params,
-                    &header_bits,
-                    true,
-                    pool,
-                    scratch,
-                );
-                pal_wp = params;
-            }
-        }
-        let linear = rct_planes.as_ref().unwrap_or(ycocg);
-
         // Group layout. With every decoding tool available, Slow lossless runs
         // the first learning stage (sampling plus a 32-leaf tree) under both
         // 1024- and 256-pixel groups.
@@ -1047,6 +947,180 @@ fn encode_frame_lossless_core_impl(
         } else {
             layouts
         };
+        // The ranking learns run under the first layout.
+        let rank_layout = layouts[0];
+        let mut final_sampling = if effort.tree_full_sampling {
+            MA_FULL_SAMPLING
+        } else {
+            MA_LITE_SAMPLING
+        };
+        let rank_sampling = final_sampling;
+        let mut pal_wp = wp_params;
+        // Ranking stages kept for the final learns (`tree_fresh_final_samples`).
+        let keep_stages = !effort.tree_fresh_final_samples;
+        let mut rgb_rank_stage: Option<CoarseLearn> = None;
+        let mut pal_rank_stage: Option<CoarseLearn> = None;
+        if compare_tree_candidates
+            && effort.tree_rank
+            && matches!(decoding_speed, crate::DecodingSpeed::Slow)
+        {
+            let mut rgb_stage = {
+                let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
+                rank_coarse(
+                    &source,
+                    xsize,
+                    ysize,
+                    min_symbol,
+                    wp_params,
+                    use_wp,
+                    rank_layout,
+                    rank_sampling,
+                    pool,
+                    scratch,
+                )
+            };
+            let mut pal_stage = palette.as_ref().and_then(|p| {
+                let source = p.source(xsize, ysize);
+                rank_coarse(
+                    &source,
+                    xsize,
+                    ysize,
+                    min_symbol,
+                    wp_params,
+                    use_wp,
+                    rank_layout,
+                    rank_sampling,
+                    pool,
+                    scratch,
+                )
+            });
+            let coarse_of = |stage: &Option<CoarseLearn>| {
+                stage.as_ref().map_or(f64::INFINITY, |s| {
+                    s.candidate.est_real + header_bits(wp_params)
+                })
+            };
+            let (rgb_coarse, pal_coarse) = (coarse_of(&rgb_stage), coarse_of(&pal_stage));
+            if effort.tree_dense_sampling
+                && rgb_stage.as_ref().is_some_and(|stage| {
+                    stage.candidate.est_real
+                        >= DENSE_FINAL_MIN_BITS_PER_VALUE
+                            * source_values_of(xsize, ysize, coded_chans) as f64
+                })
+            {
+                final_sampling = MA_DENSE_SAMPLING;
+            }
+            rank_rgb = rgb_coarse <= pal_coarse * PALETTE_COARSE_MARGIN;
+            rank_pal = pal_stage.is_some() && pal_coarse <= rgb_coarse * PALETTE_COARSE_MARGIN;
+
+            let rank_more = source_values_of(xsize, ysize, coded_chans) >= RANK_MIN_VALUES;
+            if rank_rgb && rank_more {
+                let (mut best_bits, mut best_coarse, params, stage) = {
+                    let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
+                    rank_presets(
+                        &source,
+                        xsize,
+                        ysize,
+                        min_symbol,
+                        use_wp,
+                        rgb_stage.take(),
+                        wp_params,
+                        &header_bits,
+                        effort.tree_rank_deep,
+                        rank_layout,
+                        rank_sampling,
+                        keep_stages,
+                        pool,
+                        scratch,
+                    )
+                };
+                wp_params = params;
+                rgb_stage = stage;
+                // Transform runner-up with the chosen preset, same coarse prune.
+                if let Some(&(runner_up, cost)) = rct_ranked.get(1)
+                    && cost <= rct_ranked[0].1 * RCT_RANK_MARGIN
+                {
+                    // One RGB sample set alive at a time: a losing runner-up
+                    // leaves the final learn to sample afresh.
+                    rgb_stage = None;
+                    let planes = (runner_up != 6)
+                        .then(|| rct_planes_fn(ycocg, xsize, ysize, runner_up, pool, scratch));
+                    let source = rgb_ma_source(
+                        planes.as_ref().unwrap_or(ycocg),
+                        alpha,
+                        xsize,
+                        runner_up,
+                        alpha_constant,
+                    );
+                    if let Some(stage) = rank_coarse(
+                        &source,
+                        xsize,
+                        ysize,
+                        min_symbol,
+                        wp_params,
+                        use_wp,
+                        rank_layout,
+                        rank_sampling,
+                        pool,
+                        scratch,
+                    ) && stage.candidate.est_real + header_bits(wp_params)
+                        <= best_coarse * RANK_COARSE_PRUNE
+                    {
+                        best_coarse =
+                            best_coarse.min(stage.candidate.est_real + header_bits(wp_params));
+                        let bits = rank_bits(&stage) + header_bits(wp_params);
+                        if bits < best_bits {
+                            best_bits = bits;
+                            rct_type = runner_up;
+                            rct_planes = planes;
+                            rgb_stage = keep_stages.then_some(stage);
+                        }
+                    }
+                }
+                let _ = (best_bits, best_coarse);
+            }
+            if rank_pal
+                && rank_more
+                && effort.tree_rank_deep
+                && let Some(p) = &palette
+            {
+                let source = p.source(xsize, ysize);
+                let (_, _, params, stage) = rank_presets(
+                    &source,
+                    xsize,
+                    ysize,
+                    min_symbol,
+                    use_wp,
+                    pal_stage.take(),
+                    wp_params,
+                    &header_bits,
+                    true,
+                    rank_layout,
+                    rank_sampling,
+                    keep_stages,
+                    pool,
+                    scratch,
+                );
+                pal_wp = params;
+                pal_stage = stage;
+            }
+            if keep_stages {
+                (rgb_rank_stage, pal_rank_stage) = (rgb_stage, pal_stage);
+            }
+        }
+        let linear = rct_planes.as_ref().unwrap_or(ycocg);
+
+        // A ranking stage stands in for a final learn's first stage when both
+        // sampled the same source under the same layout and budget, and the
+        // ranking did not stop at its direct small-set learn.
+        let reusable = |stage: Option<CoarseLearn>, final_layout: GroupLayout| {
+            stage.filter(|stage| {
+                final_layout == rank_layout
+                    && final_sampling == rank_sampling
+                    && stage.samples.len() > MA_COARSE_TARGET_SAMPLES
+            })
+        };
+        let mut rgb_rank_stage = reusable(rgb_rank_stage, rgb_layouts[0]);
+        let mut pal_rank_stage = reusable(pal_rank_stage, layouts[0]);
         let (layout, rgb_coarse_est, mut learned_tree_decisive, skip_alternatives) = {
             let rgb_source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
             let mut learned_estimated_savings: Option<f64> = None;
@@ -1064,6 +1138,7 @@ fn encode_frame_lossless_core_impl(
                     f64::INFINITY,
                     false,
                     final_sampling,
+                    rgb_rank_stage.take(),
                     pool,
                     scratch,
                 )
@@ -1138,6 +1213,7 @@ fn encode_frame_lossless_core_impl(
                 rgb_final_est * PALETTE_FINAL_MARGIN * PALETTE_LAYOUT_MARGIN,
                 true,
                 final_sampling,
+                pal_rank_stage.take(),
                 pool,
                 scratch,
             ) {
@@ -1228,8 +1304,7 @@ fn encode_frame_lossless_core_impl(
                         wp_params,
                         use_wp,
                         mixed.max_leaves(),
-                        final_sampling.0,
-                        final_sampling.1,
+                        final_sampling,
                         pool,
                         scratch,
                     );
@@ -1327,10 +1402,36 @@ fn encode_frame_lossless_core_impl(
         chan_preds[nb_chans - 1] = 0;
         chan_offsets[nb_chans - 1] = value;
     }
+    // The fixed WP context tree of the flat path (`flat_wp_contexts`), for
+    // displayed frames: a reference-only atlas keeps one context per channel.
+    let displayed = matches!(
+        frame_kind,
+        ModularFrameKind::Regular | ModularFrameKind::Patched(_)
+    );
+    let wp_tree = (effort.flat_wp_contexts && use_wp && displayed)
+        .then(|| {
+            let bucketed: Vec<bool> = (0..nb_chans)
+                .map(|chan| {
+                    chan_preds[chan] == PREDICTOR_WEIGHTED
+                        && !(chan >= num_color && alpha_constant.is_some())
+                })
+                .collect();
+            bucketed.contains(&true).then(|| {
+                let shift = max_bits.saturating_sub(8);
+                wp_context_tree(&chan_preds, &chan_offsets, &bucketed, shift)
+            })
+        })
+        .flatten();
+    let flat_buckets = wp_tree.as_ref().map(|tree| tree.buckets.as_slice());
+    let flat_contexts = wp_tree.as_ref().map_or(nb_chans, |tree| tree.num_ctx);
     let flat_tail = |w: usize, h: usize| -> ConstantTail {
         match alpha_constant {
             Some(_) => ConstantTail {
-                context: channel_to_context(nb_chans - 1, nb_chans),
+                context: wp_tree
+                    .as_ref()
+                    .map_or(channel_to_context(nb_chans - 1, nb_chans), |tree| {
+                        tree.buckets[nb_chans - 1].contexts[0]
+                    }),
                 count: w * h,
             },
             None => ConstantTail::NONE,
@@ -1432,13 +1533,14 @@ fn encode_frame_lossless_core_impl(
                 scratch,
                 wp_params,
                 alpha_constant,
+                flat_buckets,
             );
             let tail = flat_tail(xsize, ysize);
 
             // LZ77 layer: collapse runs of identical tokens into back-references.
             // The distance context is the (nb_chans)-th context, appended after the
             // per-channel ones.
-            let distance_ctx = nb_chans as u32;
+            let distance_ctx = flat_contexts as u32;
             let lz_tokens =
                 lz77_compress_channels_for_speed(channel_tokens, distance_ctx, speed, scratch);
 
@@ -1447,7 +1549,7 @@ fn encode_frame_lossless_core_impl(
                 speed.effort().lz_exhaustive_entropy,
                 &[lz_tokens.as_slice()],
                 &[tail],
-                nb_chans,
+                flat_contexts,
                 min_symbol,
                 speed.effort().lz_refined_entropy,
                 false,
@@ -1455,7 +1557,8 @@ fn encode_frame_lossless_core_impl(
                 &mut scratch.lz_entropy,
                 &mut scratch.huffman_pool,
             );
-            write_local_tree_lz77_offsets(
+            write_flat_tree(
+                wp_tree.as_ref(),
                 &chan_preds,
                 &chan_offsets,
                 &code,
@@ -1494,7 +1597,7 @@ fn encode_frame_lossless_core_impl(
             // back-references stay within a group's modular sub-image.  Pool the
             // resulting LzToken streams to build a single global prefix code so
             // every per-group emission is guaranteed to be representable.
-            let distance_ctx = nb_chans as u32;
+            let distance_ctx = flat_contexts as u32;
             let group_lz_tokens: Vec<Vec<LzToken>> = {
                 let deep_lz = speed
                     .effort()
@@ -1528,6 +1631,7 @@ fn encode_frame_lossless_core_impl(
                                 scratch,
                                 wp_params,
                                 alpha_constant,
+                                flat_buckets,
                             );
                             deep_lz.as_ref().unwrap().with_depth(|depth| {
                                 lz77_compress_channels_for_speed_with_depth(
@@ -1553,6 +1657,7 @@ fn encode_frame_lossless_core_impl(
                                 scratch,
                                 wp_params,
                                 alpha_constant,
+                                flat_buckets,
                             )
                         }
                     },
@@ -1574,7 +1679,7 @@ fn encode_frame_lossless_core_impl(
                 speed.effort().lz_exhaustive_entropy,
                 &group_slices,
                 &group_tails,
-                nb_chans,
+                flat_contexts,
                 min_symbol,
                 speed.effort().lz_refined_entropy,
                 false,
@@ -1584,7 +1689,8 @@ fn encode_frame_lossless_core_impl(
             );
             sections[0].write(1, 1); // dc_quant all_default = 1
             sections[0].write(1, 1); // has_tree = 1
-            write_local_tree_lz77_offsets(
+            write_flat_tree(
+                wp_tree.as_ref(),
                 &chan_preds,
                 &chan_offsets,
                 &code,
@@ -2505,6 +2611,11 @@ const MA_FINAL_TARGET_SAMPLES: usize = 1 << 23;
 const MA_LITE_TARGET_SAMPLES: usize = 1 << 19;
 const MA_LITE_FULL_SAMPLE_LIMIT: usize = 1 << 19;
 const MA_FINAL_FULL_SAMPLE_LIMIT: usize = 1 << 24;
+/// (target samples, full-sample limit) of `tree_full_sampling`, the lite
+/// budget and the dense final learn.
+const MA_FULL_SAMPLING: (usize, usize) = (MA_TARGET_SAMPLES, MA_FULL_SAMPLE_LIMIT);
+const MA_LITE_SAMPLING: (usize, usize) = (MA_LITE_TARGET_SAMPLES, MA_LITE_FULL_SAMPLE_LIMIT);
+const MA_DENSE_SAMPLING: (usize, usize) = (MA_FINAL_TARGET_SAMPLES, MA_FINAL_FULL_SAMPLE_LIMIT);
 /// The dense final budget applies to sources whose first-stage estimate
 /// costs at least this many bits per value: photos and paintings (2-3 b/v).
 /// Screen and text content (0.3 b/v and below) gets nothing from it — its
@@ -2538,6 +2649,10 @@ const MA_MIN_NODE_SAMPLES: usize = 128;
 const MA_SIDE_PREDS: usize = 4;
 /// `MA_SIDE_PREDS` of the final RCT tree learn under `tree_wide_side_preds`.
 const MA_WIDE_SIDE_PREDS: usize = 7;
+/// Leaf cap of sub-sampled final learns without `tree_deep_final`.
+const MA_LITE_MAX_LEAVES: usize = 1024;
+/// Split candidates of sub-sampled final learns without `tree_deep_final`.
+const MA_LITE_CANDIDATES: usize = 16;
 
 /// Walk one channel rectangle in scan order, feeding the visitor the property
 /// vector (libjxl ids 0..=15), the neighborhood, and the WP prediction of
@@ -3358,6 +3473,10 @@ fn finish_ma_learn(
         coarse.stride as f64,
         use_wp,
     );
+    if !speed.effort().tree_deep_final && coarse.stride > 1 {
+        params.max_leaves = params.max_leaves.min(MA_LITE_MAX_LEAVES);
+        params.max_candidates = params.max_candidates.min(MA_LITE_CANDIDATES);
+    }
     // Palette index sources keep the narrow side search: like extra split
     // candidates, it overfits their near-deterministic contexts.
     if coarse.leaf_offsets && speed.effort().tree_wide_side_preds {
@@ -3418,7 +3537,8 @@ fn wp_matters(stage: &CoarseLearn) -> bool {
 /// from `first` (already learned under `first_params`), the rest in order
 /// of how often they win; a preset trailing the best first stage seen by
 /// more than `RANK_COARSE_PRUNE` is dropped. Without `all_presets` only
-/// `first` is scored. Returns (best bits, best coarse bits, preset).
+/// `first` is scored. Returns (best bits, best coarse bits, preset) and, with
+/// `keep_stage`, the preset's stage.
 #[allow(clippy::too_many_arguments)]
 fn rank_presets(
     source: &MaSource<'_>,
@@ -3430,9 +3550,13 @@ fn rank_presets(
     first_params: WpParams,
     header_bits: &dyn Fn(WpParams) -> f64,
     all_presets: bool,
+    layout: GroupLayout,
+    sampling: (usize, usize),
+    keep_stage: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
-) -> (f64, f64, WpParams) {
+) -> (f64, f64, WpParams, Option<CoarseLearn>) {
+    let mut best_stage = None;
     let mut best_bits = f64::INFINITY;
     let mut best_coarse = f64::INFINITY;
     let mut best_params = first_params;
@@ -3449,7 +3573,7 @@ fn rank_presets(
         let stage = match first.take() {
             Some(stage) => Some(stage),
             None => rank_coarse(
-                source, xsize, ysize, min_symbol, preset, use_wp, pool, scratch,
+                source, xsize, ysize, min_symbol, preset, use_wp, layout, sampling, pool, scratch,
             ),
         };
         let Some(stage) = stage else {
@@ -3464,9 +3588,10 @@ fn rank_presets(
         if bits < best_bits {
             best_bits = bits;
             best_params = preset;
+            best_stage = keep_stage.then_some(stage);
         }
     }
-    (best_bits, best_coarse, best_params)
+    (best_bits, best_coarse, best_params, best_stage)
 }
 
 /// A gated learned tree with its BFS emission and rate estimate.
@@ -3942,8 +4067,7 @@ fn learn_ma_candidate(
     wp_params: WpParams,
     use_wp: bool,
     max_leaves: usize,
-    target_samples: usize,
-    full_sample_limit: usize,
+    (target_samples, full_sample_limit): (usize, usize),
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<CoarseLearn> {
@@ -4093,18 +4217,16 @@ const MA_RANK_LEAVES: usize = MA_COARSE_MAX_LEAVES;
 /// estimated cost is within this factor of the best.
 const RCT_RANK_MARGIN: f32 = 1.02;
 
-/// Sampling budget of the ranking learns: the final learn's. Their 32-leaf
-/// first stage only sees `MA_COARSE_TARGET_SAMPLES` evenly spaced rows of
-/// the set, yet sampling just twice that many rows at a wider stride
-/// mis-ranked presets on a third of Kodak (+0.22% overall, k01 +1.3%): the
-/// preset margins are 0.3-0.6% and need the denser set's row phases.
-const MA_RANK_SAMPLE_LIMIT: usize = MA_FULL_SAMPLE_LIMIT;
 /// A ranking candidate whose 32-leaf coarse estimate trails the best coarse
 /// estimate seen so far by more than this is not scored further.
 const RANK_COARSE_PRUNE: f64 = 1.005;
 
-/// First ranking stage of `source`: its coarse learn under the 1024-px
-/// layout at the ranking sample budget.
+/// First ranking stage of `source`: its coarse learn under `layout` at
+/// `sampling`, the final learn's budget. The 32-leaf first stage
+/// only sees `MA_COARSE_TARGET_SAMPLES` evenly spaced rows of the set, yet
+/// sampling just twice that many rows at a wider stride mis-ranked presets
+/// on a third of Kodak (+0.22% overall, k01 +1.3%): the preset margins are
+/// 0.3-0.6% and need the denser set's row phases.
 #[allow(clippy::too_many_arguments)]
 fn rank_coarse(
     source: &MaSource<'_>,
@@ -4113,6 +4235,8 @@ fn rank_coarse(
     min_symbol: u32,
     wp_params: WpParams,
     use_wp: bool,
+    layout: GroupLayout,
+    sampling: (usize, usize),
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<CoarseLearn> {
@@ -4120,13 +4244,12 @@ fn rank_coarse(
         source,
         xsize,
         ysize,
-        GroupLayout::LARGE,
+        layout,
         min_symbol,
         wp_params,
         use_wp,
         MA_RANK_LEAVES,
-        MA_TARGET_SAMPLES,
-        MA_RANK_SAMPLE_LIMIT,
+        sampling,
         pool,
         scratch,
     )
@@ -4145,7 +4268,7 @@ fn rank_bits(stage: &CoarseLearn) -> f64 {
 /// estimates smaller; the full estimates pick the winner. Layouts are
 /// processed one at a time so a single sample set is alive. `coarse_limit`
 /// prunes a source by its first stage, `final_limit` by its first complete
-/// layout.
+/// layout. `first_stage`, when given, is the first layout's stage.
 #[allow(clippy::too_many_arguments)]
 fn learn_best_layout(
     speed: crate::Speed,
@@ -4160,6 +4283,7 @@ fn learn_best_layout(
     final_limit: f64,
     deepen_all: bool,
     sampling: (usize, usize),
+    mut first_stage: Option<CoarseLearn>,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<(GroupLayout, LearnedCandidate, f64)> {
@@ -4175,20 +4299,22 @@ fn learn_best_layout(
         {
             break;
         }
-        let Some(stage) = learn_ma_candidate(
-            source,
-            xsize,
-            ysize,
-            layout,
-            min_symbol,
-            wp_params,
-            use_wp,
-            source.max_leaves(),
-            sampling.0,
-            sampling.1,
-            pool,
-            scratch,
-        ) else {
+        let stage = first_stage.take().or_else(|| {
+            learn_ma_candidate(
+                source,
+                xsize,
+                ysize,
+                layout,
+                min_symbol,
+                wp_params,
+                use_wp,
+                source.max_leaves(),
+                sampling,
+                pool,
+                scratch,
+            )
+        });
+        let Some(stage) = stage else {
             continue;
         };
         let coarse_est = stage.candidate.est_real;
@@ -5856,6 +5982,137 @@ fn push_leaf_offset(out: &mut Vec<Token>, predictor: u32, offset: i32) {
     out.push(Token::new(TREE_CTX_OFFSET, pack_signed(offset)));
     out.push(Token::new(TREE_CTX_MULTIPLIER_LOG, 0));
     out.push(Token::new(TREE_CTX_MULTIPLIER_BITS, 0));
+}
+
+/// Fixed flat context tree: a channel split, then each `bucketed` channel
+/// split on the WP error property at `WP_CONTEXT_CUTOFFS` scaled by
+/// `1 << shift` (the sample depth above 8 bits).
+struct WpContextTree {
+    tokens: Vec<Token>,
+    /// Context of every WP bucket, per channel (one context for a channel
+    /// that is not bucketed).
+    buckets: Vec<WpChannelContexts>,
+    num_ctx: usize,
+}
+
+fn wp_context_tree(
+    predictors: &[u32],
+    offsets: &[i32],
+    bucketed: &[bool],
+    shift: u32,
+) -> WpContextTree {
+    enum Node {
+        Split {
+            prop: u32,
+            val: i32,
+            gt: usize,
+            le: usize,
+        },
+        Leaf {
+            chan: usize,
+            lo: usize,
+            hi: usize,
+        },
+    }
+    fn buckets(nodes: &mut Vec<Node>, shift: u32, chan: usize, lo: usize, hi: usize) -> usize {
+        if lo == hi {
+            nodes.push(Node::Leaf { chan, lo, hi });
+            return nodes.len() - 1;
+        }
+        let mid = (lo + hi) / 2;
+        let gt = buckets(nodes, shift, chan, mid + 1, hi);
+        let le = buckets(nodes, shift, chan, lo, mid);
+        // `p >> shift > c` exactly when `p > ((c + 1) << shift) - 1`.
+        nodes.push(Node::Split {
+            prop: PROP_WP,
+            val: ((WP_CONTEXT_CUTOFFS[mid] + 1) << shift) - 1,
+            gt,
+            le,
+        });
+        nodes.len() - 1
+    }
+    fn channels(
+        nodes: &mut Vec<Node>,
+        shift: u32,
+        bucketed: &[bool],
+        lo: usize,
+        hi: usize,
+    ) -> usize {
+        if lo == hi {
+            if bucketed[lo] {
+                return buckets(nodes, shift, lo, 0, WP_CONTEXT_BUCKETS - 1);
+            }
+            nodes.push(Node::Leaf {
+                chan: lo,
+                lo: 0,
+                hi: WP_CONTEXT_BUCKETS - 1,
+            });
+            return nodes.len() - 1;
+        }
+        let mid = (lo + hi) / 2;
+        let gt = channels(nodes, shift, bucketed, mid + 1, hi);
+        let le = channels(nodes, shift, bucketed, lo, mid);
+        nodes.push(Node::Split {
+            prop: 0,
+            val: mid as i32,
+            gt,
+            le,
+        });
+        nodes.len() - 1
+    }
+    let mut nodes = Vec::new();
+    let root = channels(&mut nodes, shift, bucketed, 0, bucketed.len() - 1);
+    let mut tokens = Vec::new();
+    let mut table: Vec<WpChannelContexts> = (0..bucketed.len())
+        .map(|_| WpChannelContexts {
+            contexts: [0; WP_CONTEXT_BUCKETS],
+            shift,
+        })
+        .collect();
+    let mut num_ctx = 0u32;
+    let mut queue = std::collections::VecDeque::from([root]);
+    while let Some(index) = queue.pop_front() {
+        match nodes[index] {
+            Node::Split { prop, val, gt, le } => {
+                push_split(&mut tokens, prop, val);
+                queue.push_back(gt);
+                queue.push_back(le);
+            }
+            Node::Leaf { chan, lo, hi } => {
+                push_leaf_offset(&mut tokens, predictors[chan], offsets[chan]);
+                table[chan].contexts[lo..=hi].fill(num_ctx);
+                num_ctx += 1;
+            }
+        }
+    }
+    WpContextTree {
+        tokens,
+        buckets: table,
+        num_ctx: num_ctx as usize,
+    }
+}
+
+/// The flat path's tree (`wp_tree`, else one leaf per channel) and pixel code.
+fn write_flat_tree(
+    wp_tree: Option<&WpContextTree>,
+    predictors: &[u32],
+    offsets: &[i32],
+    pixel_code: &crate::entropy::EntropyCode<'_>,
+    min_symbol: u32,
+    huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
+    w: &mut BitWriter,
+) {
+    match wp_tree {
+        Some(tree) => write_tree_lz77(&tree.tokens, pixel_code, min_symbol, huffman_pool, w),
+        None => write_local_tree_lz77_offsets(
+            predictors,
+            offsets,
+            pixel_code,
+            min_symbol,
+            huffman_pool,
+            w,
+        ),
+    }
 }
 
 /// `build_balanced_tree_tokens` with a predictor offset per channel.

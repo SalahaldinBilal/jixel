@@ -92,6 +92,14 @@ impl Ssimulacra2Reference {
         }
     }
 
+    /// The identical pooled score when no per-pixel map is consumed.
+    pub(crate) fn deficit(&self, recon: &Image3F) -> f32 {
+        let linear = linear_of_xyb(recon);
+        self.prepared
+            .compare(planes(&linear, self.width, self.height))
+            .map_or(f32::NAN, |score| (100.0 - score) as f32)
+    }
+
     /// Incremental state following `recon`.
     pub(crate) fn state(&self, recon: &Image3F) -> Ssimulacra2State {
         let linear = linear_of_xyb(recon);
@@ -187,6 +195,22 @@ mod tests {
             }
         }
         img
+    }
+
+    #[test]
+    fn score_only_preserves_the_map_scores_exact_bits() {
+        for (w, h) in [(8, 8), (9, 17), (161, 97)] {
+            let source = textured(7, w, h);
+            let reference = Ssimulacra2Reference::new(&source).unwrap();
+            for seed in [7, 8, 19] {
+                let recon = textured(seed, w, h);
+                assert_eq!(
+                    reference.deficit(&recon).to_bits(),
+                    reference.deficit_and_map(&recon).0.to_bits(),
+                    "{w}x{h}, seed={seed}",
+                );
+            }
+        }
     }
 
     #[test]

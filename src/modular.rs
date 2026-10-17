@@ -74,7 +74,7 @@ pub(crate) fn write_lfglobal_alpha_section(
         // Small path: everything in the LfGlobal section. Same two candidates
         // as `write_ac_group_alpha`: plain single-context prefix coding vs the
         // lossless path's LZ77+rANS section; exact bit comparison picks.
-        let tokens = tokenize_channel(alpha, xsize, ysize, 0, 0, xsize, ysize, xsize);
+        let tokens = tokenize_channel(alpha, xsize, ysize);
         let mut plain = BitWriter::new();
         {
             write_group_header_local_tree(&mut plain);
@@ -783,41 +783,27 @@ pub(crate) fn gradient(w: i32, n: i32, nw: i32) -> i32 {
     (w + n - nw).clamp(lo, hi)
 }
 
-/// Tokenize a rectangular slice [x0..x0+gw, y0..y0+gh] of `alpha` (which
-/// has the given `full_xsize` stride) using context = 0.
-fn tokenize_channel(
-    alpha: &AlphaPlane,
-    _full_xsize: usize,
-    _full_ysize: usize,
-    x0: usize,
-    y0: usize,
-    gw: usize,
-    gh: usize,
-    stride: usize,
-) -> Vec<Token> {
-    let _ = _full_ysize;
-    let mut tokens = Vec::with_capacity(gw * gh);
-    for y in y0..y0 + gh {
-        for x in x0..x0 + gw {
-            let v = alpha.get_i32(y * stride + x);
-            let w_ = if x > 0 {
-                alpha.get_i32(y * stride + x - 1)
-            } else {
-                0
-            };
-            let n_ = if y > 0 {
-                alpha.get_i32((y - 1) * stride + x)
-            } else {
-                0
-            };
-            let nw_ = if x > 0 && y > 0 {
-                alpha.get_i32((y - 1) * stride + x - 1)
-            } else {
-                0
-            };
-            let pred = gradient(w_, n_, nw_);
-            tokens.push(Token::new(0, pack_signed(v - pred)));
+/// Tokenize a complete alpha plane using the shared group gradient kernels
+/// and the LfGlobal single-leaf tree's context = 0.
+fn tokenize_channel(alpha: &AlphaPlane, xsize: usize, ysize: usize) -> Vec<Token> {
+    let mut tokens = vec![Token::new(0, 0); xsize * ysize];
+    if tokens.is_empty() {
+        return tokens;
+    }
+    match alpha {
+        AlphaPlane::U8(data) => {
+            tokenize_ac_group_alpha_u8(data, xsize, 0, 0, xsize, ysize, &mut tokens)
         }
+        AlphaPlane::U16 { data, .. } => {
+            tokenize_ac_group_alpha_u16(data, xsize, 0, 0, xsize, ysize, &mut tokens)
+        }
+        AlphaPlane::F32(data) => {
+            tokenize_ac_group_alpha(data, xsize, 0, 0, xsize, ysize, &mut tokens)
+        }
+    }
+    // Group kernels select contexts by gradient sign; this tree has one leaf.
+    for token in &mut tokens {
+        token.context = 0;
     }
     tokens
 }
@@ -964,9 +950,63 @@ mod tests {
     fn tokenize_constant_zero() {
         let chan = vec![0u8; 16 * 16];
         let alpha = AlphaPlane::from_u8(chan);
-        let toks = tokenize_channel(&alpha, 16, 16, 0, 0, 16, 16, 16);
+        let toks = tokenize_channel(&alpha, 16, 16);
         for t in &toks {
             assert_eq!(t.value, 0);
+        }
+    }
+
+    #[test]
+    fn tokenize_channel_matches_scalar_for_all_sample_types() {
+        for width in [
+            1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 255, 256,
+        ] {
+            for height in [1usize, 2, 7] {
+                let mut state = 0x1234_5678u32;
+                let samples: Vec<u16> = (0..width * height)
+                    .map(|i| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        match i & 7 {
+                            0 => 0,
+                            1 => u16::MAX,
+                            _ => (state >> 16) as u16,
+                        }
+                    })
+                    .collect();
+                for alpha in [
+                    AlphaPlane::U8(samples.iter().map(|&v| v as u8).collect()),
+                    AlphaPlane::U16 {
+                        data: samples.clone(),
+                        bits: 16,
+                    },
+                    AlphaPlane::F32(samples.iter().map(|&v| i32::from(v) - 32768).collect()),
+                ] {
+                    let tokens = tokenize_channel(&alpha, width, height);
+                    assert_eq!(tokens.len(), width * height);
+                    for y in 0..height {
+                        for x in 0..width {
+                            let at = |x, y| alpha.get_i32(y * width + x);
+                            let west = if x > 0 { at(x - 1, y) } else { 0 };
+                            let north = if y > 0 { at(x, y - 1) } else { 0 };
+                            let northwest = if x > 0 && y > 0 { at(x - 1, y - 1) } else { 0 };
+                            let expected = pack_signed(at(x, y) - gradient(west, north, northwest));
+                            let token = tokens[y * width + x];
+                            assert_eq!(
+                                (token.context, token.value),
+                                (0, expected),
+                                "channel token mismatch at ({x}, {y}) for {width}x{height}",
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tokenize_empty_channel() {
+        for (width, height) in [(0, 0), (0, 3), (3, 0)] {
+            assert!(tokenize_channel(&AlphaPlane::U8(Vec::new()), width, height).is_empty());
         }
     }
 

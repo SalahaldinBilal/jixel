@@ -43,13 +43,13 @@ use crate::dc_group_data::{DcGroupData, STRATEGY_DCT};
 use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
+use crate::encoding_context::FrameRole;
 use crate::entropy::{
     AcTokens, EntropyCode, Token, TokenSlice, f_log2, optimize_entropy_code, pack_signed,
     write_entropy_code, write_token,
 };
 use crate::group::write_ac_group;
 use crate::image::{Image3B, Image3F, Image3S, Rect};
-use crate::encoding_context::FrameRole;
 use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind};
 use crate::quant_weights::quant_table_slot_of;
 use crate::static_entropy_codes::{
@@ -5629,7 +5629,7 @@ fn run_quant_field_loop(
                         region.x1 = region.x1.max(r.x1);
                         region.y1 = region.y1.max(r.y1);
                     }
-                    cand_gbits[task] = group_bits(&cand, task);
+                    cand_gbits[task] = group_bits(cand, task);
                     delta_bits += cand_gbits[task] - cur_gbits[task];
                 }
                 let d = if region.x1 > 0 {

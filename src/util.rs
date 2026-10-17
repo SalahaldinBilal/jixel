@@ -263,7 +263,7 @@ fn round_i32_portable(value: f32) -> i32 {
     let magnitude = value.abs();
     // Below 0.5, adding half can round the float up to 1.0. At 2^23
     // and above, floats are already integral and must not be biased.
-    let biased = if magnitude >= 0.5 && magnitude < 8_388_608.0 {
+    let biased = if (0.5..8_388_608.0).contains(&magnitude) {
         value + 0.5f32.copysign(value)
     } else {
         value

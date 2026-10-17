@@ -721,11 +721,17 @@ mod tests {
         assert_eq!(natural_scan_generic(4, 2), widen(&a::K_COEFF_ORDER_32X16));
         assert_eq!(
             natural_scan_generic(2, 1),
-            a::K_COEFF_ORDER_16X8.iter().map(|&r| u32::from(r)).collect::<Vec<_>>()
+            a::K_COEFF_ORDER_16X8
+                .iter()
+                .map(|&r| u32::from(r))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             natural_scan_generic(2, 2),
-            a::K_COEFF_ORDER_16X16.iter().map(|&r| u32::from(r)).collect::<Vec<_>>()
+            a::K_COEFF_ORDER_16X16
+                .iter()
+                .map(|&r| u32::from(r))
+                .collect::<Vec<_>>()
         );
         assert_eq!(natural_scan_generic(8, 4), natural_scan_64x32());
         let scan = natural_scan_8x32();

@@ -106,7 +106,15 @@ pub(super) fn skip_dc_smoothing(
         return Ok(true);
     }
     let steps = dc_value_steps(distp);
-    let recon = dequantized_dc(dim, dc_datas, group_coords, distp, ytob_dc, cfl, reconstruct_row)?;
+    let recon = dequantized_dc(
+        dim,
+        dc_datas,
+        group_coords,
+        distp,
+        ytob_dc,
+        cfl,
+        reconstruct_row,
+    )?;
 
     // Fixed bands and ordered reduction keep the decision independent of the
     // worker count. Avoid dispatch overhead on small images.

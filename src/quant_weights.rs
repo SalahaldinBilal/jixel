@@ -1712,7 +1712,11 @@ fn compute_dct32x16_matrix(override_: Option<&BandOverride>) -> HeapMatrix<f32, 
 /// pair's band curve sampled at the same normalized frequencies, scaled by
 /// sqrt(2) for the doubled area (equal per-pixel error per step), F16-rounded
 /// as signaled.
-pub(crate) type Tables8x32 = (BandOverride, HeapMatrix<f32, 3, 256>, HeapMatrix<f32, 3, 256>);
+pub(crate) type Tables8x32 = (
+    BandOverride,
+    HeapMatrix<f32, 3, 256>,
+    HeapMatrix<f32, 3, 256>,
+);
 
 fn derive_8x32(pair: &[[f32; 7]; 3]) -> Tables8x32 {
     const PAIR_BANDS: usize = 7;
@@ -1736,8 +1740,7 @@ fn derive_8x32(pair: &[[f32; 7]; 3]) -> Tables8x32 {
             }
         };
         let gain = std::f32::consts::SQRT_2;
-        let nodes: [f32; NUM_BANDS] =
-            std::array::from_fn(|i| sample(i as f32 * 6.0 / 7.0) * gain);
+        let nodes: [f32; NUM_BANDS] = std::array::from_fn(|i| sample(i as f32 * 6.0 / 7.0) * gain);
         // Wire form: base, then multiplicative steps (band_mult inverse).
         let mut params = [0.0f32; NUM_BANDS];
         params[0] = f16(nodes[0] / 64.0) * 64.0;
@@ -1757,7 +1760,8 @@ fn derive_8x32(pair: &[[f32; 7]; 3]) -> Tables8x32 {
             let dy = y as f32 * rcprow;
             for x in 0..32 {
                 let dx = x as f32 * rcpcol;
-                matrix[c][y * 32 + x] = 1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
+                matrix[c][y * 32 + x] =
+                    1.0 / interpolate_vec_bands(fmla(dx, dx, dy * dy).sqrt(), &bands);
             }
         }
     }
@@ -1765,7 +1769,14 @@ fn derive_8x32(pair: &[[f32; 7]; 3]) -> Tables8x32 {
     for c in 0..3 {
         fill_ac_reciprocals(&matrix[c], &mut inv[c]);
     }
-    (BandOverride { num_bands: NUM_BANDS, bands: bands_out }, matrix, inv)
+    (
+        BandOverride {
+            num_bands: NUM_BANDS,
+            bands: bands_out,
+        },
+        matrix,
+        inv,
+    )
 }
 
 /// Parity tables for a pair table, cached per distinct pair table.
@@ -1789,8 +1800,11 @@ const QM_4X8_SCALE: [f32; 3] = [1.2, 1.0, 0.45];
 
 /// The signaled DCT4X8 table (F16-rounded as written) with its matrices.
 fn tables_4x8() -> &'static (BandOverride, HeapMatrix<f32, 3, 64>, HeapMatrix<f32, 3, 64>) {
-    static TABLES: std::sync::OnceLock<(BandOverride, HeapMatrix<f32, 3, 64>, HeapMatrix<f32, 3, 64>)> =
-        std::sync::OnceLock::new();
+    static TABLES: std::sync::OnceLock<(
+        BandOverride,
+        HeapMatrix<f32, 3, 64>,
+        HeapMatrix<f32, 3, 64>,
+    )> = std::sync::OnceLock::new();
     TABLES.get_or_init(|| {
         let mut o = BandOverride {
             num_bands: 4,
@@ -1798,7 +1812,8 @@ fn tables_4x8() -> &'static (BandOverride, HeapMatrix<f32, 3, 64>, HeapMatrix<f3
         };
         for c in 0..3 {
             o.bands[c][0] =
-                f16_bits_to_f32(f32_to_f16_bits(DCT4X8_BANDS[c][0] * QM_4X8_SCALE[c] / 64.0)) * 64.0;
+                f16_bits_to_f32(f32_to_f16_bits(DCT4X8_BANDS[c][0] * QM_4X8_SCALE[c] / 64.0))
+                    * 64.0;
             for i in 1..4 {
                 o.bands[c][i] = f16_bits_to_f32(f32_to_f16_bits(DCT4X8_BANDS[c][i]));
             }
@@ -1985,7 +2000,6 @@ fn shared_tables() -> &'static SharedTables {
             // only LLF position is the DC; [1], [8], [9] are regular AC.
             fill_ac_reciprocals(&matrix_4x4[c], &mut inv_matrix_4x4[c]);
         }
-
 
         let matrix_afv = compute_afv_matrix();
         let mut inv_matrix_afv = HeapMatrix::new(0.);
@@ -2793,7 +2807,10 @@ mod tests {
                 let w16 = 1.0 / m.matrix_16x8(c)[y * 16 + x16];
                 let w32 = 1.0 / m.matrix_8x32(c)[y * 32 + 2 * x16];
                 let ratio = w32 / (w16 * std::f32::consts::SQRT_2);
-                assert!((0.85..1.18).contains(&ratio), "c={c} y={y} x={x16} ratio={ratio}");
+                assert!(
+                    (0.85..1.18).contains(&ratio),
+                    "c={c} y={y} x={x16} ratio={ratio}"
+                );
             }
         }
     }

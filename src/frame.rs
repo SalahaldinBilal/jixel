@@ -43,6 +43,7 @@ use crate::dc_group_data::{DcGroupData, STRATEGY_DCT};
 use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
+use crate::encoding_context::FrameRole;
 use crate::entropy::{
     AcTokens, EntropyCode, Token, TokenSlice, f_log2, optimize_entropy_code, pack_signed,
     write_entropy_code, write_token,
@@ -972,6 +973,7 @@ fn write_frame_header_kind(
     use_dc_frame: bool,
     coding: crate::coding::CodingTransform,
     epf_channel_scale: Option<[f32; 3]>,
+    role: FrameRole,
     w: &mut BitWriter,
 ) {
     match kind {
@@ -989,6 +991,7 @@ fn write_frame_header_kind(
             use_dc_frame,
             coding,
             epf_channel_scale,
+            role,
             w,
         ),
         VarDctFrameKind::Patched(_) => write_frame_header(
@@ -1005,6 +1008,7 @@ fn write_frame_header_kind(
             use_dc_frame,
             coding,
             epf_channel_scale,
+            role,
             w,
         ),
         VarDctFrameKind::ReferenceOnly { width, height } => {
@@ -1093,6 +1097,7 @@ fn write_frame_header(
     use_dc_frame: bool,
     coding: crate::coding::CodingTransform,
     epf_channel_scale: Option<[f32; 3]>,
+    role: FrameRole,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // not all default
@@ -1191,7 +1196,14 @@ fn write_frame_header(
         w.write(2, 0); // ec_blending_info[0].mode = Replace
     }
 
-    w.write(1, 1); // last frame
+    match role {
+        FrameRole::Last => w.write(1, 1), // last frame
+        FrameRole::SavedFirst => {
+            w.write(1, 0); // not the last frame
+            w.write(2, 0); // save_as_reference = 0
+            w.write(1, 0); // save_before_color_transform = false
+        }
+    }
     w.write(2, 0); // no name
     write_loop_filter(
         epf_iters,
@@ -4535,6 +4547,7 @@ fn encode_frame_core(
         use_dc_frame,
         ctx.coding,
         ctx.epf_channel_scale,
+        ctx.frame_role,
         writer,
     );
     let payload_bits = dc_frame_bits

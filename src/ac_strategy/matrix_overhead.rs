@@ -92,7 +92,10 @@ fn choose_tables(header: &MatrixHeaderCost, used: u16, pinned: u16, regions: &[R
 /// its blocks' pre-selection field merged like `adjust_quant_field` (the
 /// merge's own field is its blocks' aggregate, not theirs).
 fn merged_quant(data: &DcGroupData, strategy: u8, x: usize, y: usize, distance: f32) -> u8 {
-    let field = data.block_quant_field.as_ref().unwrap_or(&data.raw_quant_field);
+    let field = data
+        .block_quant_field
+        .as_ref()
+        .unwrap_or(&data.raw_quant_field);
     let w = AcStrategyImage::covered_blocks_x_of(strategy);
     let h = AcStrategyImage::covered_blocks_y_of(strategy);
     if w * h == 1 {
@@ -145,103 +148,107 @@ pub(crate) fn account_matrix_headers(
     let qm_mult_x = 1.25f32.powf(x_qm_scale as f32 - 2.0);
     let dc_ref = &*dc_datas;
     const FAMILIES: [usize; 9] = [1, 2, 3, 4, 5, 6, 7, 8, 12];
-    let families = ctx.thread_pool.steal_map(scratch, FAMILIES.len(), |index, scratch| {
-        let slot = FAMILIES[index];
-        let mut regions = Vec::new();
-        let mut unavoidable_loss = 0.0;
-        for &(dc, bx, by, strategy) in &sites[slot] {
-            let data = &dc_ref[dc];
-            let (gx, gy) = group_coords[dc];
-            let width = AcStrategyImage::covered_blocks_x_of(strategy);
-            let height = AcStrategyImage::covered_blocks_y_of(strategy);
-            let score = |scratch: &mut CoderScratch, s, x, y| {
-                let px = gx * crate::frame::K_DC_GROUP_DIM + x * 8;
-                let py = gy * crate::frame::K_DC_GROUP_DIM + y * 8;
-                // The incumbent keeps its merged quantizer; an alternative
-                // would get the selection's merge of the per-block field.
-                let q = if s == strategy || width * height == 1 {
-                    data.raw_quant_field.row(y)[x]
-                } else {
-                    merged_quant(data, s, x, y, distance)
+    let families = ctx
+        .thread_pool
+        .steal_map(scratch, FAMILIES.len(), |index, scratch| {
+            let slot = FAMILIES[index];
+            let mut regions = Vec::new();
+            let mut unavoidable_loss = 0.0;
+            for &(dc, bx, by, strategy) in &sites[slot] {
+                let data = &dc_ref[dc];
+                let (gx, gy) = group_coords[dc];
+                let width = AcStrategyImage::covered_blocks_x_of(strategy);
+                let height = AcStrategyImage::covered_blocks_y_of(strategy);
+                let score = |scratch: &mut CoderScratch, s, x, y| {
+                    let px = gx * crate::frame::K_DC_GROUP_DIM + x * 8;
+                    let py = gy * crate::frame::K_DC_GROUP_DIM + y * 8;
+                    // The incumbent keeps its merged quantizer; an alternative
+                    // would get the selection's merge of the per-block field.
+                    let q = if s == strategy || width * height == 1 {
+                        data.raw_quant_field.row(y)[x]
+                    } else {
+                        merged_quant(data, s, x, y, distance)
+                    };
+                    let qac = scale * q as f32;
+                    let cmap = cmap_factors(ctx.cfl_frame(), &data.ytox_map, &data.ytob_map, x, y);
+                    let cost =
+                        if matches!(s, STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64) {
+                            strategy_cost64(
+                                ctx, scratch, s, opsin, px, py, qac, qm_mult_x, META_R, distance,
+                                cmap,
+                            )
+                        } else {
+                            strategy_cost(
+                                ctx, scratch, s, opsin, px, py, qac, qm_mult_x, META_R, distance,
+                                cmap,
+                            )
+                        };
+                    f64::from(cost) / f64::from(RD_LAMBDA)
                 };
-                let qac = scale * q as f32;
-                let cmap = cmap_factors(ctx.cfl_frame(), &data.ytox_map, &data.ytob_map, x, y);
-                let cost = if matches!(s, STRATEGY_DCT64X64 | STRATEGY_DCT64X32 | STRATEGY_DCT32X64)
-                {
-                    strategy_cost64(
-                        ctx, scratch, s, opsin, px, py, qac, qm_mult_x, META_R, distance, cmap,
-                    )
-                } else {
-                    strategy_cost(
-                        ctx, scratch, s, opsin, px, py, qac, qm_mult_x, META_R, distance, cmap,
-                    )
-                };
-                f64::from(cost) / f64::from(RD_LAMBDA)
-            };
-            let incumbent = score(scratch, strategy, bx, by);
-            let mut alternatives = vec![Alternative {
-                strategy,
-                required: 1 << slot,
-                loss_bits: 0.0,
-            }];
-            for candidate in [
-                STRATEGY_DCT,
-                STRATEGY_DCT16X8,
-                STRATEGY_DCT8X16,
-                STRATEGY_DCT16X16,
-                STRATEGY_DCT32X16,
-                STRATEGY_DCT16X32,
-                STRATEGY_DCT32X32,
-                STRATEGY_DCT64X32,
-                STRATEGY_DCT32X64,
-            ] {
-                let cx = AcStrategyImage::covered_blocks_x_of(candidate);
-                let cy = AcStrategyImage::covered_blocks_y_of(candidate);
-                if cx > width
-                    || cy > height
-                    || (cx * cy >= width * height && candidate != STRATEGY_DCT)
-                    || (!SearchScope::for_speed(ctx.speed).rectangles() && cx != cy)
-                {
-                    continue;
-                }
-                let mut cost = 0.0;
-                for y in (by..by + height).step_by(cy) {
-                    for x in (bx..bx + width).step_by(cx) {
-                        cost += score(scratch, candidate, x, y);
+                let incumbent = score(scratch, strategy, bx, by);
+                let mut alternatives = vec![Alternative {
+                    strategy,
+                    required: 1 << slot,
+                    loss_bits: 0.0,
+                }];
+                for candidate in [
+                    STRATEGY_DCT,
+                    STRATEGY_DCT16X8,
+                    STRATEGY_DCT8X16,
+                    STRATEGY_DCT16X16,
+                    STRATEGY_DCT32X16,
+                    STRATEGY_DCT16X32,
+                    STRATEGY_DCT32X32,
+                    STRATEGY_DCT64X32,
+                    STRATEGY_DCT32X64,
+                ] {
+                    let cx = AcStrategyImage::covered_blocks_x_of(candidate);
+                    let cy = AcStrategyImage::covered_blocks_y_of(candidate);
+                    if cx > width
+                        || cy > height
+                        || (cx * cy >= width * height && candidate != STRATEGY_DCT)
+                        || (!SearchScope::for_speed(ctx.speed).rectangles() && cx != cy)
+                    {
+                        continue;
+                    }
+                    let mut cost = 0.0;
+                    for y in (by..by + height).step_by(cy) {
+                        for x in (bx..bx + width).step_by(cx) {
+                            cost += score(scratch, candidate, x, y);
+                        }
+                    }
+                    if cost.is_finite() && incumbent.is_finite() {
+                        alternatives.push(Alternative {
+                            strategy: candidate,
+                            required: quant_table_slot_of(candidate).map_or(0, |s| 1 << s) & custom,
+                            // Preserve earlier perceptual decisions unless a real
+                            // header saving pays for changing them. Negative local
+                            // model deltas cannot subsidize losses elsewhere.
+                            loss_bits: (cost - incumbent).max(0.0),
+                        });
                     }
                 }
-                if cost.is_finite() && incumbent.is_finite() {
-                    alternatives.push(Alternative {
-                        strategy: candidate,
-                        required: quant_table_slot_of(candidate).map_or(0, |s| 1 << s) & custom,
-                        // Preserve earlier perceptual decisions unless a real
-                        // header saving pays for changing them. Negative local
-                        // model deltas cannot subsidize losses elsewhere.
-                        loss_bits: (cost - incumbent).max(0.0),
-                    });
+                unavoidable_loss += alternatives[1..]
+                    .iter()
+                    .map(|a| a.loss_bits)
+                    .fold(f64::INFINITY, f64::min);
+                // A lower bound already exceeds this family's entire possible
+                // fee, including the all-default transition. No table combination
+                // can profitably remove it, so stop scoring its alternatives.
+                if unavoidable_loss > (header.payload[slot] + 17 * 3) as f64 {
+                    return (1 << slot, Vec::new());
                 }
+                regions.push(Region {
+                    dc,
+                    bx,
+                    by,
+                    width,
+                    height,
+                    alternatives,
+                });
             }
-            unavoidable_loss += alternatives[1..]
-                .iter()
-                .map(|a| a.loss_bits)
-                .fold(f64::INFINITY, f64::min);
-            // A lower bound already exceeds this family's entire possible
-            // fee, including the all-default transition. No table combination
-            // can profitably remove it, so stop scoring its alternatives.
-            if unavoidable_loss > (header.payload[slot] + 17 * 3) as f64 {
-                return (1 << slot, Vec::new());
-            }
-            regions.push(Region {
-                dc,
-                bx,
-                by,
-                width,
-                height,
-                alternatives,
-            });
-        }
-        (0, regions)
-    });
+            (0, regions)
+        });
     let mut pinned = used & 1;
     let mut regions = Vec::new();
     for (fixed, candidates) in families {

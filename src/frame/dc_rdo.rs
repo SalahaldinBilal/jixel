@@ -805,13 +805,25 @@ mod tests {
         let params = super::super::compute_distance_params(7.0);
         // Every block sits 0.4 levels above level 3: all round down alike.
         let mut groups = [x_step_fixture(&params, |_, _| 3.4)];
-        let step = choose_x_dc_step(&mut groups, &params, CflFrame::XYB, crate::group::quantize_dc_cfl_scalar);
+        let step = choose_x_dc_step(
+            &mut groups,
+            &params,
+            CflFrame::XYB,
+            crate::group::quantize_dc_cfl_scalar,
+        );
         assert!(step[0] < params.dc_step[0], "kept the default step");
         assert_eq!([step[1], step[2]], [params.dc_step[1], params.dc_step[2]]);
         // X is re-quantized under the chosen step, and lands closer.
         let m = step[0] / params.dc_step[0];
         let level = groups[0].quant_dc.plane(0).as_slice()[0];
-        assert!(groups[0].quant_dc.plane(0).as_slice().iter().all(|&q| q == level));
+        assert!(
+            groups[0]
+                .quant_dc
+                .plane(0)
+                .as_slice()
+                .iter()
+                .all(|&q| q == level)
+        );
         assert!((f32::from(level) * m - 3.4).abs() < 0.4 * 0.5);
     }
 
@@ -825,9 +837,21 @@ mod tests {
             *v = (state >> 8) as f32 / (1u32 << 24) as f32 * 40.0 - 20.0;
         }
         let mut groups = [x_step_fixture(&params, |x, y| noise[y * 32 + x])];
-        let step = choose_x_dc_step(&mut groups, &params, CflFrame::XYB, crate::group::quantize_dc_cfl_scalar);
+        let step = choose_x_dc_step(
+            &mut groups,
+            &params,
+            CflFrame::XYB,
+            crate::group::quantize_dc_cfl_scalar,
+        );
         assert_eq!(step, params.dc_step);
-        assert!(groups[0].quant_dc.plane(0).as_slice().iter().all(|&q| q == 0));
+        assert!(
+            groups[0]
+                .quant_dc
+                .plane(0)
+                .as_slice()
+                .iter()
+                .all(|&q| q == 0)
+        );
     }
 
     #[test]
@@ -837,9 +861,21 @@ mod tests {
             x_step_fixture(&params, |_, _| 3.4),
             DcGroupData::new(4, 4).unwrap(),
         ];
-        let step = choose_x_dc_step(&mut groups, &params, CflFrame::XYB, crate::group::quantize_dc_cfl_scalar);
+        let step = choose_x_dc_step(
+            &mut groups,
+            &params,
+            CflFrame::XYB,
+            crate::group::quantize_dc_cfl_scalar,
+        );
         assert_eq!(step, params.dc_step);
-        assert!(groups[0].quant_dc.plane(0).as_slice().iter().all(|&q| q == 0));
+        assert!(
+            groups[0]
+                .quant_dc
+                .plane(0)
+                .as_slice()
+                .iter()
+                .all(|&q| q == 0)
+        );
     }
 
     #[test]

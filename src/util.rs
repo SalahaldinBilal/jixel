@@ -243,6 +243,34 @@ impl FastRound for f32 {
     }
 }
 
+/// Ties-away rounding followed by a saturating integer conversion, without
+/// a libm roundf call on baseline x86 or WebAssembly.
+#[inline]
+pub(crate) fn round_i32(value: f32) -> i32 {
+    if cfg!(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_family = "wasm"
+    )) {
+        round_i32_portable(value)
+    } else {
+        value.round() as i32
+    }
+}
+
+#[inline]
+fn round_i32_portable(value: f32) -> i32 {
+    let magnitude = value.abs();
+    // Below 0.5, adding half can round the float up to 1.0. At 2^23
+    // and above, floats are already integral and must not be biased.
+    let biased = if (0.5..8_388_608.0).contains(&magnitude) {
+        value + 0.5f32.copysign(value)
+    } else {
+        value
+    };
+    biased as i32
+}
+
 #[cfg(not(all(target_arch = "aarch64", feature = "neon")))]
 #[inline]
 fn f32_to_f16_bits_impl(v: f32) -> u16 {
@@ -394,6 +422,43 @@ pub(crate) fn sort_small_by<T>(
         while j > 0 && compare(&items[j], &items[j - 1]).is_lt() {
             items.swap(j, j - 1);
             j -= 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod rounding_tests {
+    use super::{round_i32, round_i32_portable};
+
+    #[test]
+    fn integer_rounding_preserves_half_ties_precision_and_saturation() {
+        let check = |value: f32| {
+            let expected = value.round() as i32;
+            assert_eq!(round_i32_portable(value), expected, "portable: {value:?}");
+            assert_eq!(round_i32(value), expected, "dispatched: {value:?}");
+        };
+        // Every layer coverage/byte boundary, including adjacent floats.
+        for i in 0..=256 {
+            let half = i as f32 + 0.5;
+            for value in [half.next_down(), half, half.next_up()] {
+                check(value);
+                check(-value);
+            }
+        }
+        for value in [
+            0.0f32,
+            f32::MIN_POSITIVE,
+            8_388_607.5,
+            8_388_609.0,
+            2_147_483_648.0,
+            f32::MAX,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            for value in [value.next_down(), value, value.next_up()] {
+                check(value);
+                check(-value);
+            }
         }
     }
 }

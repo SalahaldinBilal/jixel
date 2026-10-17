@@ -404,6 +404,20 @@ pub struct EncodeConfig {
     pub decoding_speed: DecodingSpeed,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
+    /// Experimental: lift line/text colors into one palette frame with
+    /// coverage alpha, blended over a VarDCT base that is free under the ink.
+    /// Source color and edge statistics select the decomposition before the
+    /// base and ink frames are encoded once. Supports 8-bit RGB/RGBA in XYB;
+    /// non-opaque pixels stay in the base and retain their original alpha.
+    /// Layered RGB declares an opaque alpha channel. Lossless and progressive
+    /// DC ignore it. Defaults to false.
+    pub ink_layer: bool,
+    /// Experimental: flat-color art with antialiased edges is split in one
+    /// pass into a lossless palette base and a lossless coverage frame
+    /// (kBlend) that carries the antialiasing; other images are coded as
+    /// usual. 8-bit RGB input only; the output is near-lossless and
+    /// independent of `distance`. Defaults to false.
+    pub vector_layers: bool,
     /// Progressive DC for lossy VarDCT: the 1:8 DC image is coded as its own
     /// squeezed modular frame ahead of the main frame, so a decoder can show
     /// previews refining from 1:256 to 1:8 before any AC data arrives.
@@ -553,6 +567,8 @@ impl Default for EncodeConfig {
             arbiter: Arbiter::Ssimulacra2,
             decoding_speed: DecodingSpeed::Slow,
             lossy_modular: LossyModular::Off,
+            ink_layer: false,
+            vector_layers: false,
             progressive_dc: false,
             progressive_dc_levels: None,
             group_order: GroupOrder::Scanline,
@@ -898,6 +914,20 @@ impl EncodeConfig {
         self
     }
 
+    /// Experimental ink layer for cel and line art (see
+    /// [`EncodeConfig::ink_layer`]).
+    pub fn with_ink_layer(mut self, ink_layer: bool) -> Self {
+        self.ink_layer = ink_layer;
+        self
+    }
+
+    /// Experimental vector layers for flat-color art (see
+    /// [`EncodeConfig::vector_layers`]).
+    pub fn with_vector_layers(mut self, vector_layers: bool) -> Self {
+        self.vector_layers = vector_layers;
+        self
+    }
+
     /// Code the lossy DC as a progressive DC frame (see
     /// [`EncodeConfig::progressive_dc`]).
     pub fn with_progressive_dc(mut self, progressive_dc: bool) -> Self {
@@ -951,11 +981,19 @@ impl EncodeConfig {
     }
 
     /// Select the encode-speed/density tradeoff (see [`Speed`]).
-    /// [`Speed::Slow`] and [`Speed::ExtraSlow`] also turn on [`EncodeConfig::patches`].
+    /// [`Speed::Slow`] and [`Speed::ExtraSlow`] also turn on [`EncodeConfig::patches`]
+    /// and [`EncodeConfig::vector_layers`]; [`Speed::Medium`] and above turn on
+    /// [`EncodeConfig::ink_layer`].
     pub fn with_speed(mut self, speed: Speed) -> Self {
         self.speed = speed;
         if speed.effort().patches_default {
             self.patches = true;
+        }
+        if speed.effort().ink_layer_default {
+            self.ink_layer = true;
+        }
+        if speed.effort().vector_layers_default {
+            self.vector_layers = true;
         }
         self
     }
@@ -1179,6 +1217,60 @@ pub fn encode_image(
                 .with_num_threads(config.num_threads),
         );
     }
+    // Vector layers are near-lossless and cost the same at every distance:
+    // they replace the lossy frame only where its own size would be close.
+    // The vector encode does not depend on the distance; it stands wherever
+    // it is no larger than the VarDCT encode the distance asks for, taken
+    // from the edge-cost model instead of a second encode.
+    // The vector encode spends what VarDCT would at this distance: its
+    // band precision follows the distance, then drops until the modeled
+    // VarDCT size covers it, and the bare palette base stands last.
+    if config.vector_layers {
+        let steps = crate::vector_layers::coverage_steps(config.distance);
+        if let Some(split) = crate::vector_layers::split(input, width, height, steps) {
+            // The model sizes the VarDCT encode within 0.78..1.39 of its
+            // measure; the layers, far above VarDCT in quality, are kept up
+            // to that margin.
+            let budget = crate::vector_layers::vardct_bytes(input, width, height, config.distance)
+                * crate::vector_layers::VARDCT_BYTES_MARGIN;
+            let vector = encode_vector_layers(split, width, height, config)?;
+            if vector.bytes.len() as f64 <= budget {
+                return Ok(vector.bytes);
+            }
+            if (vector.base as f64) < budget {
+                let room = ((budget - vector.base as f64) / vector.band.max(1) as f64
+                    * crate::vector_layers::band_bytes_ratio(steps))
+                .max(0.0);
+                let fit = 2f64.powf(5.0 * room - 1.0).floor().clamp(1.0, steps as f64) as u32;
+                if fit < steps
+                    && let Some(split) = crate::vector_layers::split(input, width, height, fit)
+                {
+                    return Ok(encode_vector_layers(split, width, height, config)?.bytes);
+                }
+            }
+        }
+    }
+    if config.ink_layer
+        && config.coding_transform == CodingTransform::Xyb
+        && !config.progressive_dc
+        && let Some(candidates) =
+            crate::ink_layer::InkCandidates::new_fast(input, None, width, height)
+    {
+        return select_ink_layered(
+            candidates.select(config.distance),
+            width,
+            height,
+            config,
+            None,
+            crate::vector_layers::vardct_bytes(input, width, height, config.distance),
+            || {
+                let mut plain_config = config.clone();
+                plain_config.ink_layer = false;
+                plain_config.vector_layers = false;
+                encode_image(input, width, height, &plain_config)
+            },
+        );
+    }
     let distance = config.distance.max(MIN_DISTANCE);
     let transform = ColorTransform::for_integer(
         8,
@@ -1213,6 +1305,429 @@ pub fn encode_image(
         &ctx,
         &mut scratch,
     )
+}
+
+/// Encode the selected decomposition once, or use the ordinary path.
+fn select_ink_layered(
+    plan: Option<crate::ink_layer::InkLayers>,
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+    alpha: Option<&AlphaPlane>,
+    budget: f64,
+    ordinary: impl FnOnce() -> Result<Vec<u8>, EncodeError>,
+) -> Result<Vec<u8>, EncodeError> {
+    let Some(plan) = plan else {
+        return ordinary();
+    };
+    // Repeated-glyph patches may code thin text better than the ink frame,
+    // and the model does not see them: the plain encode decides, and the
+    // stack has no quality edge over patched text to pay for.
+    let glyph_text = plan.thin_text && config.patches;
+    let stack = InkStack::new(plan, width, height, config, alpha, budget)?;
+    if !glyph_text && stack.bytes.len() as f64 <= budget {
+        return Ok(stack.bytes);
+    }
+    // Past the modeled VarDCT size the plain encode decides: the stack, exact
+    // on its strokes, may cost one quality step more than it.
+    let plain = ordinary()?;
+    let step = if glyph_text { 1.0 } else { INK_STACK_STEP };
+    Ok(if stack.bytes.len() as f64 <= plain.len() as f64 * step {
+        stack.bytes
+    } else {
+        plain
+    })
+}
+
+/// Bytes an ink stack may cost relative to the plain encode it replaces: one
+/// quality step of the rate curve.
+const INK_STACK_STEP: f64 = 1.15;
+
+/// Coverage levels of the ink frame at a distance: 7 at distance 1, more
+/// below it, fewer above, within the palette's room for the inks.
+fn ink_levels(distance: f32, inks: usize) -> u32 {
+    (7.0 / distance.max(0.01))
+        .round()
+        .clamp(1.0, (255 / inks.max(1)) as f32) as u32
+}
+
+/// One VarDCT base and its palette coverage frame.
+struct InkStack {
+    width: usize,
+    height: usize,
+    ctx: EncodingContext,
+    base_frame: BitWriter,
+    /// Ink colors and coverage levels; index zero is transparent.
+    inks: Vec<[u8; 3]>,
+    ink: Vec<u8>,
+    coverage: Vec<u8>,
+    bytes: Vec<u8>,
+}
+
+impl InkStack {
+    fn new(
+        plan: crate::ink_layer::InkLayers,
+        width: usize,
+        height: usize,
+        config: &EncodeConfig,
+        alpha: Option<&AlphaPlane>,
+        budget: f64,
+    ) -> Result<Self, EncodeError> {
+        let mut scratch = Box::<CoderScratch>::default();
+        let (ctx, base_frame) =
+            encode_ink_base(&plan.base, width, height, config, alpha, &mut scratch)?;
+        drop(plan.base);
+        let mut stack = Self {
+            width,
+            height,
+            ctx,
+            base_frame,
+            inks: plan.inks,
+            ink: plan.ink,
+            coverage: plan.coverage,
+            bytes: Vec::new(),
+        };
+        // The coverage precision follows the distance, then drops until the
+        // modeled VarDCT size, within the model's margin, covers the stack;
+        // the hard mask stands last.
+        let budget = budget * crate::vector_layers::VARDCT_BYTES_MARGIN;
+        let mut levels = ink_levels(config.distance, stack.inks.len());
+        loop {
+            stack.bytes = stack.assemble(config, alpha, levels, &mut scratch)?;
+            if stack.bytes.len() as f64 <= budget || levels == 1 {
+                return Ok(stack);
+            }
+            levels = [7, 5, 3, 2, 1]
+                .into_iter()
+                .find(|&l| l < levels)
+                .unwrap_or(1);
+        }
+    }
+
+    /// Image header, saved base frame and final palette ink frame with the
+    /// coverage on `levels` steps above zero.
+    fn assemble(
+        &self,
+        config: &EncodeConfig,
+        alpha: Option<&AlphaPlane>,
+        levels: u32,
+        scratch: &mut CoderScratch,
+    ) -> Result<Vec<u8>, EncodeError> {
+        let mut palette = vec![([0u8; 3], 0u8)];
+        let mut entries = vec![vec![0u8; levels as usize + 1]; self.inks.len()];
+        for (slot, &ink) in self.inks.iter().enumerate() {
+            for step in 1..=levels {
+                entries[slot][step as usize] = palette.len() as u8;
+                palette.push((ink, ((step * 255 + levels / 2) / levels) as u8));
+            }
+        }
+        let indices: Vec<u8> = self
+            .ink
+            .iter()
+            .zip(&self.coverage)
+            .map(|(&k, &a)| {
+                if k == 0 {
+                    0
+                } else {
+                    entries[k as usize - 1][((a as u32 * levels + 127) / 255) as usize]
+                }
+            })
+            .collect();
+        let pixels = self.width * self.height;
+        let opaque = alpha
+            .is_none()
+            .then(|| AlphaPlane::from_u8(vec![255; pixels]));
+        let base_alpha = alpha.or(opaque.as_ref()).expect("base alpha");
+        let mut w = BitWriter::new();
+        w.write(8, 0xFF);
+        w.write(8, CODESTREAM_MARKER as u64);
+        write_size_header(self.width, self.height, &mut w);
+        write_image_metadata(
+            &ImageMetadataParams {
+                tone_mapping: config.tone_mapping(),
+                color_encoding: &config.color_encoding,
+                alpha: Some(base_alpha),
+                black: false,
+                icc_profile: config.icc_profile.as_deref(),
+                bps: BitsPerSample::Eight,
+                lossless: false,
+                xyb_encoded: true,
+                xyb: &self.ctx.xyb,
+                grayscale: false,
+                orientation: config.orientation,
+                lossy_modular_16: false,
+                extra_16: false,
+            },
+            scratch,
+            &mut w,
+        );
+        w.append(&self.base_frame);
+        let transform = ColorTransform::for_integer(
+            8,
+            config.color_encoding.transfer,
+            config.color_encoding.primaries,
+        );
+        w.append(&encode_ink_frame(
+            &self.ctx,
+            &transform,
+            &palette,
+            &indices,
+            self.width,
+            self.height,
+            config,
+            scratch,
+        )?);
+        finalize_container(
+            w.into_bytes(),
+            config.exif.as_deref(),
+            config.xmp.as_deref(),
+            config.brotli_compression.as_deref(),
+            false,
+            encode_gain_map(config)?.as_ref(),
+        )
+    }
+}
+
+/// The VarDCT base of a layered codestream, saved to reference slot 0, with
+/// the context whose opsin matrix every ink frame must share.
+fn encode_ink_base(
+    base: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+    original_alpha: Option<&AlphaPlane>,
+    scratch: &mut CoderScratch,
+) -> Result<(EncodingContext, BitWriter), EncodeError> {
+    use crate::encoding_context::FrameRole;
+    let distance = config.distance.max(MIN_DISTANCE);
+    let transform = ColorTransform::for_integer(
+        8,
+        config.color_encoding.transfer,
+        config.color_encoding.primaries,
+    );
+    let pixels = width * height;
+    let opaque = original_alpha
+        .is_none()
+        .then(|| AlphaPlane::from_u8(vec![255; pixels]));
+    let base_alpha = original_alpha.or(opaque.as_ref()).expect("base alpha");
+    let mut ctx = lossy_context(config, distance, XybMatrix::SPEC, pixels);
+    ctx.lossy_modular = LossyModular::Off;
+    // Coverage is zero wherever the source alpha is not opaque. Keeping the
+    // reference alpha exact makes kBlend preserve it at those pixels.
+    ctx.extra_squeeze_distance = 0.0;
+    ctx.extra_step = 1;
+    ctx.frame_role = FrameRole::SavedFirst;
+    let linear = linearize_rgb::<_, _, 3>(base, width, height, &ctx, scratch, &transform);
+    ctx.set_coding(CodingTransform::Xyb, distance);
+    apply_yellow_opsin(&mut ctx, &linear, distance);
+    let mut frame = BitWriter::new();
+    encode_frame(
+        &ctx,
+        scratch,
+        distance,
+        linear,
+        None,
+        false,
+        Some(base_alpha),
+        config.fill_invisible,
+        &[0],
+        config.patches,
+        true,
+        &mut frame,
+    )?;
+    Ok((ctx, frame))
+}
+
+/// The palette of inks on the base frame's XYB lattice, with exact coverage.
+#[allow(clippy::too_many_arguments)]
+fn encode_ink_frame(
+    ctx: &EncodingContext,
+    transform: &ColorTransform<crate::color::TransferLut>,
+    colors: &[([u8; 3], u8)],
+    indices: &[u8],
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+    scratch: &mut CoderScratch,
+) -> Result<BitWriter, EncodeError> {
+    let palette: Vec<_> = colors
+        .iter()
+        .map(|&(ink, alpha)| {
+            let (mut r, mut g, mut b) = ([0.0], [0.0], [0.0]);
+            transform.transform_block(&[ink], [&mut r, &mut g, &mut b]);
+            let (x, y, b) = crate::xyb::rgb_to_xyb_pixel_f32(&ctx.xyb, r[0], g[0], b[0]);
+            let y = (y * crate::quant_weights::INV_DC_QUANT[1]).round() as i32;
+            let ycocg = forward_ycocg(
+                y,
+                (x * crate::quant_weights::INV_DC_QUANT[0]).round() as i32,
+                (b * crate::quant_weights::INV_DC_QUANT[2]).round() as i32 - y,
+            );
+            (ycocg, alpha)
+        })
+        .collect();
+    let mut image = Image3Si::new(width, height);
+    let mut alpha = vec![0u8; width * height];
+    for (y, row) in indices.chunks_exact(width).enumerate() {
+        for c in 0..3 {
+            let dst = image.plane_row_mut(c, y);
+            for (d, &k) in dst.iter_mut().zip(row) {
+                let v = palette[k as usize].0;
+                *d = match c {
+                    0 => v.0,
+                    1 => v.1,
+                    _ => v.2,
+                };
+            }
+        }
+        for (a, &k) in alpha[y * width..][..width].iter_mut().zip(row) {
+            *a = palette[k as usize].1;
+        }
+    }
+    let alpha = AlphaPlane::from_u8(alpha);
+    let speed = if config.speed >= Speed::ExtraSlow {
+        Speed::Slow
+    } else {
+        Speed::Medium
+    };
+    let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+    let mut frame = BitWriter::new();
+    if !crate::lossless::encode_frame_lossless_xyb_ink(
+        &image,
+        &alpha,
+        speed,
+        config.decoding_speed,
+        &pool,
+        scratch,
+        &mut frame,
+    ) {
+        return Err(EncodeError::EmptyImage);
+    }
+    Ok(frame)
+}
+
+/// Two lossless modular frames for a vector split: the palette base saved
+/// to reference slot 0, then the coverage frame blended over it (kBlend).
+struct VectorEncode {
+    bytes: Vec<u8>,
+    /// Bytes of the palette base frame and of the coverage band frame.
+    base: usize,
+    band: usize,
+}
+
+fn encode_vector_layers(
+    split: crate::vector_layers::VectorSplit,
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<VectorEncode, EncodeError> {
+    use crate::patches::ModularFrameKind;
+    let pixels = width * height;
+    let planes = |rgb: &[u8]| {
+        let mut image = Image3Si::new(width, height);
+        let mut row = vec![(0i32, 0i32, 0i32); width];
+        for (y, src) in rgb.as_chunks::<3>().0.chunks_exact(width).enumerate() {
+            for (out, &[r, g, b]) in row.iter_mut().zip(src) {
+                *out = forward_ycocg(r as i32, g as i32, b as i32);
+            }
+            for c in 0..3 {
+                let dst = image.plane_row_mut(c, y);
+                for (d, v) in dst.iter_mut().zip(&row) {
+                    *d = match c {
+                        0 => v.0,
+                        1 => v.1,
+                        _ => v.2,
+                    };
+                }
+            }
+        }
+        image
+    };
+    let base = planes(&split.base);
+    let layer = planes(&split.layer);
+    let opaque = AlphaPlane::from_u8(vec![255; pixels]);
+    let banded = split.coverage.iter().any(|&a| a != 0);
+    let coverage = AlphaPlane::from_u8(split.coverage);
+    let mut scratch = Box::new(CoderScratch::lossless());
+    let mut w = BitWriter::new();
+    w.write(8, 0xFF);
+    w.write(8, CODESTREAM_MARKER as u64);
+    write_size_header(width, height, &mut w);
+    write_image_metadata(
+        &ImageMetadataParams {
+            tone_mapping: config.tone_mapping(),
+            color_encoding: &config.color_encoding,
+            alpha: Some(&opaque),
+            black: false,
+            icc_profile: config.icc_profile.as_deref(),
+            bps: BitsPerSample::Eight,
+            lossless: true,
+            xyb_encoded: false,
+            xyb: &XybMatrix::SPEC,
+            grayscale: false,
+            orientation: config.orientation,
+            lossy_modular_16: false,
+            extra_16: false,
+        },
+        &mut scratch,
+        &mut w,
+    );
+    // The frames hold flat regions and a thin band: the Medium lossless
+    // effort codes them within 12% of Slow at a third of the time; the
+    // fastest tiers have no palette or learned tree and triple the size.
+    let speed = if config.speed >= Speed::ExtraSlow {
+        Speed::Slow
+    } else {
+        Speed::Medium
+    };
+    // The Weighted Predictor costs these flat frames decode time and gains
+    // them nothing: 1-2% larger with it.
+    let decoding_speed = if config.decoding_speed == DecodingSpeed::Fastest {
+        DecodingSpeed::Fastest
+    } else {
+        DecodingSpeed::Fast
+    };
+    let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+    let start = w.bits_written();
+    crate::lossless::encode_frame_lossless_layer(
+        &base,
+        &opaque,
+        if banded {
+            ModularFrameKind::RgbSavedFirst
+        } else {
+            ModularFrameKind::Regular
+        },
+        speed,
+        decoding_speed,
+        &pool,
+        &mut scratch,
+        &mut w,
+    );
+    let base_bytes = (w.bits_written() - start) / 8;
+    if banded {
+        crate::lossless::encode_frame_lossless_layer(
+            &layer,
+            &coverage,
+            ModularFrameKind::RgbBlendLast,
+            speed,
+            decoding_speed,
+            &pool,
+            &mut scratch,
+            &mut w,
+        );
+    }
+    let band_bytes = (w.bits_written() - start) / 8 - base_bytes;
+    Ok(VectorEncode {
+        bytes: finalize_container(
+            w.into_bytes(),
+            config.exif.as_deref(),
+            config.xmp.as_deref(),
+            config.brotli_compression.as_deref(),
+            false,
+            encode_gain_map(config)?.as_ref(),
+        )?,
+        base: base_bytes,
+        band: band_bytes,
+    })
 }
 
 /// Encode interleaved 8-bit RGBA samples. Lossy RGB samples use
@@ -1263,6 +1778,31 @@ pub fn encode_image_with_alpha(
                 .with_decoding_speed(config.decoding_speed)
                 .with_num_threads(config.num_threads),
         );
+    }
+    if config.ink_layer
+        && config.coding_transform == CodingTransform::Xyb
+        && !config.progressive_dc
+        && width * height >= 64 * 64
+    {
+        let pixels = input.as_chunks::<4>().0;
+        let rgb: Vec<_> = pixels.iter().flat_map(|&[r, g, b, _]| [r, g, b]).collect();
+        let alpha = AlphaPlane::from_u8(pixels.iter().map(|p| p[3]).collect());
+        let AlphaPlane::U8(alpha_bytes) = &alpha else {
+            unreachable!()
+        };
+        if let Some(candidates) =
+            crate::ink_layer::InkCandidates::new_fast(&rgb, Some(alpha_bytes), width, height)
+        {
+            let plan = candidates.select(config.distance);
+            let budget = crate::vector_layers::vardct_bytes(&rgb, width, height, config.distance);
+            drop(rgb);
+            return select_ink_layered(plan, width, height, config, Some(&alpha), budget, || {
+                let mut plain_config = config.clone();
+                plain_config.ink_layer = false;
+                plain_config.vector_layers = false;
+                encode_image_with_alpha(input, width, height, &plain_config)
+            });
+        }
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let transform = ColorTransform::for_integer(
@@ -2996,6 +3536,38 @@ mod tests {
 mod encode_smoke_tests {
     use super::*;
 
+    #[test]
+    fn palette_ink_is_deterministic_across_workers_and_preserves_plain_fallback() {
+        let (width, height) = (1100, 130);
+        let rgb: Vec<_> = (0..height)
+            .flat_map(|y| {
+                (0..width).flat_map(move |x| {
+                    if (8..122).contains(&y) && (x % 40 < 2) {
+                        [16; 3]
+                    } else if y % 31 < 2 {
+                        [150, 20, 40]
+                    } else {
+                        [240; 3]
+                    }
+                })
+            })
+            .collect();
+        let config = EncodeConfig::default()
+            .with_distance(1.5)
+            .with_ink_layer(true)
+            .with_patches(false);
+        let single =
+            encode_image(&rgb, width, height, &config.clone().with_num_threads(1)).unwrap();
+        let parallel =
+            encode_image(&rgb, width, height, &config.clone().with_num_threads(4)).unwrap();
+        assert_eq!(single, parallel);
+        let flat = vec![200; 64 * 64 * 3];
+        assert_eq!(
+            encode_image(&flat, 64, 64, &config).unwrap(),
+            encode_image(&flat, 64, 64, &config.with_ink_layer(false)).unwrap()
+        );
+    }
+
     const W: usize = 16;
     const H: usize = 16;
 
@@ -3470,7 +4042,10 @@ mod encode_smoke_tests {
                 pixels.extend([v as u8, (v * 0.95) as u8, (v * 0.9) as u8]);
             }
         }
-        let config = slow_lossy(2.0).with_patches(false).with_num_threads(1);
+        let config = slow_lossy(2.0)
+            .with_patches(false)
+            .with_ink_layer(false)
+            .with_num_threads(1);
         let plain = encode_image(&pixels, S, S, &config).unwrap();
         let config = config.with_splines(true);
         let joined = encode_image(&pixels, S, S, &config).unwrap();
@@ -4044,6 +4619,8 @@ mod encode_smoke_tests {
             .with_distance(distance)
             .with_speed(Speed::Slow)
             .with_patches(false)
+            .with_ink_layer(false)
+            .with_vector_layers(false)
             .with_learned_rate(true)
     }
 

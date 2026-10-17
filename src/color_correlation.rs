@@ -1451,6 +1451,8 @@ pub(crate) fn dc_step_wire(dc_step: [f32; 3]) -> Option<[u16; 3]> {
 /// the DC plane carries the flicker: more bits, and visible noise on flat
 /// ground. A slightly finer step moves the levels under the value. Textured
 /// images have no such value and keep the default, which costs no header.
+/// The finer step must also reproduce the DC on the display at least as well
+/// as its rate gain pays for.
 pub(crate) fn choose_dc_steps(
     dc_datas: &[DcGroupData],
     ctx: &EncodingContext,
@@ -1559,15 +1561,75 @@ pub(crate) fn choose_dc_steps(
             }
         }
     }
-    if best + DC_STEP_HEADER_BITS + DC_STEP_MIN_GAIN * base < base {
-        [
-            base_step[0],
-            base_step[1] * steps_y[step_y],
-            base_step[2] * steps_b[step_b],
-        ]
-    } else {
-        default
+    if best + DC_STEP_HEADER_BITS + DC_STEP_MIN_GAIN * base >= base {
+        return default;
     }
+    let chosen = [
+        base_step[0],
+        base_step[1] * steps_y[step_y],
+        base_step[2] * steps_b[step_b],
+    ];
+    // A finer lattice can still reproduce the DC worse: a flat color that the
+    // default step hits lands between two finer levels. Measure both on the
+    // display, where the clamp also forgives any overshoot of white.
+    let mut distortion = |dc_step: [f32; 3]| -> f64 {
+        let factor_y = INV_DC_QUANT[1] / dc_step[1] * scale_dc;
+        let factor_b = INV_DC_QUANT[2] / dc_step[2] * scale_dc;
+        let cfl = dc_cfl_factor(dc_step, ytob_dc, cfl);
+        let oetf = |v: f32| {
+            let v = v.clamp(0.0, 1.0);
+            if v <= 0.0031308 {
+                12.92 * v
+            } else {
+                1.055 * v.powf(1.0 / 2.4) - 0.055
+            }
+        };
+        let mut sum = 0.0f64;
+        for (dc, levels) in dc_datas.iter().zip(&mut y_levels) {
+            let (source_y, source_b) = (
+                dc.source_dc_y.as_ref().unwrap(),
+                dc.source_dc_b.as_ref().unwrap(),
+            );
+            for y in 0..source_y.ysize() {
+                let (row_y, row_b) = (source_y.row(y), source_b.row(y));
+                let row_x = dc.source_dc_x.as_ref().map(|p| p.row(y));
+                let w = row_y.len();
+                let y_quant = &mut levels[y * w..][..w];
+                let b_quant = &mut current[..w];
+                (ctx.quantize_dc_i32)(row_y, factor_y, y_quant);
+                (ctx.quantize_dc_cfl_i32)(row_b, y_quant, factor_b, cfl, b_quant);
+                for x in 0..row_y.len() {
+                    let sx = row_x.map_or(0.0, |r| r[x]);
+                    let yq = y_quant[x] as f32;
+                    let bq = b_quant[x] as f32;
+                    let decoded = crate::xyb::xyb_to_rgb_pixel_f32(
+                        &ctx.xyb,
+                        sx,
+                        yq / factor_y,
+                        (bq + yq * cfl) / factor_b,
+                    );
+                    let source = crate::xyb::xyb_to_rgb_pixel_f32(&ctx.xyb, sx, row_y[x], row_b[x]);
+                    for c in 0..3 {
+                        let e = (oetf(decoded[c]) - oetf(source[c])) as f64;
+                        sum += e * e;
+                    }
+                }
+            }
+        }
+        sum
+    };
+    let (d_chosen, d_default) = (distortion(chosen), distortion(default));
+    if d_chosen <= d_default {
+        return chosen;
+    }
+    // A quantizer spends half a bit per block for each halving of its
+    // distortion, so the bit gain must pay for the relative increase.
+    let blocks: usize = dc_datas
+        .iter()
+        .map(|dc| dc.quant_dc.xsize() * dc.quant_dc.ysize())
+        .sum();
+    let price = blocks as f64 / (2.0 * std::f64::consts::LN_2) * (d_chosen - d_default) / d_default;
+    if base - best > price { chosen } else { default }
 }
 
 /// Subtracting two rounded values can invent a coding gain that disappears

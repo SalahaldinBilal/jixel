@@ -52,9 +52,22 @@ fn channel_weights_for_bias(bias: f32, distance: f32) -> [f32; 3] {
 /// Per-encode dispatch table. The individual modules still own their `OnceLock`
 /// selectors, but hot inner loops receive these already-resolved function
 /// references instead of touching a static guard for every block / band / token.
+/// Place of a VarDCT frame in a layered codestream (see
+/// `EncodeConfig::ink_layer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum FrameRole {
+    /// The only frame.
+    #[default]
+    Last,
+    /// First frame, saved to reference slot 0 after the colour transform;
+    /// the ink frame is blended over it.
+    SavedFirst,
+}
+
 pub(crate) struct EncodingContext {
     pub(crate) thread_pool: ThreadPool,
     pub(crate) speed: Speed,
+    pub(crate) frame_role: FrameRole,
     /// Lossy arm selection from the public config
     pub(crate) lossy_modular: crate::LossyModular,
     /// Code VarDCT frames' DC as a separate DC frame (see
@@ -469,6 +482,7 @@ impl EncodingContext {
         Self {
             thread_pool: ThreadPool::new(num_threads),
             speed,
+            frame_role: FrameRole::Last,
             lossy_modular: crate::LossyModular::Off,
             progressive_dc: false,
             progressive_dc_levels: None,

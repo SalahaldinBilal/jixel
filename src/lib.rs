@@ -68,6 +68,7 @@ mod haar;
 mod icc_codec;
 mod image;
 mod inflated_cost;
+mod ink_layer;
 mod invisible;
 mod iso_gain_map;
 mod jpeg;
@@ -91,6 +92,7 @@ mod ssimulacra2;
 mod static_entropy_codes;
 mod thread_pool;
 mod util;
+mod vector_layers;
 #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
 mod wasm;
 mod weighted_predictor;

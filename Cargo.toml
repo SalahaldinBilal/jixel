@@ -25,7 +25,7 @@ wasm = []
 splines = []
 
 [dependencies]
-cvvdp-lite = "0.1.0"
+cvvdp-lite = "0.1.1"
 ssimu2-lite = "0.1.1"
 
 [profile.profiling]

@@ -46,7 +46,7 @@ fn main() {
     let cfg = EncodeConfig::default()
         .with_lossless(false)
         .with_distance(distance)
-        .with_speed(Speed::ExtraSlow)
+        .with_speed(Speed::Slow)
         .with_progressive(false)
         .with_decoding_speed(DecodingSpeed::Slow)
         .with_patches(true)
@@ -57,6 +57,8 @@ fn main() {
                 .unwrap_or(NonZero::new(1).unwrap())
                 .get(),
         )
+        .with_ink_layer(true)
+        .with_vector_layers(true)
         .with_splines(true)
         .with_dots(false);
     let bytes = jixel::encode_image(&rgb_img, width, height, &cfg).unwrap();

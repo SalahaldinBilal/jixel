@@ -49,6 +49,7 @@ use crate::entropy::{
 };
 use crate::group::write_ac_group;
 use crate::image::{Image3B, Image3F, Image3S, Rect};
+use crate::encoding_context::FrameRole;
 use crate::patches::{MODULAR_PATCH_REF_ID, PATCH_REF_ID, VarDctFrameKind};
 use crate::quant_weights::quant_table_slot_of;
 use crate::static_entropy_codes::{
@@ -972,6 +973,7 @@ fn write_frame_header_kind(
     use_dc_frame: bool,
     coding: crate::coding::CodingTransform,
     epf_channel_scale: Option<[f32; 3]>,
+    role: FrameRole,
     w: &mut BitWriter,
 ) {
     match kind {
@@ -989,6 +991,7 @@ fn write_frame_header_kind(
             use_dc_frame,
             coding,
             epf_channel_scale,
+            role,
             w,
         ),
         VarDctFrameKind::Patched(_) => write_frame_header(
@@ -1005,6 +1008,7 @@ fn write_frame_header_kind(
             use_dc_frame,
             coding,
             epf_channel_scale,
+            role,
             w,
         ),
         VarDctFrameKind::ReferenceOnly { width, height } => {
@@ -1093,6 +1097,7 @@ fn write_frame_header(
     use_dc_frame: bool,
     coding: crate::coding::CodingTransform,
     epf_channel_scale: Option<[f32; 3]>,
+    role: FrameRole,
     w: &mut BitWriter,
 ) {
     w.write(1, 0); // not all default
@@ -1191,7 +1196,14 @@ fn write_frame_header(
         w.write(2, 0); // ec_blending_info[0].mode = Replace
     }
 
-    w.write(1, 1); // last frame
+    match role {
+        FrameRole::Last => w.write(1, 1), // last frame
+        FrameRole::SavedFirst => {
+            w.write(1, 0); // not the last frame
+            w.write(2, 0); // save_as_reference = 0
+            w.write(1, 0); // save_before_color_transform = false
+        }
+    }
     w.write(2, 0); // no name
     write_loop_filter(
         epf_iters,
@@ -4535,6 +4547,7 @@ fn encode_frame_core(
         use_dc_frame,
         ctx.coding,
         ctx.epf_channel_scale,
+        ctx.frame_role,
         writer,
     );
     let payload_bits = dc_frame_bits
@@ -5616,7 +5629,7 @@ fn run_quant_field_loop(
                         region.x1 = region.x1.max(r.x1);
                         region.y1 = region.y1.max(r.y1);
                     }
-                    cand_gbits[task] = group_bits(cand, task);
+                    cand_gbits[task] = group_bits(&cand, task);
                     delta_bits += cand_gbits[task] - cur_gbits[task];
                 }
                 let d = if region.x1 > 0 {

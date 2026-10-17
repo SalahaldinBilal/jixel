@@ -404,6 +404,13 @@ pub struct EncodeConfig {
     pub decoding_speed: DecodingSpeed,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
+    /// Experimental: code the dominant single-color ink lines of cel and
+    /// line art as a second frame (constant color plus a few-level coverage
+    /// alpha, blended with kBlend) over a VarDCT base that is free under the
+    /// ink. Images without such ink are coded as one frame. The layered
+    /// codestream declares an (opaque) alpha channel. 8-bit RGB input in the
+    /// XYB coding transform only; lossless ignores it. Defaults to false.
+    pub ink_layer: bool,
     /// Progressive DC for lossy VarDCT: the 1:8 DC image is coded as its own
     /// squeezed modular frame ahead of the main frame, so a decoder can show
     /// previews refining from 1:256 to 1:8 before any AC data arrives.
@@ -553,6 +560,7 @@ impl Default for EncodeConfig {
             arbiter: Arbiter::Ssimulacra2,
             decoding_speed: DecodingSpeed::Slow,
             lossy_modular: LossyModular::Off,
+            ink_layer: false,
             progressive_dc: false,
             progressive_dc_levels: None,
             group_order: GroupOrder::Scanline,
@@ -898,6 +906,13 @@ impl EncodeConfig {
         self
     }
 
+    /// Experimental ink layer for cel and line art (see
+    /// [`EncodeConfig::ink_layer`]).
+    pub fn with_ink_layer(mut self, ink_layer: bool) -> Self {
+        self.ink_layer = ink_layer;
+        self
+    }
+
     /// Code the lossy DC as a progressive DC frame (see
     /// [`EncodeConfig::progressive_dc`]).
     pub fn with_progressive_dc(mut self, progressive_dc: bool) -> Self {
@@ -1179,6 +1194,13 @@ pub fn encode_image(
                 .with_num_threads(config.num_threads),
         );
     }
+    if config.ink_layer
+        && config.coding_transform == CodingTransform::Xyb
+        && !config.progressive_dc
+        && let Some(split) = crate::ink_layer::split(input, width, height)
+    {
+        return encode_ink_layered(split, width, height, config);
+    }
     let distance = config.distance.max(MIN_DISTANCE);
     let transform = ColorTransform::for_integer(
         8,
@@ -1212,6 +1234,120 @@ pub fn encode_image(
         &cfg,
         &ctx,
         &mut scratch,
+    )
+}
+
+/// Two-frame codestream for an ink split: the base as a VarDCT frame saved
+/// to reference slot 0, then the constant ink color with its coverage
+/// alpha blended over it (kBlend) by the decoder.
+fn encode_ink_layered(
+    split: crate::ink_layer::InkSplit,
+    width: usize,
+    height: usize,
+    config: &EncodeConfig,
+) -> Result<Vec<u8>, EncodeError> {
+    use crate::encoding_context::FrameRole;
+    let distance = config.distance.max(MIN_DISTANCE);
+    let transform = ColorTransform::for_integer(
+        8,
+        config.color_encoding.transfer,
+        config.color_encoding.primaries,
+    );
+    let pixels = width * height;
+    let mut scratch = Box::<CoderScratch>::default();
+    let opaque = AlphaPlane::from_u8(vec![255; pixels]);
+
+    let mut base_ctx = lossy_context(config, distance, XybMatrix::SPEC, pixels);
+    base_ctx.lossy_modular = LossyModular::Off;
+    base_ctx.frame_role = FrameRole::SavedFirst;
+    let linear = linearize_rgb::<_, _, 3>(
+        &split.base,
+        width,
+        height,
+        &base_ctx,
+        &mut scratch,
+        &transform,
+    );
+    base_ctx.set_coding(CodingTransform::Xyb, distance);
+    apply_yellow_opsin(&mut base_ctx, &linear, distance);
+    let mut base_frame = BitWriter::new();
+    encode_frame(
+        &base_ctx,
+        &mut scratch,
+        distance,
+        linear,
+        None,
+        false,
+        Some(&opaque),
+        false,
+        &[0],
+        config.patches,
+        true,
+        &mut base_frame,
+    )?;
+
+    // The ink frame: the ink color on the modular XYB lattice of the image's
+    // opsin matrix, under the lossless coverage alpha.
+    let linear = |v: u8| crate::color::srgb_to_linear_f32(v as f32 / 255.0);
+    let (x, y, b) = crate::xyb::rgb_to_xyb_pixel_f32(
+        &base_ctx.xyb,
+        linear(split.ink[0]),
+        linear(split.ink[1]),
+        linear(split.ink[2]),
+    );
+    let lattice_y = (y * crate::quant_weights::INV_DC_QUANT[1]).round() as i32;
+    let ink = [
+        lattice_y,
+        (x * crate::quant_weights::INV_DC_QUANT[0]).round() as i32,
+        (b * crate::quant_weights::INV_DC_QUANT[2]).round() as i32 - lattice_y,
+    ];
+    let coverage = AlphaPlane::from_u8(split.coverage);
+    let mut ink_frame = BitWriter::new();
+    if !crate::lossless::encode_modular_xyb_ink_frame(
+        ink,
+        width,
+        height,
+        &coverage,
+        config.speed,
+        &base_ctx.thread_pool,
+        &mut scratch,
+        &mut ink_frame,
+    ) {
+        return Err(EncodeError::EmptyImage);
+    }
+
+    let mut w = BitWriter::new();
+    w.write(8, 0xFF);
+    w.write(8, CODESTREAM_MARKER as u64);
+    write_size_header(width, height, &mut w);
+    write_image_metadata(
+        &ImageMetadataParams {
+            tone_mapping: config.tone_mapping(),
+            color_encoding: &config.color_encoding,
+            alpha: Some(&opaque),
+            black: false,
+            icc_profile: config.icc_profile.as_deref(),
+            bps: BitsPerSample::Eight,
+            lossless: false,
+            xyb_encoded: true,
+            xyb: &base_ctx.xyb,
+            grayscale: false,
+            orientation: config.orientation,
+            lossy_modular_16: false,
+            extra_16: false,
+        },
+        &mut scratch,
+        &mut w,
+    );
+    w.append(&base_frame);
+    w.append(&ink_frame);
+    finalize_container(
+        w.into_bytes(),
+        config.exif.as_deref(),
+        config.xmp.as_deref(),
+        config.brotli_compression.as_deref(),
+        false,
+        encode_gain_map(config)?.as_ref(),
     )
 }
 

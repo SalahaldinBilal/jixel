@@ -1406,7 +1406,7 @@ fn encode_frame_lossless_core_impl(
     // displayed frames: a reference-only atlas keeps one context per channel.
     let displayed = matches!(
         frame_kind,
-        ModularFrameKind::Regular | ModularFrameKind::Patched(_)
+        ModularFrameKind::Regular | ModularFrameKind::Patched(_) | ModularFrameKind::XybBlendLast
     );
     let wp_tree = (effort.flat_wp_contexts && use_wp && displayed)
         .then(|| {
@@ -1794,6 +1794,7 @@ fn write_frame_header_modular_kind(
             height,
             slot,
         } => write_frame_header_modular_xyb_reference(width, height, slot, has_alpha, layout, w),
+        ModularFrameKind::XybBlendLast => write_frame_header_modular_xyb_blend_last(has_alpha, layout, w),
         ModularFrameKind::ReferenceOnly { width, height } => {
             w.write(1, 0); // all_default = false
             w.write(2, 0b10); // reference-only frame
@@ -1820,6 +1821,77 @@ fn write_frame_header_modular_kind(
             w.write(2, 0); // no frame-header extensions
         }
     }
+}
+
+/// Frame header of the ink frame: a regular modular frame of the lossy
+/// (`xyb_encoded`) codestream, kBlend over reference slot 0 with extra
+/// channel 0 as its alpha, for the colour channels and the alpha itself.
+fn write_frame_header_modular_xyb_blend_last(has_alpha: bool, layout: GroupLayout, w: &mut BitWriter) {
+    w.write(1, 0); // all_default = false
+    w.write(2, 0b00); // regular frame
+    w.write(1, 1); // encoding = Modular
+    write_u64(0, w); // flags
+    // No do_YCbCr bit: with xyb_encoded set the color transform is XYB.
+    w.write(2, 0b00); // upsampling = 1
+    if has_alpha {
+        w.write(2, 0b00); // ec_upsampling[0] = 1
+    }
+    w.write(2, layout.shift as u64);
+    w.write(2, 0b00); // num_passes = 1
+    w.write(1, 0); // have_crop = false
+    for _ in 0..1 + usize::from(has_alpha) {
+        w.write(2, 2); // mode = kBlend
+        w.write(2, 0); // alpha_channel = 0
+        w.write(1, 0); // clamp = false
+        w.write(2, 0); // source = 0
+    }
+    w.write(1, 1); // is_last
+    w.write(2, 0b00); // name length = 0
+    w.write(1, 0); // loop_filter NOT all_default
+    w.write(1, 0); // no gaborish
+    w.write(2, 0); // 0 EPF iters
+    w.write(2, 0b00); // no LF extensions
+    w.write(2, 0b00); // no FH extensions
+}
+
+/// The ink frame of a layered codestream: one constant colour on the modular
+/// XYB lattice (`ink` = Y, X, B-Y) under the coverage alpha, coded by the
+/// lossless machinery (palette + learned tree) and blended by the decoder.
+pub(crate) fn encode_modular_xyb_ink_frame(
+    ink: [i32; 3],
+    xsize: usize,
+    ysize: usize,
+    coverage: &AlphaPlane,
+    speed: crate::Speed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    let speed = speed.clamp(crate::Speed::Medium, crate::Speed::Slow);
+    let Ok(mut planes) = Image3Si::try_new(xsize, ysize) else {
+        return false;
+    };
+    let (a, b, c) = forward_ycocg(ink[0], ink[1], ink[2]);
+    for y in 0..ysize {
+        planes.plane_row_mut(0, y).fill(a);
+        planes.plane_row_mut(1, y).fill(b);
+        planes.plane_row_mut(2, y).fill(c);
+    }
+    encode_frame_lossless_core(
+        &planes,
+        Some(coverage),
+        14,
+        false,
+        3,
+        speed,
+        crate::DecodingSpeed::Slow,
+        pool,
+        scratch,
+        ModularFrameKind::XybBlendLast,
+        false,
+        writer,
+    );
+    true
 }
 
 /// Frame header for a modular reference-only frame inside the lossy

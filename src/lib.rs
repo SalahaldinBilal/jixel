@@ -68,6 +68,7 @@ mod haar;
 mod icc_codec;
 mod image;
 mod inflated_cost;
+mod ink_layer;
 mod invisible;
 mod iso_gain_map;
 mod jpeg;
@@ -111,8 +112,7 @@ pub use encode_image::{
     encode_image_gray_f32, encode_image_with_alpha, encode_image_with_alpha_10bit,
     encode_image_with_alpha_12bit, encode_image_with_alpha_16bit, encode_image_with_alpha_f16,
     encode_image_with_alpha_f32,
-};
-pub use fast_loseless::{FlMeta, encode_fast_lossless, encode_fast_lossless_u16};
+};pub use fast_loseless::{FlMeta, encode_fast_lossless, encode_fast_lossless_u16};
 pub use gain_map::{GainMap, GainMapPixels};
 pub use iso_gain_map::{GainMapFloats, IsoGainMap};
 pub use jpeg::{

@@ -860,6 +860,10 @@ pub(crate) enum ModularFrameKind<'a> {
         height: usize,
         slot: u32,
     },
+    /// Last frame of an `xyb_encoded` codestream, alpha-blended (kBlend)
+    /// over reference slot 0: channels are Y, X, B-Y on the default LF
+    /// dequant lattice plus the coverage alpha (see `EncodeConfig::ink_layer`).
+    XybBlendLast,
     Patched(&'a [PatchReference]),
 }
 

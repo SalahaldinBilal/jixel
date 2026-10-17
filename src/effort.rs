@@ -134,6 +134,10 @@ effort_gates! {
     lossy_modular_auto,
     splines,
     patches_default,
+    /// `EncodeConfig::ink_layer` is on by default at this speed.
+    ink_layer_default,
+    /// `EncodeConfig::vector_layers` is on by default at this speed.
+    vector_layers_default,
     /// Lossy tile patches also match near-duplicate tiles, not only exact ones.
     near_patch_tiles,
     /// Any config strictly cheaper than the default hybrid-uint wins (else a 0.5% bar).
@@ -220,6 +224,7 @@ const FAST: Effort = Effort {
 };
 
 const MEDIUM: Effort = Effort {
+    vector_layers_default: false,
     full_rerank: false,
     layout_retile: false,
     learned_rate: false,

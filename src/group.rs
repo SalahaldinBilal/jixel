@@ -47,7 +47,7 @@ use crate::entropy::{FrozenTokenPrices, Token, pack_signed};
 use crate::image::{Image3B, Image3F, Image3S, Rect};
 use crate::inflated_cost::Footprint;
 use crate::quant_weights::INV_DC_QUANT;
-use crate::util::{FastRound, HeapMatrix, heap_array};
+use crate::util::{FastRound, HeapMatrix, heap_array, round_i32};
 use std::sync::OnceLock;
 
 const RDOQ_MAX_STRIDE: usize = 2 * (256 + 1);
@@ -979,7 +979,7 @@ fn dc_from_coefficients(ctx: &EncodingContext, raw_strategy: u8, coeffs: &[f32],
 pub(crate) fn quantize_dc_i32_scalar(input: &[f32], scale: f32, output: &mut [i32]) {
     debug_assert_eq!(input.len(), output.len());
     for (&value, target) in input.iter().zip(output) {
-        *target = (value * scale).round() as i32;
+        *target = round_i32(value * scale);
     }
 }
 
@@ -994,7 +994,7 @@ pub(crate) fn quantize_dc_cfl_i32_scalar(
     debug_assert_eq!(input.len(), y_quant.len());
     debug_assert_eq!(input.len(), output.len());
     for ((&value, &yq), target) in input.iter().zip(y_quant).zip(output) {
-        *target = fmla(value, scale, -(yq as f32) * cfl).round() as i32;
+        *target = round_i32(fmla(value, scale, -(yq as f32) * cfl));
     }
 }
 

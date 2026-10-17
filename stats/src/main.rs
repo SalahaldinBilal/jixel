@@ -1012,6 +1012,8 @@ fn bench_jixel(
         .with_speed(Speed::ExtraSlow)
         .with_splines(false)
         .with_dots(false)
+        .with_vector_layers(true)
+        .with_ink_layer(true)
         .with_coding_transform(CodingTransform::Xyb);
     let data = jixel::encode_image(rgb, w, h, &cfg)
         .map_err(|e| anyhow::anyhow!("jixel encode failed: {e:?}"))?;

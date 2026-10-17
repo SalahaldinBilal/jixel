@@ -860,16 +860,30 @@ pub(crate) enum ModularFrameKind<'a> {
         height: usize,
         slot: u32,
     },
-    /// Last frame of an `xyb_encoded` codestream, alpha-blended (kBlend)
+    /// Ink frame of an `xyb_encoded` codestream, alpha-blended (kBlend)
     /// over reference slot 0: channels are Y, X, B-Y on the default LF
     /// dequant lattice plus the coverage alpha (see `EncodeConfig::ink_layer`).
-    XybBlendLast,
+    XybBlend {
+        /// False when further ink frames are stacked on this one: the
+        /// blended canvas is saved back to reference slot 0.
+        last: bool,
+    },
+    /// First frame of a lossless layered codestream (see
+    /// `EncodeConfig::vector_layers`): the palette base, saved to reference
+    /// slot 0 and not displayed on its own.
+    RgbSavedFirst,
+    /// Last frame of a lossless layered codestream: the coverage frame,
+    /// alpha-blended (kBlend) over reference slot 0.
+    RgbBlendLast,
     Patched(&'a [PatchReference]),
 }
 
 impl ModularFrameKind<'_> {
     pub(crate) fn is_regular(self) -> bool {
-        matches!(self, Self::Regular)
+        matches!(
+            self,
+            Self::Regular | Self::RgbSavedFirst | Self::RgbBlendLast
+        )
     }
 
     /// Every frame kind may be coded by the learned-tree path: patched

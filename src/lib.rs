@@ -92,6 +92,7 @@ mod ssimulacra2;
 mod static_entropy_codes;
 mod thread_pool;
 mod util;
+mod vector_layers;
 #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
 mod wasm;
 mod weighted_predictor;

@@ -188,8 +188,13 @@ fn lz_tokens<T: LzTokenSource>(
 
 #[inline]
 fn fingerprint<T: LiteralToken>(tokens: &[T], pos: usize) -> u32 {
+    fingerprint_gram::<T, 3>(tokens, pos)
+}
+
+#[inline]
+fn fingerprint_gram<T: LiteralToken, const GRAM: usize>(tokens: &[T], pos: usize) -> u32 {
     let mut hash = 0x9e37_79b9u32;
-    for token in &tokens[pos..tokens.len().min(pos + 3)] {
+    for token in &tokens[pos..tokens.len().min(pos + GRAM)] {
         let token = token.as_token();
         hash ^= token.value.wrapping_mul(0x85eb_ca6b).rotate_left(13);
         hash = hash.wrapping_mul(0xc2b2_ae35);
@@ -269,10 +274,32 @@ fn find_match_ring<T: LiteralToken>(
     epoch: u32,
     match_kernel: crate::lz_match::MatchKernel<T>,
 ) -> (usize, usize) {
+    find_match_ring_hashed(
+        tokens,
+        pos,
+        ring_hash(tokens, pos),
+        entries,
+        cursors,
+        max_probes,
+        epoch,
+        match_kernel,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_match_ring_hashed<T: LiteralToken>(
+    tokens: &[T],
+    pos: usize,
+    h: usize,
+    entries: &[u32],
+    cursors: &mut [u32],
+    max_probes: usize,
+    epoch: u32,
+    match_kernel: crate::lz_match::MatchKernel<T>,
+) -> (usize, usize) {
     if pos + LZ77_MIN_LENGTH as usize > tokens.len() {
         return (0, 0);
     }
-    let h = ring_hash(tokens, pos);
     let base = h * RING_BUCKET;
     let word = ring_bucket_state(cursors, h, epoch);
     let idx = (word as usize) & (RING_BUCKET - 1);
@@ -493,7 +520,7 @@ pub(super) fn lz77_compress_for_speed(
         huffman_pool,
         ..
     } = scratch;
-    lz77_compress_for_speed_with_parts(
+    lz77_compress_for_speed_with_parts::<_, 3>(
         tokens,
         distance_context,
         speed,
@@ -521,7 +548,7 @@ pub(super) fn lz77_compress_for_speed_with_depth<T: LiteralToken>(
         huffman_pool,
         ..
     } = scratch;
-    lz77_compress_for_speed_with_parts(
+    lz77_compress_for_speed_with_parts::<_, 3>(
         tokens,
         distance_context,
         speed,
@@ -535,7 +562,7 @@ pub(super) fn lz77_compress_for_speed_with_depth<T: LiteralToken>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn lz77_compress_for_speed_with_parts<T: LiteralToken>(
+fn lz77_compress_for_speed_with_parts<T: LiteralToken, const GRAM: usize>(
     tokens: &[T],
     distance_context: u32,
     speed: crate::Speed,
@@ -555,7 +582,13 @@ fn lz77_compress_for_speed_with_parts<T: LiteralToken>(
     // Slow mode's broader candidate selection protects the major Modular
     // alternatives, so do not discard useful 2..10% LZ wins at this local gate.
     let max_candidate_len = run_tokens.len().saturating_mul(98) / 100;
-    if !lz77_compress_with_depth_into_limit(tokens, 8, lz_depth, lz_candidate, max_candidate_len) {
+    if !lz77_compress_with_depth_into_limit_gram::<_, GRAM>(
+        tokens,
+        8,
+        lz_depth,
+        lz_candidate,
+        max_candidate_len,
+    ) {
         return run_tokens;
     }
     let deep_bits = estimate_payload_bits(
@@ -728,7 +761,23 @@ fn lz77_compress_with_depth_into(
 /// Returns false once the monotonically growing output exceeds `max_output`.
 /// The caller can then select an already-built alternative without completing
 /// a candidate that can no longer pass its size gate.
+#[cfg(test)]
 fn lz77_compress_with_depth_into_limit<T: LiteralToken>(
+    tokens: &[T],
+    max_probes: usize,
+    scratch: &mut Vec<u32>,
+    out: &mut Vec<LzToken>,
+    max_output: usize,
+) -> bool {
+    lz77_compress_with_depth_into_limit_gram::<T, 3>(tokens, max_probes, scratch, out, max_output)
+}
+
+#[inline]
+fn ring_hash_gram<T: LiteralToken, const GRAM: usize>(tokens: &[T], pos: usize) -> usize {
+    fingerprint_gram::<T, GRAM>(tokens, pos) as usize & (RING_HASH_SIZE - 1)
+}
+
+fn lz77_compress_with_depth_into_limit_gram<T: LiteralToken, const GRAM: usize>(
     tokens: &[T],
     max_probes: usize,
     scratch: &mut Vec<u32>,
@@ -761,8 +810,20 @@ fn lz77_compress_with_depth_into_limit<T: LiteralToken>(
     let match_kernel = T::match_kernel();
     let mut i = 0usize;
     while i < tokens.len() {
-        let (match_len, distance) =
-            find_match_ring(tokens, i, entries, cursors, max_probes, epoch, match_kernel);
+        let (match_len, distance) = if GRAM == 3 {
+            find_match_ring(tokens, i, entries, cursors, max_probes, epoch, match_kernel)
+        } else {
+            find_match_ring_hashed(
+                tokens,
+                i,
+                ring_hash_gram::<T, GRAM>(tokens, i),
+                entries,
+                cursors,
+                max_probes,
+                epoch,
+                match_kernel,
+            )
+        };
         let threshold = if distance <= 16 { 4 } else { 5 };
         if match_len >= threshold {
             let distance_value = if distance == 1 {
@@ -778,8 +839,24 @@ fn lz77_compress_with_depth_into_limit<T: LiteralToken>(
             if out.len() > max_output {
                 return false;
             }
-            for pos in i..i + match_len {
-                ring_insert(entries, cursors, ring_hash(tokens, pos), pos, epoch);
+            let mut insert_start = i;
+            if GRAM > 3 {
+                // All grams inside a constant prefix share one bucket. Only
+                // its newest RING_BUCKET entries can survive insertion, so
+                // skip those that would immediately be overwritten. Preserve
+                // every gram crossing the end of the constant prefix.
+                let constant =
+                    1 + match_kernel(&tokens[i..i + match_len - 1], &tokens[i + 1..i + match_len]);
+                insert_start += constant.saturating_sub(GRAM + RING_BUCKET - 1);
+            }
+            for pos in insert_start..i + match_len {
+                ring_insert(
+                    entries,
+                    cursors,
+                    ring_hash_gram::<T, GRAM>(tokens, pos),
+                    pos,
+                    epoch,
+                );
             }
             i += match_len;
         } else {
@@ -788,7 +865,13 @@ fn lz77_compress_with_depth_into_limit<T: LiteralToken>(
             if out.len() > max_output {
                 return false;
             }
-            ring_insert(entries, cursors, ring_hash(tokens, i), i, epoch);
+            ring_insert(
+                entries,
+                cursors,
+                ring_hash_gram::<T, GRAM>(tokens, i),
+                i,
+                epoch,
+            );
             i += 1;
         }
     }

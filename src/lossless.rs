@@ -597,6 +597,7 @@ fn coarse_frame_bits(
         xsize,
         6,
         alpha.and_then(constant_alpha_value),
+        3,
     );
     let stage = rank_coarse(
         &source,
@@ -850,7 +851,8 @@ fn encode_frame_lossless_core_impl(
     // RCT re-selection (Slow, regular RGB frames): estimated over the same
     // fixed-context gradient cost libjxl uses. When a non-YCoCg transform
     // wins, the color planes are rebuilt and the frame headers signal it.
-    let mut rct_type = 6u32;
+    // A single gray plane has no RCT.
+    let mut rct_type = if num_color == 3 { 6u32 } else { 0 };
     let mut rct_planes: Option<Image3Si> = None;
     let rct_ranked: Vec<(u32, f32)> =
         if frame_kind.allows_learned_tree() && effort.rct_search && num_color == 3 {
@@ -891,7 +893,7 @@ fn encode_frame_lossless_core_impl(
     // and LZ77 can otherwise reverse the order predicted from residual entropy.
     let compare_tree_candidates = frame_kind.allows_learned_tree()
         && effort.learned_tree
-        && num_color == 3
+        && (num_color == 3 || num_color == 1)
         && decoding_speed.use_ma_trees();
     let mut best_tree_writer: Option<BitWriter> = None;
 
@@ -902,7 +904,7 @@ fn encode_frame_lossless_core_impl(
     // First the two sources are compared by one first-stage learn each under the proxy
     // preset.
     let (layout, learned_tree_decisive, skip_alternatives) = {
-        let palette = if compare_tree_candidates && effort.tree_global_palette {
+        let palette = if compare_tree_candidates && effort.tree_global_palette && num_color == 3 {
             build_global_palette(ycocg, alpha, xsize, ysize, pool, scratch)
         } else {
             None
@@ -949,6 +951,10 @@ fn encode_frame_lossless_core_impl(
         };
         // The ranking learns run under the first layout.
         let rank_layout = layouts[0];
+        // An ink frame is a palette image by construction: its color planes
+        // hold one value per ink, so only the palette source is learned.
+        let palette_only =
+            matches!(frame_kind, ModularFrameKind::XybBlend { .. }) && palette.is_some();
         let mut final_sampling = if effort.tree_full_sampling {
             MA_FULL_SAMPLING
         } else {
@@ -964,8 +970,11 @@ fn encode_frame_lossless_core_impl(
             && effort.tree_rank
             && matches!(decoding_speed, crate::DecodingSpeed::Slow)
         {
-            let mut rgb_stage = {
-                let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
+            let mut rgb_stage = if palette_only {
+                None
+            } else {
+                let source =
+                    rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant, num_color);
                 rank_coarse(
                     &source,
                     xsize,
@@ -1015,7 +1024,8 @@ fn encode_frame_lossless_core_impl(
             let rank_more = source_values_of(xsize, ysize, coded_chans) >= RANK_MIN_VALUES;
             if rank_rgb && rank_more {
                 let (mut best_bits, mut best_coarse, params, stage) = {
-                    let source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
+                    let source =
+                        rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant, num_color);
                     rank_presets(
                         &source,
                         xsize,
@@ -1050,6 +1060,7 @@ fn encode_frame_lossless_core_impl(
                         xsize,
                         runner_up,
                         alpha_constant,
+                        num_color,
                     );
                     if let Some(stage) = rank_coarse(
                         &source,
@@ -1122,7 +1133,8 @@ fn encode_frame_lossless_core_impl(
         let mut rgb_rank_stage = reusable(rgb_rank_stage, rgb_layouts[0]);
         let mut pal_rank_stage = reusable(pal_rank_stage, layouts[0]);
         let (layout, rgb_coarse_est, mut learned_tree_decisive, skip_alternatives) = {
-            let rgb_source = rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant);
+            let rgb_source =
+                rgb_ma_source(linear, alpha, xsize, rct_type, alpha_constant, num_color);
             let mut learned_estimated_savings: Option<f64> = None;
             let learned = if rank_rgb {
                 learn_best_layout(
@@ -1406,7 +1418,11 @@ fn encode_frame_lossless_core_impl(
     // displayed frames: a reference-only atlas keeps one context per channel.
     let displayed = matches!(
         frame_kind,
-        ModularFrameKind::Regular | ModularFrameKind::Patched(_) | ModularFrameKind::XybBlendLast
+        ModularFrameKind::Regular
+            | ModularFrameKind::Patched(_)
+            | ModularFrameKind::XybBlend { .. }
+            | ModularFrameKind::RgbSavedFirst
+            | ModularFrameKind::RgbBlendLast
     );
     let wp_tree = (effort.flat_wp_contexts && use_wp && displayed)
         .then(|| {
@@ -1702,6 +1718,8 @@ fn encode_frame_lossless_core_impl(
             sections[0].write(1, 1);
             write_wp_header(wp_params, &mut sections[0]);
             write_modular_transforms(nb_chans, rct_type, &mut sections[0]);
+            // An empty global stream still carries its ANS state: jxl-oxide reads it.
+            write_lz_section::<LzToken>(&[], distance_ctx, &code, min_symbol, &mut sections[0]);
             sections[0].zero_pad_to_byte();
 
             // ----- DC groups: empty GroupHeader only -----
@@ -1788,13 +1806,21 @@ fn write_frame_header_modular_kind(
 ) {
     match kind {
         ModularFrameKind::Regular => write_frame_header_modular(has_alpha, layout, w),
+        ModularFrameKind::RgbSavedFirst => {
+            write_frame_header_modular_layer(has_alpha, false, layout, w)
+        }
+        ModularFrameKind::RgbBlendLast => {
+            write_frame_header_modular_layer(has_alpha, true, layout, w)
+        }
         ModularFrameKind::Patched(_) => write_frame_header_modular_flags(has_alpha, 2, layout, w),
         ModularFrameKind::XybReferenceOnly {
             width,
             height,
             slot,
         } => write_frame_header_modular_xyb_reference(width, height, slot, has_alpha, layout, w),
-        ModularFrameKind::XybBlendLast => write_frame_header_modular_xyb_blend_last(has_alpha, layout, w),
+        ModularFrameKind::XybBlend { last } => {
+            write_frame_header_modular_xyb_blend(has_alpha, last, layout, w)
+        }
         ModularFrameKind::ReferenceOnly { width, height } => {
             w.write(1, 0); // all_default = false
             w.write(2, 0b10); // reference-only frame
@@ -1826,7 +1852,12 @@ fn write_frame_header_modular_kind(
 /// Frame header of the ink frame: a regular modular frame of the lossy
 /// (`xyb_encoded`) codestream, kBlend over reference slot 0 with extra
 /// channel 0 as its alpha, for the colour channels and the alpha itself.
-fn write_frame_header_modular_xyb_blend_last(has_alpha: bool, layout: GroupLayout, w: &mut BitWriter) {
+fn write_frame_header_modular_xyb_blend(
+    has_alpha: bool,
+    last: bool,
+    layout: GroupLayout,
+    w: &mut BitWriter,
+) {
     w.write(1, 0); // all_default = false
     w.write(2, 0b00); // regular frame
     w.write(1, 1); // encoding = Modular
@@ -1845,53 +1876,20 @@ fn write_frame_header_modular_xyb_blend_last(has_alpha: bool, layout: GroupLayou
         w.write(1, 0); // clamp = false
         w.write(2, 0); // source = 0
     }
-    w.write(1, 1); // is_last
+    if last {
+        w.write(1, 1); // is_last
+    } else {
+        w.write(1, 0); // not the last frame
+        // The blended canvas replaces reference slot 0 for the next ink
+        // frame; kBlend does not reset the canvas, so no save_before_ct bit.
+        w.write(2, 0); // save_as_reference = 0
+    }
     w.write(2, 0b00); // name length = 0
     w.write(1, 0); // loop_filter NOT all_default
     w.write(1, 0); // no gaborish
     w.write(2, 0); // 0 EPF iters
     w.write(2, 0b00); // no LF extensions
     w.write(2, 0b00); // no FH extensions
-}
-
-/// The ink frame of a layered codestream: one constant colour on the modular
-/// XYB lattice (`ink` = Y, X, B-Y) under the coverage alpha, coded by the
-/// lossless machinery (palette + learned tree) and blended by the decoder.
-pub(crate) fn encode_modular_xyb_ink_frame(
-    ink: [i32; 3],
-    xsize: usize,
-    ysize: usize,
-    coverage: &AlphaPlane,
-    speed: crate::Speed,
-    pool: &ThreadPool,
-    scratch: &mut CoderScratch,
-    writer: &mut BitWriter,
-) -> bool {
-    let speed = speed.clamp(crate::Speed::Medium, crate::Speed::Slow);
-    let Ok(mut planes) = Image3Si::try_new(xsize, ysize) else {
-        return false;
-    };
-    let (a, b, c) = forward_ycocg(ink[0], ink[1], ink[2]);
-    for y in 0..ysize {
-        planes.plane_row_mut(0, y).fill(a);
-        planes.plane_row_mut(1, y).fill(b);
-        planes.plane_row_mut(2, y).fill(c);
-    }
-    encode_frame_lossless_core(
-        &planes,
-        Some(coverage),
-        14,
-        false,
-        3,
-        speed,
-        crate::DecodingSpeed::Slow,
-        pool,
-        scratch,
-        ModularFrameKind::XybBlendLast,
-        false,
-        writer,
-    );
-    true
 }
 
 /// Frame header for a modular reference-only frame inside the lossy
@@ -2190,6 +2188,108 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     writer.append_byte_aligned(std::slice::from_mut(&mut section));
     writer.zero_pad_to_byte();
     true
+}
+
+/// Frame header of a lossless layer frame: the palette base saved to
+/// reference slot 0 (not last), or the coverage frame blended over it
+/// (kBlend with extra channel 0 as alpha, last).
+fn write_frame_header_modular_layer(
+    has_alpha: bool,
+    blend_last: bool,
+    layout: GroupLayout,
+    w: &mut BitWriter,
+) {
+    w.write(1, 0); // all_default = false
+    w.write(2, 0b00); // regular frame
+    w.write(1, 1); // encoding = Modular
+    write_u64(0, w); // flags
+    w.write(1, 0); // do_ycbcr = false
+    w.write(2, 0b00); // upsampling = 1
+    if has_alpha {
+        w.write(2, 0b00); // ec_upsampling[0] = 1
+    }
+    w.write(2, layout.shift as u64);
+    w.write(2, 0b00); // num_passes = 1
+    w.write(1, 0); // have_crop = false
+    if blend_last {
+        for _ in 0..1 + usize::from(has_alpha) {
+            w.write(2, 2); // mode = kBlend
+            w.write(2, 0); // alpha_channel = 0
+            w.write(1, 0); // clamp = false
+            w.write(2, 0); // source = 0
+        }
+        w.write(1, 1); // is_last
+    } else {
+        w.write(2, 0b00); // blending = Replace
+        if has_alpha {
+            w.write(2, 0b00); // ec blending = Replace
+        }
+        w.write(1, 0); // not the last frame
+        w.write(2, 0); // save_as_reference = 0
+        w.write(1, 0); // save_before_color_transform = false
+    }
+    w.write(2, 0b00); // name length = 0
+    w.write(1, 0); // loop_filter NOT all_default
+    w.write(1, 0); // no gaborish
+    w.write(2, 0); // 0 EPF iters
+    w.write(2, 0b00); // no LF extensions
+    w.write(2, 0b00); // no FH extensions
+}
+
+/// One lossless 8-bit RGB(+alpha) frame of a layered codestream.
+#[allow(clippy::too_many_arguments)]
+/// Ink frame of the lossy codestream: XYB lattice ints (Y, X, B-Y, run
+/// through YCoCg like RGB so the signaled RCT restores them exactly) and the
+/// coverage alpha, blended over reference slot 0 with the learned-tree coder.
+pub(crate) fn encode_frame_lossless_xyb_ink(
+    linear: &Image3Si,
+    alpha: &AlphaPlane,
+    speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) -> bool {
+    encode_frame_lossless_core(
+        linear,
+        Some(alpha),
+        13,
+        false,
+        3,
+        speed,
+        decoding_speed,
+        pool,
+        scratch,
+        ModularFrameKind::XybBlend { last: true },
+        true,
+        writer,
+    )
+}
+
+pub(crate) fn encode_frame_lossless_layer(
+    linear: &Image3Si,
+    alpha: &AlphaPlane,
+    kind: ModularFrameKind<'_>,
+    speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) {
+    encode_frame_lossless_core(
+        linear,
+        Some(alpha),
+        8,
+        false,
+        3,
+        speed,
+        decoding_speed,
+        pool,
+        scratch,
+        kind,
+        true,
+        writer,
+    );
 }
 
 fn write_frame_header_modular(has_alpha: bool, layout: GroupLayout, w: &mut BitWriter) {
@@ -4027,7 +4127,7 @@ fn mixed_ma_source<'a>(
     palettes: &'a [Option<palette::LocalPaletteGroup>],
     alpha_constant: Option<i32>,
 ) -> MaSource<'a> {
-    let mut source = rgb_ma_source(ycocg, alpha, xsize, 6, alpha_constant);
+    let mut source = rgb_ma_source(ycocg, alpha, xsize, 6, alpha_constant, 3);
     source.group_channels = palettes
         .iter()
         .map(|palette| {
@@ -4058,16 +4158,17 @@ fn mixed_ma_source<'a>(
     source
 }
 
-/// The YCoCg(A) planes as a learned-tree source.
+/// The YCoCg(A) planes, or the single gray plane, as a learned-tree source.
 fn rgb_ma_source<'a>(
     linear: &'a Image3Si,
     alpha: Option<&'a AlphaPlane>,
     xsize: usize,
     rct_type: u32,
     alpha_constant: Option<i32>,
+    num_color: usize,
 ) -> MaSource<'a> {
     let ysize = linear.ysize();
-    let mut channels: Vec<MaChannel<'a>> = (0..3)
+    let mut channels: Vec<MaChannel<'a>> = (0..num_color)
         .map(|c| {
             let pd = linear.plane_data(c);
             MaChannel {
@@ -4699,7 +4800,6 @@ fn write_learned_tree_frame(
                         scratch,
                         num_ac_groups,
                         num_dc_groups,
-                        has_global_stream,
                         dictionary,
                         &mut best,
                         &mut best_bits,
@@ -4719,7 +4819,6 @@ fn write_learned_tree_frame(
                         scratch,
                         num_ac_groups,
                         num_dc_groups,
-                        has_global_stream,
                         dictionary,
                         &mut best,
                         &mut best_bits,
@@ -5079,6 +5178,9 @@ fn write_local_tree_sections(
     sections[0].write(1, 0); // use_global_tree = 0 (no channel is coded here)
     write_wp_header(wp_params, &mut sections[0]);
     source.write_transforms(&mut sections[0]);
+    // libjxl skips an empty stream's tree; jxl-oxide parses one.
+    let empty_code = crate::modular::build_pixel_code(&[Token::new(0, 0)], scratch);
+    crate::modular::write_tree_and_pixel_histograms(&empty_code, scratch, &mut sections[0]);
     sections[0].zero_pad_to_byte();
     for section in sections[1..num_dc_groups + 2].iter_mut() {
         section.write(1, 0); // use_global_tree = 0
@@ -5350,7 +5452,6 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     scratch: &mut CoderScratch,
     num_ac_groups: usize,
     num_dc_groups: usize,
-    has_global_stream: bool,
     dictionary: Option<&BitWriter>,
     best: &mut Option<Vec<BitWriter>>,
     best_bits: &mut usize,
@@ -5395,16 +5496,15 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     sections[0].write(1, 1); // use_global_tree
     write_wp_header(wp_params, &mut sections[0]);
     source.write_transforms(&mut sections[0]);
-    if has_global_stream {
-        write_lz_section_tail(
-            &streams[0],
-            tails[0],
-            distance_ctx,
-            &code,
-            min_symbol,
-            &mut sections[0],
-        );
-    }
+    // An empty global stream still carries its ANS state: jxl-oxide reads it.
+    write_lz_section_tail(
+        &streams[0],
+        tails[0],
+        distance_ctx,
+        &code,
+        min_symbol,
+        &mut sections[0],
+    );
     sections[0].zero_pad_to_byte();
 
     for section in sections[1..num_dc_groups + 1].iter_mut() {
@@ -5992,6 +6092,8 @@ fn try_encode_context_tree_multi_group(
     sections[0].write(1, 1); // use_global_tree
     write_wp_header(wp_params, &mut sections[0]);
     write_modular_transforms(nb_chans, rct_type, &mut sections[0]);
+    // An empty global stream still carries its ANS state: jxl-oxide reads it.
+    write_lz_section::<LzToken>(&[], distance_ctx, &code, min_symbol, &mut sections[0]);
     sections[0].zero_pad_to_byte();
 
     for section in sections[1..num_dc_groups + 1].iter_mut() {

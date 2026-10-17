@@ -700,9 +700,12 @@ fn tokenize_channel_with_wp(
     buckets: Option<&WpChannelContexts>,
 ) {
     let nb_chans = num_color + usize::from(alpha.is_some());
-    let ctx = channel_to_context(chan, nb_chans);
-    if let Some(buckets) = buckets {
-        debug_assert_eq!(predictors[chan], PREDICTOR_WEIGHTED);
+    // The shared WP tree also contains single leaves for non-WP channels.
+    // Those channels keep their selected predictor and the leaf's context.
+    let ctx = buckets.map_or_else(|| channel_to_context(chan, nb_chans), |b| b.contexts[0]);
+    if predictors[chan] == PREDICTOR_WEIGHTED
+        && let Some(buckets) = buckets
+    {
         let ctx = WpBucketContexts(buckets);
         if chan < num_color {
             tokenize_wp_row_slices(
@@ -1663,6 +1666,88 @@ pub(super) fn clamped_gradient(w: i64, n: i64, nw: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mixed_wp_contexts_preserve_other_channels_predictors_and_leaf_contexts() {
+        let (width, height) = (17, 11);
+        let mut image = Image3Si::new(width, height);
+        for c in 0..3 {
+            for y in 0..height {
+                for (x, v) in image.plane_row_mut(c, y).iter_mut().enumerate() {
+                    *v = ((x * 37 + y * 19 + c * 11) % 97) as i32 - 48;
+                }
+            }
+        }
+        let alpha = AlphaPlane::from_u8(
+            (0..width * height)
+                .map(|i| {
+                    if (i % width + i / width) % 7 < 3 {
+                        0
+                    } else {
+                        255
+                    }
+                })
+                .collect(),
+        );
+        let leaf_context = 42;
+        let buckets = WpChannelContexts {
+            contexts: [leaf_context; WP_CONTEXT_BUCKETS],
+            shift: 6,
+        };
+        for chan in [0, 3] {
+            for pred in SLOW_PREDICTORS
+                .into_iter()
+                .filter(|&p| p != PREDICTOR_WEIGHTED)
+            {
+                let mut predictors = [PREDICTOR_WEIGHTED; 4];
+                predictors[chan] = pred;
+                let mut actual = Vec::new();
+                tokenize_channel_with_wp(
+                    &image,
+                    Some(&alpha),
+                    width,
+                    0,
+                    0,
+                    width,
+                    height,
+                    3,
+                    &predictors,
+                    chan,
+                    grad_pack_interior_scalar,
+                    &mut GradientScratch::default(),
+                    &mut actual,
+                    WpParams::DEFAULT,
+                    Some(&buckets),
+                );
+                let mut expected = Vec::new();
+                tokenize_plane_with_wp(
+                    leaf_context,
+                    |x, y| {
+                        if chan == 3 {
+                            alpha.get_i32(y * width + x)
+                        } else {
+                            image.plane_row(chan, y)[x]
+                        }
+                    },
+                    width,
+                    height,
+                    pred,
+                    grad_pack_interior_scalar,
+                    &mut GradientScratch::default(),
+                    &mut expected,
+                    WpParams::DEFAULT,
+                );
+                assert_eq!(actual.len(), expected.len());
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(a, b)| (a.context, a.value) == (b.context, b.value)),
+                    "channel {chan}, predictor {pred}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn row_neighbors_match_point_fetches_at_every_border() {

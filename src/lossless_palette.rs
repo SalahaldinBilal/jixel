@@ -938,6 +938,8 @@ pub(super) fn try_encode_local_palette_multi_group(
     sections[0].write(1, 1); // use_global_tree
     sections[0].write(1, 1); // wp_default
     write_modular_transforms(nb_chans, 6, &mut sections[0]);
+    // An empty global stream still carries its ANS state: jxl-oxide reads it.
+    write_lz_section::<LzToken>(&[], distance_ctx, &code, min_symbol, &mut sections[0]);
     sections[0].zero_pad_to_byte();
 
     for section in sections[1..num_dc_groups + 1].iter_mut() {

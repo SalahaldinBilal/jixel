@@ -342,6 +342,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         decoding_speed: base.decoding_speed,
         lossy_modular: base.lossy_modular,
         ink_layer: false,
+        vector_layers: false,
         progressive_dc: false,
         progressive_dc_levels: None,
         group_order: crate::GroupOrder::Scanline,

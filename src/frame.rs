@@ -6965,6 +6965,8 @@ fn learn_ma_dc_arm(
         allowed_preds: u16::MAX,
         side_preds: 4,
         max_candidates: 32,
+        modal_offsets: false,
+        prune_leaf_bits: 0.0,
     };
     let tree = crate::ma_tree::learn_ma_tree(&samples, params, &ctx.thread_pool, scratch);
     drop(samples);
@@ -7112,8 +7114,8 @@ fn process_ac_group(
     }
     let mut recon = capture_recon.then(|| {
         let plane = match memo.as_deref_mut() {
-            Some(m) => std::mem::replace(m.recon_mut(), crate::image::Image3F::new(0, 0)),
-            None => crate::image::Image3F::new(group_xsize, group_ysize),
+            Some(m) => std::mem::replace(m.recon_mut(), Image3F::new(0, 0)),
+            None => Image3F::new(group_xsize, group_ysize),
         };
         (plane, Vec::new())
     });

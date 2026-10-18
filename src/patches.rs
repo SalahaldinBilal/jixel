@@ -875,14 +875,29 @@ pub(crate) enum ModularFrameKind<'a> {
     /// Last frame of a lossless layered codestream: the coverage frame,
     /// alpha-blended (kBlend) over reference slot 0.
     RgbBlendLast,
-    Patched(&'a [PatchReference]),
+    /// A region frame (see `region_frames`): a crop of the image at
+    /// (`x0`, `y0`) replacing that rectangle of reference slot 0, saved back
+    /// to the slot unless it is the last frame.
+    RgbCrop {
+        x0: usize,
+        y0: usize,
+        width: usize,
+        height: usize,
+        last: bool,
+    },
+    Patched {
+        references: &'a [PatchReference],
+        /// The frame is the base of region frames: saved to reference slot
+        /// 0 and not the last frame.
+        saved_first: bool,
+    },
 }
 
 impl ModularFrameKind<'_> {
     pub(crate) fn is_regular(self) -> bool {
         matches!(
             self,
-            Self::Regular | Self::RgbSavedFirst | Self::RgbBlendLast
+            Self::Regular | Self::RgbSavedFirst | Self::RgbBlendLast | Self::RgbCrop { .. }
         )
     }
 

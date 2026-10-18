@@ -784,7 +784,7 @@ fn emit_lm_forest(
                     gt: gt + base,
                     le: le + base,
                 },
-                MaNode::Leaf { pred } => MaNode::Leaf { pred },
+                leaf @ MaNode::Leaf { .. } => leaf,
             });
             mult_of.push(tag_mults[t]);
         }
@@ -876,7 +876,7 @@ fn emit_forest_bfs(
                 queue.push_back(gt);
                 queue.push_back(le);
             }
-            MaNode::Leaf { pred } => {
+            MaNode::Leaf { pred, .. } => {
                 push_leaf_mul(&mut tokens, pred, mult_of[i as usize]);
                 leaf_ctx[i as usize] = ctx;
                 ctx += 1;
@@ -1689,7 +1689,7 @@ fn encode_lm_frame(
                 WpParams::DEFAULT,
                 false,
                 stride,
-                |props, tok| samples.push(props, tok),
+                |props, tok, _| samples.push(props, tok),
             );
             scale_ma_value_props(&mut samples, tag_quants[t] as i32);
             samples
@@ -1729,6 +1729,8 @@ fn encode_lm_frame(
                 allowed_preds: LM_SAFE_PRED_MASK,
                 side_preds: 1,
                 max_candidates: MA_PHOTO_CANDIDATES,
+                modal_offsets: false,
+                prune_leaf_bits: 0.0,
             };
             let samples = &tag_samples[t];
             if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
@@ -1771,6 +1773,8 @@ fn encode_lm_frame(
                 allowed_preds: LM_SAFE_PRED_MASK,
                 side_preds: 1,
                 max_candidates: MA_PHOTO_CANDIDATES,
+                modal_offsets: false,
+                prune_leaf_bits: 0.0,
             };
             learned[worst] = learn_ma_tree(&tag_samples[worst], params, pool, scratch);
             total_leaves = learned.iter().map(leaves_of).sum();
@@ -2209,7 +2213,7 @@ impl ExtraSqueeze {
                 WpParams::DEFAULT,
                 false,
                 step,
-                |props, tok| samples.push(props, tok),
+                |props, tok, _| samples.push(props, tok),
             );
             scale_ma_value_props(&mut samples, self.quants[c] as i32);
             let params = |max_leaves: usize| MaLearnParams {
@@ -2221,6 +2225,8 @@ impl ExtraSqueeze {
                 allowed_preds: LM_SAFE_PRED_MASK,
                 side_preds: 1,
                 max_candidates: MA_PHOTO_CANDIDATES,
+                modal_offsets: false,
+                prune_leaf_bits: 0.0,
             };
             let budget = (px / LM_BUDGET_DIV).clamp(1, LM_BUDGET_CAP);
             let tree = if samples.len() < 4 * MA_MIN_NODE_SAMPLES {
@@ -2383,7 +2389,7 @@ pub(crate) fn learn_global_plane_tree(
             WpParams::DEFAULT,
             false,
             step,
-            |props, tok| samples.push(props, tok),
+            |props, tok, _| samples.push(props, tok),
         );
     }
     scale_ma_value_props(&mut samples, q as i32);
@@ -2400,6 +2406,8 @@ pub(crate) fn learn_global_plane_tree(
         },
         side_preds: GLOBAL_PLANE_SIDE_PREDS,
         max_candidates: MA_PHOTO_CANDIDATES,
+        modal_offsets: false,
+        prune_leaf_bits: 0.0,
     };
     let tree = learn_ma_tree(&samples, params, pool, scratch);
     drop(samples);
@@ -2491,7 +2499,7 @@ fn emit_slot_forest(trees: &[LearnedTree], mults: &[u32]) -> (Vec<Token>, Vec<u3
                     gt: gt + base,
                     le: le + base,
                 },
-                MaNode::Leaf { pred } => MaNode::Leaf { pred },
+                leaf @ MaNode::Leaf { .. } => leaf,
             });
             mult_of.push(mults[slot]);
         }
@@ -2520,7 +2528,7 @@ fn emit_slot_forest(trees: &[LearnedTree], mults: &[u32]) -> (Vec<Token>, Vec<u3
                 queue.push_back(gt);
                 queue.push_back(le);
             }
-            MaNode::Leaf { pred } => {
+            MaNode::Leaf { pred, .. } => {
                 push_leaf_mul(&mut tokens, pred, mult_of[i as usize]);
                 leaf_ctx[i as usize] = ctx;
                 ctx += 1;

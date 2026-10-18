@@ -717,7 +717,7 @@ pub(crate) fn graft_ma_dc_tree(
                 gt: Box::new(convert(nodes, offsets, gt)),
                 le: Box::new(convert(nodes, offsets, le)),
             },
-            crate::ma_tree::MaNode::Leaf { pred } => Node::Leaf {
+            crate::ma_tree::MaNode::Leaf { pred, .. } => Node::Leaf {
                 tag: LeafTag::Ma(i),
                 pred,
                 offset: pack_signed(offsets[i as usize]),

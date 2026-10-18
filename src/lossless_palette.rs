@@ -36,18 +36,19 @@ use super::lz77::{
 };
 use super::predictor::{
     GradPackInteriorFn, GradientScratch, SqueezePredictorCost, TokenSink, channel_to_context,
-    choose_predictor_for_rows, fixed_predictor, tokenize_channels_with_wp, tokenize_plane_rows,
-    tokenize_runs_with_wp, tokenize_sample_rows,
+    choose_predictor_for_rows, clamped_gradient, fixed_predictor, tokenize_channels_with_wp,
+    tokenize_plane_rows, tokenize_runs_with_wp, tokenize_sample_rows,
 };
-use super::rct::{inverse_ycocg, rct_gradient_row};
+use super::rct::inverse_ycocg;
 use super::{
-    DeepLzScratchPool, GROUP_DIM, GroupLayout, MaChannel, MaPixels, MaSource, MaTransform,
-    SLOW_DEEP_LZ_MAX_THREADS, group_lz_threads, write_frame_header_modular,
+    DeepLzScratchPool, EntropyOfHistFn, GROUP_DIM, GroupLayout, MaChannel, MaPixels, MaSource,
+    MaTransform, SLOW_DEEP_LZ_MAX_THREADS, group_lz_threads, write_frame_header_modular,
     write_lz_groups_with_header, write_modular_transforms, write_toc_entry,
 };
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
+use crate::entropy::{pack_signed, uint_encode};
 use crate::image::Image3Si;
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
@@ -1242,9 +1243,76 @@ fn cooccurrence_chain(n: usize, cooc: &[u32]) -> Vec<i32> {
     order
 }
 
-/// Gradient-predictor residual entropy of the index image under a candidate
-/// order, over the same activity contexts as the RCT estimator (rows are
-/// scored in parallel; the histogram sums make the split irrelevant).
+/// Contexts of `estimate_index_plane_cost`: the sign pattern of four
+/// neighbor differences (W-NW, N-NW, N-NE, W-WW).
+const INDEX_COST_CONTEXTS: usize = 81;
+/// Token alphabet of its residual histograms.
+const INDEX_COST_ALPHABET: usize = 64;
+/// Residual predictors it scores per context: Left, Top, clamped gradient.
+const INDEX_COST_PREDS: usize = 3;
+
+/// Histograms of one palette order's index plane: per context, the
+/// hybrid-uint token histogram and raw bits of every predictor's residual,
+/// and the histogram of the indices themselves.
+struct IndexCostHist {
+    /// `[context][predictor][token]`.
+    tokens: Vec<u64>,
+    /// `[context][predictor]`.
+    raw_bits: Vec<u64>,
+    /// `[context][index]`, `nb_colors` wide.
+    values: Vec<u64>,
+    nb_colors: usize,
+}
+
+impl IndexCostHist {
+    fn new(nb_colors: usize) -> Self {
+        Self {
+            tokens: vec![0; INDEX_COST_CONTEXTS * INDEX_COST_PREDS * INDEX_COST_ALPHABET],
+            raw_bits: vec![0; INDEX_COST_CONTEXTS * INDEX_COST_PREDS],
+            values: vec![0; INDEX_COST_CONTEXTS * nb_colors],
+            nb_colors,
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        for (a, b) in self.tokens.iter_mut().zip(&other.tokens) {
+            *a += b;
+        }
+        for (a, b) in self.raw_bits.iter_mut().zip(&other.raw_bits) {
+            *a += b;
+        }
+        for (a, b) in self.values.iter_mut().zip(&other.values) {
+            *a += b;
+        }
+    }
+
+    /// Bits of the plane with, per context, the cheapest of the residual
+    /// predictors and a constant prediction of the context's own index
+    /// distribution (what a learned tree's leaf would code).
+    fn cost(&self, entropy_of_hist: EntropyOfHistFn) -> f32 {
+        let mut cost = 0.0f32;
+        for ctx in 0..INDEX_COST_CONTEXTS {
+            let values = &self.values[ctx * self.nb_colors..][..self.nb_colors];
+            let mut best = entropy_of_hist(values, values.iter().sum());
+            for pred in 0..INDEX_COST_PREDS {
+                let slot = ctx * INDEX_COST_PREDS + pred;
+                let tokens = &self.tokens[slot * INDEX_COST_ALPHABET..][..INDEX_COST_ALPHABET];
+                let bits =
+                    entropy_of_hist(tokens, tokens.iter().sum()) + self.raw_bits[slot] as f32;
+                best = best.min(bits);
+            }
+            cost += best;
+        }
+        cost
+    }
+}
+
+/// Estimated bits of the index plane under `order` (`order[canonical] =
+/// final index`), the measure that ranks the candidate palette orders:
+/// per sign-pattern context the cheaper of Left, Top and gradient residuals
+/// or the context's index distribution. A gradient-only estimate ranked the
+/// co-occurrence chain first on text and UI renders, where luma order codes
+/// 1-22% smaller.
 fn estimate_index_plane_cost(
     indices: &[u16],
     xsize: usize,
@@ -1254,72 +1322,70 @@ fn estimate_index_plane_cost(
     scratch: &mut CoderScratch,
 ) -> f32 {
     let entropy_of_hist = scratch.entropy_of_hist;
-    const NCTX: usize = 18;
-    const ALPHA: usize = 64;
+    let nb_colors = order.len();
     let threads = pool.num_threads().min(ysize.max(1));
     let rows_per = ysize.div_ceil(threads).max(1);
-    let parts = pool.steal_map(scratch, ysize.div_ceil(rows_per), |part, scratch| {
+    let parts = pool.steal_map(scratch, ysize.div_ceil(rows_per), |part, _scratch| {
         let y0 = part * rows_per;
-        index_plane_cost_rows(
+        index_cost_rows(
             indices,
             xsize,
             y0,
             (y0 + rows_per).min(ysize),
             order,
-            &mut scratch.gradient,
+            nb_colors,
         )
     });
-    let mut hist = [0u64; NCTX * ALPHA];
-    let mut extra_bits = 0u64;
-    for (h, e) in parts {
-        for (a, b) in hist.iter_mut().zip(h) {
-            *a += b;
-        }
-        extra_bits += e;
+    let mut hist = IndexCostHist::new(nb_colors);
+    for part in &parts {
+        hist.add(part);
     }
-    let mut cost = extra_bits as f32;
-    for h in hist.as_chunks::<ALPHA>().0 {
-        let total: u64 = h.iter().sum();
-        cost += entropy_of_hist(h, total);
-    }
-    cost
+    hist.cost(entropy_of_hist)
 }
 
-fn index_plane_cost_rows(
+/// Histograms of rows `y_begin..y_end` of the plane under `order`. Neighbors
+/// outside the plane read as index 0; the row above a band is the plane's.
+fn index_cost_rows(
     indices: &[u16],
     xsize: usize,
     y_begin: usize,
     y_end: usize,
     order: &[i32],
-    scratch: &mut GradientScratch,
-) -> ([u64; 18 * 64], u64) {
-    const NCTX: usize = 18;
-    const ALPHA: usize = 64;
-    let mut hist = [0u64; NCTX * ALPHA];
-    let mut extra_bits = 0u64;
-    if xsize == 0 || y_begin == y_end {
-        return (hist, extra_bits);
-    }
-    scratch.cur.resize(xsize, 0);
-    scratch.prev.resize(xsize, 0);
-    let mut current = scratch.cur.as_mut_slice();
-    let mut north = scratch.prev.as_mut_slice();
-    let remap = |y: usize, out: &mut [i32]| {
-        let row = &indices[y * xsize..][..xsize];
-        for (out, &index) in out.iter_mut().zip(row) {
-            *out = order[index as usize];
-        }
-    };
-    // Each parallel band starts with the preceding image row, not a crop edge.
-    if y_begin > 0 {
-        remap(y_begin - 1, north);
-    }
+    nb_colors: usize,
+) -> IndexCostHist {
+    let mut hist = IndexCostHist::new(nb_colors);
+    let at = |x: usize, y: usize| order[indices[y * xsize + x] as usize];
     for y in y_begin..y_end {
-        remap(y, current);
-        extra_bits += rct_gradient_row(current, north, y == 0, &mut hist);
-        std::mem::swap(&mut current, &mut north);
+        for x in 0..xsize {
+            let v = at(x, y);
+            let left = if x > 0 { at(x - 1, y) } else { 0 };
+            let left_left = if x > 1 { at(x - 2, y) } else { 0 };
+            let (top, top_left, top_right) = if y > 0 {
+                (
+                    at(x, y - 1),
+                    if x > 0 { at(x - 1, y - 1) } else { 0 },
+                    if x + 1 < xsize { at(x + 1, y - 1) } else { 0 },
+                )
+            } else {
+                (0, 0, 0)
+            };
+            let sign = |d: i32| (d.signum() + 1) as usize;
+            let ctx = sign(left - top_left) * 27
+                + sign(top - top_left) * 9
+                + sign(top - top_right) * 3
+                + sign(left - left_left);
+            let gradient = clamped_gradient(left as i64, top as i64, top_left as i64) as i32;
+            for (pred, prediction) in [left, top, gradient].into_iter().enumerate() {
+                let slot = ctx * INDEX_COST_PREDS + pred;
+                let (tok, nb, _) = uint_encode(pack_signed(v - prediction));
+                hist.tokens
+                    [slot * INDEX_COST_ALPHABET + (tok as usize).min(INDEX_COST_ALPHABET - 1)] += 1;
+                hist.raw_bits[slot] += nb as u64;
+            }
+            hist.values[ctx * nb_colors + v as usize] += 1;
+        }
     }
-    (hist, extra_bits)
+    hist
 }
 
 #[derive(Default)]
@@ -1477,10 +1543,7 @@ pub(super) fn build_global_palette(
 
 #[cfg(test)]
 mod tests {
-    use super::super::predictor::clamped_gradient;
-    use super::super::rct::rct_context;
     use super::*;
-    use crate::entropy::{pack_signed, uint_encode};
 
     #[test]
     fn color_hasher_accepts_array_hashing_and_uses_every_channel() {
@@ -1556,46 +1619,6 @@ mod tests {
         }
     }
 
-    fn reference_index_cost_rows(
-        indices: &[u16],
-        xsize: usize,
-        y_begin: usize,
-        y_end: usize,
-        order: &[i32],
-    ) -> (Vec<u64>, u64) {
-        const NCTX: usize = 18;
-        const ALPHA: usize = 64;
-        let mut hist = vec![0u64; NCTX * ALPHA];
-        let mut extra_bits = 0u64;
-        let at = |x: usize, y: usize| order[indices[y * xsize + x] as usize];
-        for y in y_begin..y_end {
-            for x in 0..xsize {
-                let left = if x > 0 {
-                    at(x - 1, y)
-                } else if y > 0 {
-                    at(x, y - 1)
-                } else {
-                    0
-                };
-                let top = if y > 0 { at(x, y - 1) } else { left };
-                let topleft = if x > 0 && y > 0 {
-                    at(x - 1, y - 1)
-                } else {
-                    left
-                };
-                let mx = left.max(top).max(topleft);
-                let mn = left.min(top).min(topleft);
-                let ctx = rct_context((mx - mn) as u32);
-                let res =
-                    at(x, y) as i64 - clamped_gradient(left as i64, top as i64, topleft as i64);
-                let (tok, nb, _) = uint_encode(pack_signed(res as i32));
-                hist[ctx * ALPHA + (tok as usize).min(ALPHA - 1)] += 1;
-                extra_bits += nb as u64;
-            }
-        }
-        (hist, extra_bits)
-    }
-
     #[test]
     fn pooled_index_cost_matches_serial_histograms() {
         let entropy_of_hist = super::super::selected_entropy_of_hist_fn();
@@ -1609,18 +1632,16 @@ mod tests {
                 (0..COLORS as i32).rev().collect(),
                 (0..COLORS).map(|i| ((i * 7) % COLORS) as i32).collect(),
             ] {
-                let (hist, extra_bits) = reference_index_cost_rows(&indices, w, 0, h, &order);
-                let mut rows = GradientScratch::default();
+                let whole = index_cost_rows(&indices, w, 0, h, &order, COLORS);
+                // Bands sum to the whole plane's histograms.
                 for begin in [0, h / 2, h] {
-                    let expected = reference_index_cost_rows(&indices, w, begin, h, &order);
-                    let actual = index_plane_cost_rows(&indices, w, begin, h, &order, &mut rows);
-                    assert_eq!(actual.0.as_slice(), expected.0, "{w}x{h}, begin={begin}");
-                    assert_eq!(actual.1, expected.1);
+                    let mut bands = index_cost_rows(&indices, w, 0, begin, &order, COLORS);
+                    bands.add(&index_cost_rows(&indices, w, begin, h, &order, COLORS));
+                    assert_eq!(bands.tokens, whole.tokens, "{w}x{h}, begin={begin}");
+                    assert_eq!(bands.raw_bits, whole.raw_bits);
+                    assert_eq!(bands.values, whole.values);
                 }
-                let mut reference = extra_bits as f32;
-                for context in hist.as_chunks::<64>().0 {
-                    reference += entropy_of_hist(context, context.iter().sum());
-                }
+                let reference = whole.cost(entropy_of_hist);
                 for threads in [1, 2, 8] {
                     let pool = ThreadPool::new_lossless(threads);
                     let mut scratch = CoderScratch::lossless();

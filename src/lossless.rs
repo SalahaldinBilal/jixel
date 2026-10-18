@@ -71,9 +71,10 @@ use lz77::{
     lz77_compress_for_speed_with_depth, lz77_run_count, write_local_tree_lz77,
     write_local_tree_lz77_offsets, write_lz_section, write_lz_section_tail, write_tree_lz77,
 };
+pub(crate) use palette::write_palette_transform;
 use palette::{
     PALETTE_COARSE_MARGIN, PALETTE_FINAL_MARGIN, build_global_palette,
-    try_encode_local_palette_multi_group, try_encode_palette_single_group, write_palette_transform,
+    try_encode_local_palette_multi_group, try_encode_palette_single_group,
 };
 pub(crate) use predictor::{
     GradPackInteriorFn, GradientScratch, pack_gradient_row, selected_grad_pack_interior_fn,
@@ -87,7 +88,7 @@ use predictor::{
 };
 pub(crate) use rct::forward_ycocg;
 use rct::{rank_rcts, rct_planes as rct_planes_fn, write_rct_transform};
-pub(crate) use squeeze::ExtraSqueeze;
+pub(crate) use squeeze::{ExtraSqueeze, StreamCrop, learn_global_plane_tree};
 pub(crate) use squeeze::{
     LmPlainInput, dc_frame_supported, encode_dc_frame, encode_frame_lossy_modular_plain,
     encode_frame_lossy_modular_squeeze, lm_calibrated_distance, lm_plain_distance,
@@ -904,8 +905,8 @@ fn encode_frame_lossless_core_impl(
     // First the two sources are compared by one first-stage learn each under the proxy
     // preset.
     let (layout, learned_tree_decisive, skip_alternatives) = {
-        let palette = if compare_tree_candidates && effort.tree_global_palette && num_color == 3 {
-            build_global_palette(ycocg, alpha, xsize, ysize, pool, scratch)
+        let palette = if compare_tree_candidates && effort.tree_global_palette {
+            build_global_palette(ycocg, alpha, num_color, xsize, ysize, pool, scratch)
         } else {
             None
         };
@@ -1462,6 +1463,7 @@ fn encode_frame_lossless_core_impl(
         if single_group {
             if try_encode_context_tree_single_group(
                 speed,
+                num_color,
                 linear,
                 alpha,
                 alpha_constant,
@@ -1481,6 +1483,7 @@ fn encode_frame_lossless_core_impl(
             }
         } else if try_encode_context_tree_multi_group(
             speed,
+            num_color,
             linear,
             alpha,
             alpha_constant,
@@ -2236,8 +2239,6 @@ fn write_frame_header_modular_layer(
     w.write(2, 0b00); // no FH extensions
 }
 
-/// One lossless 8-bit RGB(+alpha) frame of a layered codestream.
-#[allow(clippy::too_many_arguments)]
 /// Ink frame of the lossy codestream: XYB lattice ints (Y, X, B-Y, run
 /// through YCoCg like RGB so the signaled RCT restores them exactly) and the
 /// coverage alpha, blended over reference slot 0 with the learned-tree coder.
@@ -2266,6 +2267,8 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
     )
 }
 
+/// One lossless 8-bit RGB(+alpha) frame of a layered codestream.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_frame_lossless_layer(
     linear: &Image3Si,
     alpha: &AlphaPlane,
@@ -3945,7 +3948,7 @@ const MODULAR_NUM_QUANT_TABLES: usize = 17;
 /// The decoder's stream id (MA property 1) of AC group `group_index`:
 /// `ModularStreamId::ModularAC(group, pass 0)` = 1 + 3 * DC groups + quant
 /// tables + group. The global stream is id 0.
-fn ac_stream_id(num_dc_groups: usize, group_index: usize) -> i32 {
+pub(crate) fn ac_stream_id(num_dc_groups: usize, group_index: usize) -> i32 {
     (1 + 3 * num_dc_groups + MODULAR_NUM_QUANT_TABLES + group_index) as i32
 }
 
@@ -5803,6 +5806,7 @@ fn choose_tree_streams_standard<T: lz77::LiteralToken>(
 /// through to the flat path, having written nothing).
 fn try_encode_context_tree_single_group(
     speed: crate::Speed,
+    num_color: usize,
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     alpha_constant: Option<i32>,
@@ -5818,17 +5822,22 @@ fn try_encode_context_tree_single_group(
     wp_params: WpParams,
     writer: &mut BitWriter,
 ) -> bool {
-    let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
+    let nb_chans = num_color + usize::from(alpha.is_some());
+    // The modular channels' predictors: the color planes, then alpha.
+    let chan_preds: Vec<u32> = (0..num_color)
+        .map(|c| predictors[c])
+        .chain(alpha.map(|_| predictors[3]))
+        .collect();
 
     // Collect residuals + WP property per channel (WP runs for every channel).
     let collected = pool.steal_map(scratch, nb_chans, |chan, _scratch| {
-        if chan < 3 {
+        if chan < num_color {
             let pd = linear.plane_data(chan);
             collect_channel(
                 |x, y| pd[y * xsize + x],
                 xsize,
                 ysize,
-                predictors[chan],
+                chan_preds[chan],
                 wp_params,
             )
         } else if alpha_constant.is_some() {
@@ -5840,7 +5849,7 @@ fn try_encode_context_tree_single_group(
                 |x, y| a.get_i32(y * xsize + x),
                 xsize,
                 ysize,
-                predictors[chan],
+                chan_preds[chan],
                 wp_params,
             )
         }
@@ -5867,7 +5876,7 @@ fn try_encode_context_tree_single_group(
     }
 
     // Build tree + context map.
-    let tree = build_context_tree(nb_chans, predictors, &ts, alpha_constant);
+    let tree = build_context_tree(nb_chans, &chan_preds, &ts, alpha_constant);
     let mut tree_tokens: Vec<Token> = Vec::new();
     let ctx_map = emit_ct_tree(&tree, &mut tree_tokens);
     // Flat lookup over the dense (chan*3+bucket) property space, replacing a
@@ -5941,6 +5950,7 @@ fn try_encode_context_tree_single_group(
 /// decoder). Returns true (and writes the full frame) if it helps; else false.
 fn try_encode_context_tree_multi_group(
     speed: crate::Speed,
+    num_color: usize,
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     alpha_constant: Option<i32>,
@@ -5959,7 +5969,12 @@ fn try_encode_context_tree_multi_group(
     wp_params: WpParams,
     writer: &mut BitWriter,
 ) -> bool {
-    let nb_chans = 3 + if alpha.is_some() { 1 } else { 0 };
+    let nb_chans = num_color + usize::from(alpha.is_some());
+    // The modular channels' predictors: the color planes, then alpha.
+    let chan_preds: Vec<u32> = (0..num_color)
+        .map(|c| predictors[c])
+        .chain(alpha.map(|_| predictors[3]))
+        .collect();
     let num_ac_groups = xsize_groups * ysize_groups;
 
     // 1) Collect (residual, WP property) per group per channel (group-local WP).
@@ -5972,17 +5987,23 @@ fn try_encode_context_tree_multi_group(
             let gw = layout.dim().min(xsize - x0);
             let gh = layout.dim().min(ysize - y0);
             let mut chans: Vec<(Vec<u32>, Vec<i64>)> = Vec::with_capacity(nb_chans);
-            for chan in 0..3usize {
+            for chan in 0..num_color {
                 let pd = linear.plane_data(chan);
                 let get = |lx: usize, ly: usize| pd[(y0 + ly) * xsize + (x0 + lx)];
-                chans.push(collect_channel(get, gw, gh, predictors[chan], wp_params));
+                chans.push(collect_channel(get, gw, gh, chan_preds[chan], wp_params));
             }
             if let Some(a) = alpha {
                 if alpha_constant.is_some() {
                     chans.push((vec![0u32; gw * gh], vec![0i64; gw * gh]));
                 } else {
                     let get = |lx: usize, ly: usize| a.get_i32((y0 + ly) * xsize + (x0 + lx));
-                    chans.push(collect_channel(get, gw, gh, predictors[3], wp_params));
+                    chans.push(collect_channel(
+                        get,
+                        gw,
+                        gh,
+                        chan_preds[num_color],
+                        wp_params,
+                    ));
                 }
             }
             chans
@@ -6006,7 +6027,7 @@ fn try_encode_context_tree_multi_group(
     }
 
     // 3) Global context tree + map.
-    let tree = build_context_tree(nb_chans, predictors, &ts, alpha_constant);
+    let tree = build_context_tree(nb_chans, &chan_preds, &ts, alpha_constant);
     let mut tree_tokens: Vec<Token> = Vec::new();
     let ctx_map = emit_ct_tree(&tree, &mut tree_tokens);
     // Flat lookup over the dense (chan*3+bucket) property space, replacing a

@@ -40,6 +40,15 @@ const THIN_DEV: i32 = 24;
 /// Max per-channel distance from the ink color for a pixel to join a stroke;
 /// lighter antialiasing pixels become partial coverage instead.
 const COLOR_TOL: i32 = 20;
+/// The same for a local (non-dominant) ink.
+const LOCAL_TOL: u8 = 9;
+/// Inks per image; the ink frame's palette holds their coverage levels.
+const MAX_INKS: usize = 16;
+/// The antialiasing band reaches this far from a stroke.
+const BAND_RADIUS: usize = 1;
+/// A pixel beside the band within this of its surroundings is the fringe
+/// of the antialiasing: left out of the fill under the strokes, kept exact.
+const FRINGE_TOL: u32 = 24;
 /// Strokes smaller than this are left to VarDCT.
 const MIN_COMPONENT: usize = 16;
 /// The dominant color must hold this share of the thin pixels.
@@ -184,7 +193,7 @@ impl<'a> InkCandidates<'a> {
             }
             ranked.retain(|p| p.share >= support * 0.2);
         }
-        let mut plans: Vec<InkPlan> = Vec::with_capacity(4);
+        let mut plans: Vec<InkPlan> = Vec::with_capacity(MAX_INKS);
         for plan in ranked {
             if plans.iter().any(|p| {
                 p.color
@@ -195,7 +204,7 @@ impl<'a> InkCandidates<'a> {
                 continue;
             }
             plans.push(plan);
-            if plans.len() == 4 {
+            if plans.len() == MAX_INKS {
                 break;
             }
         }
@@ -217,7 +226,8 @@ impl<'a> InkCandidates<'a> {
 }
 
 /// Classify all selected inks together, then inpaint their union once. The
-/// low three state bits identify a color; high bits cache adjacent colors.
+/// state holds the pixel's ink (1-based) above three growth flags, then the
+/// ink alone with the top bit marking the component scan.
 fn joint_split(
     rgb: &[[u8; 3]],
     alpha: Option<&[u8]>,
@@ -231,15 +241,19 @@ fn joint_split(
 ) -> Option<InkLayers> {
     let n = rgb.len();
     queue.clear();
-    let mut buckets = [0u8; 32 * 32 * 32];
+    let mut buckets = vec![0u32; 32 * 32 * 32];
     for (k, plan) in plans.iter().enumerate() {
-        let radius = if plan.local { 8u8 } else { COLOR_TOL as u8 - 1 };
+        let radius = if plan.local {
+            LOCAL_TOL - 1
+        } else {
+            COLOR_TOL as u8 - 1
+        };
         let lo = plan.color.map(|v| (v.saturating_sub(radius) >> 3) as usize);
         let hi = plan.color.map(|v| (v.saturating_add(radius) >> 3) as usize);
         for r in lo[0]..=hi[0] {
             for g in lo[1]..=hi[1] {
                 for b in lo[2]..=hi[2] {
-                    buckets[(r << 10) | (g << 5) | b] |= 1 << k;
+                    buckets[(r << 10) | (g << 5) | b] |= 1u32 << k;
                 }
             }
         }
@@ -262,7 +276,12 @@ fn joint_split(
                 .map(|(&a, b)| a.abs_diff(b))
                 .max()
                 .unwrap();
-            if d < if plan.local { 9 } else { COLOR_TOL as u8 } && d < best.0 {
+            if d < if plan.local {
+                LOCAL_TOL
+            } else {
+                COLOR_TOL as u8
+            } && d < best.0
+            {
                 best = (d, k);
             }
         }
@@ -275,44 +294,36 @@ fn joint_split(
             queue.push(i);
         }
     }
+    // Strokes are 8-connected: a one-pixel diagonal touches only by corner.
     let mut head = 0;
     while let Some(&i) = queue.get(head) {
         head += 1;
         let color = state[i] & !7;
-        let x = i % width;
-        let mut visit = |j: usize| {
+        for j in neighbors8(i, width, height) {
             if state[j] == color | UNGROWN {
                 state[j] = color;
                 queue.push(j);
             }
-        };
-        if x > 0 {
-            visit(i - 1);
-        }
-        if x + 1 < width {
-            visit(i + 1);
-        }
-        if i >= width {
-            visit(i - width);
-        }
-        if i + width < n {
-            visit(i + width);
         }
     }
     for s in state.iter_mut() {
         *s = if *s & 7 == 0 { *s >> 3 } else { 0 };
     }
-    let mut counts = [0usize; 4];
+    const VISITED: u8 = 0x80;
+    let mut counts = vec![0usize; plans.len()];
     // Squared error of drawing the strokes in the flat ink color.
-    let mut squares = [0u64; 4];
+    let mut squares = vec![0u64; plans.len()];
     let mut seed = 0;
-    while let Some(offset) = state[seed..].iter().position(|&s| (1..=4).contains(&s)) {
+    while let Some(offset) = state[seed..]
+        .iter()
+        .position(|&s| (1..=MAX_INKS as u8).contains(&s))
+    {
         seed += offset;
         let color = state[seed];
         let k = color as usize - 1;
         queue.clear();
         queue.push(seed);
-        state[seed] |= 8;
+        state[seed] |= VISITED;
         let mut square = 0u64;
         let mut head = 0;
         while let Some(&i) = queue.get(head) {
@@ -322,24 +333,11 @@ fn joint_split(
                 .zip(plans[k].color)
                 .map(|(&a, b)| (a.abs_diff(b) as u64).pow(2))
                 .sum::<u64>();
-            let x = i % width;
-            let mut visit = |j: usize| {
+            for j in neighbors8(i, width, height) {
                 if state[j] == color {
-                    state[j] |= 8;
+                    state[j] |= VISITED;
                     queue.push(j);
                 }
-            };
-            if x > 0 {
-                visit(i - 1);
-            }
-            if x + 1 < width {
-                visit(i + 1);
-            }
-            if i >= width {
-                visit(i - width);
-            }
-            if i + width < n {
-                visit(i + width);
             }
         }
         // A stroke is one color: a component that drifts from the ink is a
@@ -357,13 +355,38 @@ fn joint_split(
         seed += 1;
     }
     for s in state.iter_mut() {
-        *s &= 7;
+        *s &= !VISITED;
+    }
+    // An ink whose strokes mostly lie within the band of another ink's
+    // strokes is that ink's antialiasing level, not a color of its own.
+    let mut touching = vec![0usize; plans.len()];
+    for i in 0..n {
+        let color = state[i];
+        if color == 0 {
+            continue;
+        }
+        let (x, y) = (i % width, i / width);
+        if neighborhood(state, width, height, x, y, BAND_RADIUS)
+            .any(|row| row.iter().any(|&s| s != 0 && s != color))
+        {
+            touching[color as usize - 1] += 1;
+        }
+    }
+    for k in 0..plans.len() {
+        if touching[k] * 2 > counts[k] {
+            for s in state.iter_mut() {
+                if *s == k as u8 + 1 {
+                    *s = 0;
+                }
+            }
+            counts[k] = 0;
+        }
     }
     // Whether the strokes are ink is a property of the image, not of the
     // distance: the edge costs are those of distance 1, and the coverage
     // precision follows the distance later.
     let costs: [f32; 256] = std::array::from_fn(|v| (1.0 + v as f32 / 4.0).log2());
-    let mut gain = [0f64; 4];
+    let mut gain = vec![0f64; plans.len()];
     for (i, &color) in state.iter().enumerate() {
         if color == 0 {
             continue;
@@ -402,7 +425,7 @@ fn joint_split(
     if !(0..plans.len()).any(|k| valid(k) && gain[k] > MIN_GAIN_PER_PIXEL * n as f64) {
         return None;
     }
-    let mut slots = [usize::MAX; 4];
+    let mut slots = vec![usize::MAX; plans.len()];
     let mut inks = Vec::new();
     for (k, plan) in plans.iter().enumerate() {
         if !valid(k) || gain[k] <= MIN_SECONDARY_GAIN_PER_PIXEL * n as f64 {
@@ -419,115 +442,213 @@ fn joint_split(
             *s = 0;
         }
     }
-    for i in 0..n {
-        let color = state[i] & 7;
-        if color == 0 {
-            continue;
-        }
-        let (x, y) = (i % width, i / width);
-        for row in neighborhood_mut(state, width, height, x, y) {
-            for s in row {
-                if *s & 7 == 0 {
-                    *s |= 1 << (color + 3);
-                }
-            }
-        }
-    }
     let mut ink = vec![0u8; n];
     let mut coverage = vec![0u8; n];
-    // Residual of the band pixels from the mix of their ink and surroundings.
-    let (mut residual, mut band) = (0f64, 0usize);
-    thin.fill(1);
-    let mut base: Vec<_> = rgb.iter().map(|p| p.map(f32::from)).collect();
-    for i in 0..n {
-        let color = state[i] & 7;
-        if color != 0 {
-            ink[i] = slots[color as usize - 1] as u8 + 1;
-            coverage[i] = 255;
-            thin[i] = 0;
-            continue;
+    let mut base: Vec<[f32; 3]> = Vec::new();
+    // Residual of the band pixels from the mix of their ink and surroundings,
+    // per ink: an ink whose band is no such mix (soft highlights, strokes
+    // over several fills) stays in the base, and the band is split again
+    // without it.
+    let mut residual = vec![0f64; plans.len()];
+    let mut band = vec![0usize; plans.len()];
+    let mut fringe = Vec::new();
+    loop {
+        ink.fill(0);
+        coverage.fill(0);
+        residual.fill(0.0);
+        band.fill(0);
+        fringe.clear();
+        // The antialiasing band: within `BAND_RADIUS` of a stroke. Its pixels
+        // mix an ink with the surroundings, which only pixels outside the band
+        // show.
+        let mut near = vec![false; n];
+        for i in 0..n {
+            if state[i] != 0 {
+                let (x, y) = (i % width, i / width);
+                let (x0, y0) = (x.saturating_sub(BAND_RADIUS), y.saturating_sub(BAND_RADIUS));
+                for row in near[y0 * width..(y + BAND_RADIUS + 1).min(height) * width]
+                    .chunks_exact_mut(width)
+                {
+                    row[x0..(x + BAND_RADIUS + 1).min(width)].fill(true);
+                }
+            }
         }
-        if state[i] == 0 || alpha.is_some_and(|a| a[i] != 255) {
-            continue;
-        }
-        let (x, y) = (i % width, i / width);
-        let mut fill = [0f32; 3];
-        let mut count = 0;
-        for (dy, (pixels, states)) in neighborhood(rgb, width, height, x, y, 2)
-            .zip(neighborhood(state, width, height, x, y, 2))
-            .enumerate()
-        {
-            for (dx, (p, &s)) in pixels.iter().zip(states).enumerate() {
-                let j = (y.saturating_sub(2) + dy) * width + x.saturating_sub(2) + dx;
-                if s != 0 || alpha.is_some_and(|a| a[j] != 255) {
+        thin.fill(1);
+        base.clear();
+        base.extend(rgb.iter().map(|p| p.map(f32::from)));
+        for i in 0..n {
+            let color = state[i];
+            if color != 0 {
+                ink[i] = slots[color as usize - 1] as u8 + 1;
+                coverage[i] = 255;
+                thin[i] = 0;
+                continue;
+            }
+            if !near[i] || alpha.is_some_and(|a| a[i] != 255) {
+                continue;
+            }
+            let (x, y) = (i % width, i / width);
+            let (x0, y0) = (
+                x.saturating_sub(BAND_RADIUS + 1),
+                y.saturating_sub(BAND_RADIUS + 1),
+            );
+            let mut fill = [0f32; 3];
+            let mut count = 0;
+            // Inks within the band radius: the pixel mixes one of them.
+            let mut adjacent = 0u32;
+            for (dy, (pixels, states)) in neighborhood(rgb, width, height, x, y, BAND_RADIUS + 1)
+                .zip(neighborhood(state, width, height, x, y, BAND_RADIUS + 1))
+                .enumerate()
+            {
+                for (dx, (p, &s)) in pixels.iter().zip(states).enumerate() {
+                    let (xx, yy) = (x0 + dx, y0 + dy);
+                    let j = yy * width + xx;
+                    if s != 0 {
+                        if xx.abs_diff(x) <= BAND_RADIUS && yy.abs_diff(y) <= BAND_RADIUS {
+                            adjacent |= 1 << (s - 1);
+                        }
+                        continue;
+                    }
+                    if near[j] || alpha.is_some_and(|a| a[j] != 255) {
+                        continue;
+                    }
+                    for c in 0..3 {
+                        fill[c] += p[c] as f32;
+                    }
+                    count += 1;
+                }
+            }
+            if adjacent == 0 || count == 0 {
+                continue;
+            }
+            fill = fill.map(|v| v / count as f32);
+            let mut best = (f32::INFINITY, 0usize, 0f32, 0u8);
+            for (k, plan) in plans.iter().enumerate() {
+                if slots[k] == usize::MAX || adjacent & (1 << k) == 0 {
                     continue;
                 }
-                for c in 0..3 {
-                    fill[c] += p[c] as f32;
+                let ink = plan.color.map(f32::from);
+                let d: [f32; 3] = std::array::from_fn(|c| fill[c] - ink[c]);
+                let dd: f32 = d.iter().map(|v| v * v).sum();
+                if dd < 100.0 {
+                    continue;
                 }
-                count += 1;
+                let c = ((0..3)
+                    .map(|j| (fill[j] - rgb[i][j] as f32) * d[j])
+                    .sum::<f32>()
+                    / dd)
+                    .clamp(0.0, 1.0);
+                let a = round_i32(c * 255.0) as u8;
+                if a == 0 {
+                    continue;
+                }
+                let error: f32 = (0..3)
+                    .map(|j| {
+                        let e = fill[j] - d[j] * c - rgb[i][j] as f32;
+                        e * e
+                    })
+                    .sum();
+                if error < best.0 {
+                    best = (error, k, c, a);
+                }
             }
-        }
-        if count == 0 {
-            continue;
-        }
-        fill = fill.map(|v| v / count as f32);
-        let mut best = (f32::INFINITY, 0usize, 0f32, 0u8);
-        for (k, plan) in plans.iter().enumerate() {
-            if slots[k] == usize::MAX || state[i] & (1 << (k + 4)) == 0 {
+            if !best.0.is_finite() {
                 continue;
             }
-            let ink = plan.color.map(f32::from);
-            let d: [f32; 3] = std::array::from_fn(|c| fill[c] - ink[c]);
-            let dd: f32 = d.iter().map(|v| v * v).sum();
-            if dd < 100.0 {
-                continue;
-            }
-            let c = ((0..3)
-                .map(|j| (fill[j] - rgb[i][j] as f32) * d[j])
-                .sum::<f32>()
-                / dd)
-                .clamp(0.0, 1.0);
-            let a = round_i32(c * 255.0) as u8;
-            if a == 0 {
-                continue;
-            }
-            let error: f32 = (0..3)
-                .map(|j| {
-                    let e = fill[j] - d[j] * c - rgb[i][j] as f32;
-                    e * e
-                })
-                .sum();
-            if error < best.0 {
-                best = (error, k, c, a);
+            let (_, k, c, a) = best;
+            residual[k] += best.0 as f64;
+            band[k] += 1;
+            ink[i] = slots[k] as u8 + 1;
+            coverage[i] = a;
+            // Mostly surroundings: the base keeps them with the ink taken out.
+            if c < 0.5 {
+                for j in 0..3 {
+                    base[i][j] = ((rgb[i][j] as f32 - plans[k].color[j] as f32 * c) / (1.0 - c))
+                        .clamp(0.0, 255.0);
+                }
+            } else {
+                thin[i] = 0;
             }
         }
-        if !best.0.is_finite() {
-            continue;
-        }
-        residual += best.0 as f64;
-        band += 1;
-        let (_, k, c, a) = best;
-        ink[i] = slots[k] as u8 + 1;
-        coverage[i] = a;
-        if c < 0.5 {
-            for j in 0..3 {
-                base[i][j] = ((rgb[i][j] as f32 - plans[k].color[j] as f32 * c) / (1.0 - c))
-                    .clamp(0.0, 255.0);
+        // The base continues its surroundings under the strokes and their band.
+        // The faint fringe one pixel further, which the mix does not claim, is
+        // taken out of the fill (it would seep under every glyph) and put back
+        // exact: it is what the strokes' edges look like.
+        for i in 0..n {
+            if coverage[i] == 0 {
+                continue;
             }
-        } else {
-            thin[i] = 0;
+            for j in neighbors8(i, width, height) {
+                if coverage[j] != 0 || thin[j] == 0 || alpha.is_some_and(|a| a[j] != 255) {
+                    continue;
+                }
+                let (x, y) = (j % width, j / width);
+                let (x0, y0) = (x.saturating_sub(2), y.saturating_sub(2));
+                let mut fill = [0i32; 3];
+                let mut count = 0;
+                for (dy, (pixels, states)) in neighborhood(rgb, width, height, x, y, 2)
+                    .zip(neighborhood(state, width, height, x, y, 2))
+                    .enumerate()
+                {
+                    for (dx, (p, &s)) in pixels.iter().zip(states).enumerate() {
+                        let m = (y0 + dy) * width + x0 + dx;
+                        if s != 0 || near[m] || alpha.is_some_and(|a| a[m] != 255) {
+                            continue;
+                        }
+                        for c in 0..3 {
+                            fill[c] += p[c] as i32;
+                        }
+                        count += 1;
+                    }
+                }
+                // Deep inside the text no surroundings show: it is fringe too.
+                if count == 0
+                    || (0..3)
+                        .all(|c| (rgb[j][c] as i32 - fill[c] / count).unsigned_abs() <= FRINGE_TOL)
+                {
+                    thin[j] = 0;
+                    fringe.push(j);
+                }
+            }
+        }
+        let limit = MAX_BAND_RESIDUAL * precision as f64;
+        let mut dropped = false;
+        for k in 0..plans.len() {
+            if slots[k] != usize::MAX && residual[k] > limit * band[k] as f64 {
+                for s in state.iter_mut() {
+                    if *s == k as u8 + 1 {
+                        *s = 0;
+                    }
+                }
+                slots[k] = usize::MAX;
+                counts[k] = 0;
+                dropped = true;
+            }
+        }
+        if !dropped {
+            break;
+        }
+        inks.clear();
+        for k in 0..plans.len() {
+            if slots[k] != usize::MAX {
+                slots[k] = inks.len();
+                inks.push(plans[k].color);
+            }
+        }
+        if inks.is_empty() {
+            return None;
         }
     }
-    if residual > MAX_BAND_RESIDUAL * precision as f64 * band as f64 {
-        return None;
-    }
+    let band: usize = band.iter().sum();
     let core: usize = (0..plans.len())
         .filter(|&k| slots[k] != usize::MAX)
         .map(|k| counts[k])
         .sum();
     let thin_text = (band as f32) >= MAX_TEXT_BAND_RATIO * core as f32;
     fill_dont_care_with_iters(&mut base, thin, width, height, queue, 8);
+    for &i in &fringe {
+        base[i] = rgb[i].map(f32::from);
+    }
     Some(InkLayers {
         base: base
             .as_flattened()
@@ -541,22 +662,14 @@ fn joint_split(
     })
 }
 
-fn neighborhood_mut(
-    pixels: &mut [u8],
-    width: usize,
-    height: usize,
-    x: usize,
-    y: usize,
-) -> impl Iterator<Item = &mut [u8]> {
-    let (x0, x1, y0, y1) = (
-        x.saturating_sub(1),
-        (x + 2).min(width),
-        y.saturating_sub(1),
-        (y + 2).min(height),
-    );
-    pixels[y0 * width..y1 * width]
-        .chunks_exact_mut(width)
-        .map(move |row| &mut row[x0..x1])
+/// The up to eight neighbors of pixel `i`.
+fn neighbors8(i: usize, width: usize, height: usize) -> impl Iterator<Item = usize> {
+    let (x, y) = (i % width, i / width);
+    (y.saturating_sub(1)..(y + 2).min(height)).flat_map(move |yy| {
+        (x.saturating_sub(1)..(x + 2).min(width))
+            .map(move |xx| yy * width + xx)
+            .filter(move |&j| j != i)
+    })
 }
 
 /// Rows of a clipped square neighborhood, with bounds checked per row

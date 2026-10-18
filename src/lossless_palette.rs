@@ -77,8 +77,8 @@ pub(super) fn local_palette_coverage_is_sufficient(
 
 /// Serialize a single Palette transform (mirrors `Transform::VisitFields` for
 /// `TransformId::kPalette`). v1: begin_c=0, num_c=3, nb_deltas=0, predictor=Zero.
-pub(super) fn write_palette_transform(num_c: u32, nb_colors: u32, w: &mut BitWriter) {
-    debug_assert!(matches!(num_c, 3 | 4));
+pub(crate) fn write_palette_transform(num_c: u32, nb_colors: u32, w: &mut BitWriter) {
+    debug_assert!((1..=4).contains(&num_c));
     // transforms count U32(Val(0),Val(1),...): selector 1 = Val(1) = 1 transform.
     w.write(2, 0b01);
     // id U32(Val(RCT=0),Val(Palette=1),...): selector 1 = Palette.
@@ -87,7 +87,15 @@ pub(super) fn write_palette_transform(num_c: u32, nb_colors: u32, w: &mut BitWri
     w.write(2, 0b00);
     w.write(3, 0);
     // num_c U32(Val(1),Val(3),Val(4),BitsOffset(13,1)).
-    w.write(2, if num_c == 3 { 0b01 } else { 0b10 });
+    match num_c {
+        1 => w.write(2, 0b00),
+        3 => w.write(2, 0b01),
+        4 => w.write(2, 0b10),
+        _ => {
+            w.write(2, 0b11);
+            w.write(13, u64::from(num_c - 1));
+        }
+    }
     // nb_colors U32(BitsOffset(8,0), BitsOffset(10,256), BitsOffset(12,1280),
     // BitsOffset(16,5376)).
     if nb_colors <= 255 {
@@ -165,6 +173,30 @@ fn visit_palette_colors<const RGB: bool>(
         }
     }
     true
+}
+
+/// Visit every (value, alpha) tuple of a gray plane as `[v, v, v, alpha]`,
+/// so the luma, axis and chain orders rank gray levels by value.
+fn visit_gray_colors(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    xsize: usize,
+    ysize: usize,
+    mut visit: impl FnMut([i32; 4]) -> bool,
+) -> bool {
+    let plane = &linear.plane_data(0)[..xsize * ysize];
+    match alpha {
+        None => plane.iter().all(|&v| visit([v, v, v, 0])),
+        Some(AlphaPlane::U8(data)) => plane
+            .iter()
+            .zip(data)
+            .all(|(&v, &a)| visit([v, v, v, i32::from(a)])),
+        Some(AlphaPlane::U16 { data, .. }) => plane
+            .iter()
+            .zip(data)
+            .all(|(&v, &a)| visit([v, v, v, i32::from(a)])),
+        Some(AlphaPlane::F32(data)) => plane.iter().zip(data).all(|(&v, &a)| visit([v, v, v, a])),
+    }
 }
 
 /// Single-group RGB/RGBA exact palette path. Encodes a palette meta-channel plus
@@ -994,7 +1026,7 @@ pub(super) const PALETTE_COARSE_MARGIN: f64 = 1.10;
 /// within this factor of the RGB frame's (the estimate is ~0.5% noisy).
 pub(super) const PALETTE_FINAL_MARGIN: f64 = 1.03;
 
-/// A global palette: RGB(A) entries in the index order that scored best in
+/// A global palette: RGB(A) or gray(A) entries in the index order that scored best in
 /// `build_global_palette` (luma, PCA, a color-space chain or the spatial
 /// co-occurrence chain — index neighbors must be spatial neighbors for the
 /// predictors and the tree to exploit them) and one index per pixel.
@@ -1322,12 +1354,14 @@ type ColorMap<V> =
 pub(super) fn build_global_palette(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
+    num_color: usize,
     xsize: usize,
     ysize: usize,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<GlobalPalette> {
-    let num_c = 3 + usize::from(alpha.is_some());
+    let gray = num_color == 1;
+    let num_c = num_color + usize::from(alpha.is_some());
     let npx = xsize * ysize;
     let (colors, canonical_of_id, mut indices) = {
         let (first_seen, indices) = {
@@ -1339,11 +1373,15 @@ pub(super) fn build_global_palette(
             let mut previous = ([0; 4], -1);
             // YCoCg is reversible, so distinct input tuples identify exactly the same
             // colors. Reconstruct RGB only when adding a new palette entry.
-            if !visit_palette_colors::<false>(linear, alpha, xsize, 0, 0, xsize, ysize, |color| {
+            let visit = |color: [i32; 4]| {
                 if previous.1 < 0 || previous.0 != color {
                     let next = first_seen.len() as i32;
                     let id = *seen.entry(color).or_insert_with(|| {
-                        let (r, g, b) = inverse_ycocg(color[0], color[1], color[2]);
+                        let (r, g, b) = if gray {
+                            (color[0], color[0], color[0])
+                        } else {
+                            inverse_ycocg(color[0], color[1], color[2])
+                        };
                         first_seen.push([r, g, b, color[3]]);
                         next
                     });
@@ -1354,11 +1392,31 @@ pub(super) fn build_global_palette(
                 }
                 indices.push(previous.1 as u16);
                 true
-            }) {
+            };
+            let complete = if gray {
+                visit_gray_colors(linear, alpha, xsize, ysize, visit)
+            } else {
+                visit_palette_colors::<false>(linear, alpha, xsize, 0, 0, xsize, ysize, visit)
+            };
+            if !complete {
                 return None;
             }
             let nb_colors = first_seen.len();
-            if nb_colors == 0 || npx + num_c * nb_colors >= num_c * npx {
+            if nb_colors == 0 {
+                return None;
+            }
+            // The index image must be narrower than the samples it replaces:
+            // fewer indices than samples per pixel, or for one channel a
+            // palette at most half as long as the span of its values.
+            let narrower = if num_c == 1 {
+                let (lo, hi) = first_seen.iter().fold((i32::MAX, i32::MIN), |(lo, hi), c| {
+                    (lo.min(c[0]), hi.max(c[0]))
+                });
+                2 * nb_colors as i64 <= i64::from(hi) - i64::from(lo) + 1
+            } else {
+                npx + num_c * nb_colors < num_c * npx
+            };
+            if !narrower {
                 return None;
             }
             (first_seen, indices)
@@ -1404,7 +1462,9 @@ pub(super) fn build_global_palette(
     for (canonical, color) in colors.iter().enumerate() {
         let index = order[canonical] as usize;
         for c in 0..num_c {
-            palette[c * nb_colors + index] = color[c];
+            // A gray palette holds the value and, after it, the alpha.
+            let component = if gray && c == 1 { 3 } else { c };
+            palette[c * nb_colors + index] = color[component];
         }
     }
     Some(GlobalPalette {
@@ -1483,7 +1543,7 @@ mod tests {
                 bits: 16,
             };
             let palette =
-                build_global_palette(&linear, Some(&alpha), w, h, &pool, &mut scratch).unwrap();
+                build_global_palette(&linear, Some(&alpha), 3, w, h, &pool, &mut scratch).unwrap();
             assert_eq!(palette.nb_colors, colors.len());
             for (&index, color) in palette.indices.iter().zip(expected) {
                 for (c, value) in color.into_iter().enumerate() {

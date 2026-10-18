@@ -191,6 +191,9 @@ effort_gates! {
     tree_global_palette,
     tree_group_palette,
     tree_ctx_v1,
+    /// Gradient and photo-like rectangles of a screenshot as cropped frames
+    /// of their own (`region_frames`).
+    region_frames,
 }
 
 const ULTRAFAST: Effort = Effort::NONE;
@@ -246,6 +249,7 @@ const MEDIUM: Effort = Effort {
     tree_deep_final: false,
     tree_fresh_final_samples: false,
     patches_default: false,
+    region_frames: false,
     ..SLOW
 };
 

@@ -57,7 +57,8 @@ use crate::ma_tree::{
     deepen_ma_tree, learn_ma_tree, learn_ma_tree_in_place, learn_ma_tree_indexed,
 };
 use crate::patches::{
-    ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PatchReference, find_lossless_patches,
+    LosslessPatches, ModularFrameKind, NUM_PATCH_CONTEXTS, PATCH_REF_ID, PatchReference,
+    find_lossless_patches,
 };
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::{WpNeighbors, WpParams, WpState, write_wp_header};
@@ -390,6 +391,10 @@ pub(crate) fn encode_frame_lossless(
     );
 }
 
+/// The displayed frame, or, for a screenshot with gradient or photo-like
+/// rectangles (see `region_frames`), the base saved to reference slot 0
+/// followed by one cropped kReplace frame per rectangle, whichever is
+/// smaller.
 #[allow(clippy::too_many_arguments)]
 fn encode_frame_lossless_with_pool(
     linear: &Image3Si,
@@ -404,13 +409,184 @@ fn encode_frame_lossless_with_pool(
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) {
+    // The whole frame's glyph plan, shared with its encode below.
+    let mut whole_glyphs: Option<Option<LosslessPatches>> = None;
+    if speed.effort().region_frames
+        && !progressive
+        && num_color == 3
+        && max_bits == 8
+        && let Some(mut regions) = crate::region_frames::plan(linear, alpha)
+    {
+        let min_symbol = lossless_min_symbol(max_bits);
+        let use_wp = decoding_speed.use_weighted_predictor();
+        let mut estimate = |image: &Image3Si, alpha: Option<&AlphaPlane>| {
+            coarse_frame_bits(image, alpha, min_symbol, use_wp, pool, scratch)
+        };
+        let mut crops: Vec<_> = regions
+            .iter()
+            .map(|r| crate::region_frames::crop(linear, alpha, r))
+            .collect();
+        let mut own: Vec<Option<f64>> =
+            crops.iter().map(|(c, a)| estimate(c, a.as_ref())).collect();
+        // A rectangle of text (a nested screenshot) codes worse as its own
+        // frame than inside the whole, whose glyph patches cover it: it
+        // stays in the base when the patches save a share of its estimate.
+        if patches {
+            let glyphs = whole_glyphs.insert(crate::patches::find_lossless_glyph_patches(linear));
+            if let Some(glyphs) = glyphs {
+                let mut keep = Vec::with_capacity(regions.len());
+                for (i, r) in regions.iter().enumerate() {
+                    let (patched, patched_alpha) =
+                        crate::region_frames::crop(&glyphs.base, alpha, r);
+                    let text_like = match (own[i], estimate(&patched, patched_alpha.as_ref())) {
+                        (Some(own), Some(patched)) => patched < own * (1.0 - REGION_GLYPH_SAVING),
+                        _ => false,
+                    };
+                    keep.push(!text_like);
+                }
+                let mut kept = keep.iter();
+                regions.retain(|_| *kept.next().unwrap_or(&true));
+                let mut kept = keep.iter();
+                crops.retain(|_| *kept.next().unwrap_or(&true));
+                let mut kept = keep.iter();
+                own.retain(|_| *kept.next().unwrap_or(&true));
+            }
+        }
+        let (base, base_alpha) = crate::region_frames::cut(linear, alpha, &regions);
+        let whole = estimate(linear, alpha);
+        let base_bits = estimate(&base, base_alpha.as_ref());
+        let split = own
+            .iter()
+            .copied()
+            .chain([base_bits])
+            .sum::<Option<f64>>()
+            .map(|bits| bits + REGION_FRAME_OVERHEAD_BITS * regions.len() as f64);
+        if !regions.is_empty()
+            && let (Some(whole), Some(split)) = (whole, split)
+            && split < whole * REGION_SPLIT_MARGIN
+        {
+            let mut split_writer = BitWriter::new();
+            encode_displayed_frame(
+                &base,
+                base_alpha.as_ref(),
+                max_bits,
+                progressive,
+                patches,
+                num_color,
+                speed,
+                decoding_speed,
+                pool,
+                scratch,
+                true,
+                None,
+                &mut split_writer,
+            );
+            for (i, ((crop, crop_alpha), r)) in crops.iter().zip(&regions).enumerate() {
+                encode_frame_lossless_core(
+                    crop,
+                    crop_alpha.as_ref(),
+                    max_bits,
+                    false,
+                    num_color,
+                    speed,
+                    decoding_speed,
+                    pool,
+                    scratch,
+                    ModularFrameKind::RgbCrop {
+                        x0: r.x0,
+                        y0: r.y0,
+                        width: r.width,
+                        height: r.height,
+                        last: i + 1 == regions.len(),
+                    },
+                    true,
+                    &mut split_writer,
+                );
+            }
+            // The estimate ranks the two within a few percent and misses
+            // what the cut does to the base's palette and tree, so the
+            // whole frame competes on complete size.
+            let mut whole_writer = BitWriter::new();
+            encode_displayed_frame(
+                linear,
+                alpha,
+                max_bits,
+                progressive,
+                patches,
+                num_color,
+                speed,
+                decoding_speed,
+                pool,
+                scratch,
+                false,
+                whole_glyphs.take(),
+                &mut whole_writer,
+            );
+            if whole_writer.bits_written() < split_writer.bits_written() {
+                writer.append(&whole_writer);
+            } else {
+                writer.append(&split_writer);
+            }
+            return;
+        }
+    }
+    encode_displayed_frame(
+        linear,
+        alpha,
+        max_bits,
+        progressive,
+        patches,
+        num_color,
+        speed,
+        decoding_speed,
+        pool,
+        scratch,
+        false,
+        whole_glyphs,
+        writer,
+    );
+}
+
+/// Header, TOC and tree of one region frame.
+const REGION_FRAME_OVERHEAD_BITS: f64 = 1600.0;
+/// A rectangle stays in the base when the whole frame's glyph patches save
+/// this share of its own-frame estimate (a nested screenshot 15%, a chat
+/// header block 19%; an image thumbnail 2%, art and avatars 0).
+const REGION_GLYPH_SAVING: f64 = 0.1;
+/// The region split is encoded when its first-stage estimate is under this
+/// share of the whole frame's: estimated gains of 1.8% and more won 2-20%,
+/// one of 0.6% lost 3.7%.
+const REGION_SPLIT_MARGIN: f64 = 0.99;
+
+#[allow(clippy::too_many_arguments)]
+fn encode_displayed_frame(
+    linear: &Image3Si,
+    alpha: Option<&AlphaPlane>,
+    max_bits: u32,
+    progressive: bool,
+    patches: bool,
+    num_color: usize,
+    speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    saved_first: bool,
+    glyph_plan: Option<Option<LosslessPatches>>,
+    writer: &mut BitWriter,
+) {
+    let regular = if saved_first {
+        ModularFrameKind::RgbSavedFirst
+    } else {
+        ModularFrameKind::Regular
+    };
     // Glyph plans (arbitrary-position repeated shapes: text, UI) come first
     // and always compete on complete frame size; tile plans keep the old
-    // decisive-tree skip, having never beaten one.
-    let glyph_plan = if patches && num_color == 3 {
-        crate::patches::find_lossless_glyph_patches(linear)
-    } else {
-        None
+    // decisive-tree skip, having never beaten one. The caller may have
+    // found the plan already.
+    let glyph_plan = match glyph_plan {
+        Some(plan) => plan,
+        None if patches && num_color == 3 => crate::patches::find_lossless_glyph_patches(linear),
+        None => None,
     };
     let is_glyph_plan = glyph_plan.is_some();
     if patches
@@ -437,7 +613,7 @@ fn encode_frame_lossless_with_pool(
                 decoding_speed,
                 pool,
                 scratch,
-                ModularFrameKind::Regular,
+                regular,
                 true,
                 &mut regular_writer,
             );
@@ -484,7 +660,10 @@ fn encode_frame_lossless_with_pool(
             decoding_speed,
             pool,
             scratch,
-            ModularFrameKind::Patched(&plan.references),
+            ModularFrameKind::Patched {
+                references: &plan.references,
+                saved_first,
+            },
             true,
             &mut patched_writer,
         );
@@ -523,7 +702,7 @@ fn encode_frame_lossless_with_pool(
                     decoding_speed,
                     pool,
                     scratch,
-                    ModularFrameKind::Regular,
+                    regular,
                     false,
                     &mut regular_writer,
                 );
@@ -549,7 +728,7 @@ fn encode_frame_lossless_with_pool(
         decoding_speed,
         pool,
         scratch,
-        ModularFrameKind::Regular,
+        regular,
         true,
         writer,
     );
@@ -1420,10 +1599,11 @@ fn encode_frame_lossless_core_impl(
     let displayed = matches!(
         frame_kind,
         ModularFrameKind::Regular
-            | ModularFrameKind::Patched(_)
+            | ModularFrameKind::Patched { .. }
             | ModularFrameKind::XybBlend { .. }
             | ModularFrameKind::RgbSavedFirst
             | ModularFrameKind::RgbBlendLast
+            | ModularFrameKind::RgbCrop { .. }
     );
     let wp_tree = (effort.flat_wp_contexts && use_wp && displayed)
         .then(|| {
@@ -1523,7 +1703,7 @@ fn encode_frame_lossless_core_impl(
         if single_group {
             // Single section: GroupHeader + local tree + pixel histograms + pixels.
             let mut section = BitWriter::new();
-            if let ModularFrameKind::Patched(references) = frame_kind {
+            if let ModularFrameKind::Patched { references, .. } = frame_kind {
                 write_patch_dictionary(references, alpha.is_some(), scratch, &mut section);
             }
             // 1 bit: dc_quant all_default = 1
@@ -1690,7 +1870,7 @@ fn encode_frame_lossless_core_impl(
                 })
                 .collect();
             // ----- Section 0: DC global -----
-            if let ModularFrameKind::Patched(references) = frame_kind {
+            if let ModularFrameKind::Patched { references, .. } = frame_kind {
                 write_patch_dictionary(references, alpha.is_some(), scratch, &mut sections[0]);
             }
             let group_slices: Vec<&[LzToken]> = group_lz_tokens.iter().map(Vec::as_slice).collect();
@@ -1815,7 +1995,16 @@ fn write_frame_header_modular_kind(
         ModularFrameKind::RgbBlendLast => {
             write_frame_header_modular_layer(has_alpha, true, layout, w)
         }
-        ModularFrameKind::Patched(_) => write_frame_header_modular_flags(has_alpha, 2, layout, w),
+        ModularFrameKind::Patched { saved_first, .. } => {
+            write_frame_header_modular_flags(has_alpha, 2, saved_first, layout, w)
+        }
+        ModularFrameKind::RgbCrop {
+            x0,
+            y0,
+            width,
+            height,
+            last,
+        } => write_frame_header_modular_crop(has_alpha, [x0, y0, width, height], layout, last, w),
         ModularFrameKind::XybReferenceOnly {
             width,
             height,
@@ -2296,12 +2485,58 @@ pub(crate) fn encode_frame_lossless_layer(
 }
 
 fn write_frame_header_modular(has_alpha: bool, layout: GroupLayout, w: &mut BitWriter) {
-    write_frame_header_modular_flags(has_alpha, 0, layout, w);
+    write_frame_header_modular_flags(has_alpha, 0, false, layout, w);
+}
+
+/// Frame header of a region frame: a regular modular frame cropped to
+/// `rect` (x0, y0, width, height), kReplace over reference slot 0; the
+/// composite goes back to slot 0 unless this is the last frame. A partial
+/// frame always signals its source and never `save_before_color_transform`.
+fn write_frame_header_modular_crop(
+    has_alpha: bool,
+    rect: [usize; 4],
+    layout: GroupLayout,
+    last: bool,
+    w: &mut BitWriter,
+) {
+    w.write(1, 0); // all_default = false
+    w.write(2, 0b00); // regular frame
+    w.write(1, 1); // encoding = Modular
+    write_u64(0, w); // flags
+    w.write(1, 0); // do_ycbcr = false
+    w.write(2, 0b00); // upsampling = 1
+    if has_alpha {
+        w.write(2, 0b00); // ec_upsampling[0] = 1
+    }
+    w.write(2, layout.shift as u64);
+    w.write(2, 0b00); // num_passes = 1
+    w.write(1, 1); // have_crop
+    write_frame_dimension(2 * rect[0], w); // PackSigned(x0)
+    write_frame_dimension(2 * rect[1], w);
+    write_frame_dimension(rect[2], w);
+    write_frame_dimension(rect[3], w);
+    for _ in 0..1 + usize::from(has_alpha) {
+        w.write(2, 0b00); // blending = Replace
+        w.write(2, 0); // source = 0
+    }
+    if last {
+        w.write(1, 1); // is_last
+    } else {
+        w.write(1, 0); // not the last frame
+        w.write(2, 0); // save_as_reference = 0
+    }
+    w.write(2, 0b00); // name length = 0
+    w.write(1, 0); // loop_filter NOT all_default
+    w.write(1, 0); // no gaborish
+    w.write(2, 0); // 0 EPF iters
+    w.write(2, 0b00); // no LF extensions
+    w.write(2, 0b00); // no FH extensions
 }
 
 fn write_frame_header_modular_flags(
     has_alpha: bool,
     flags: u64,
+    saved_first: bool,
     layout: GroupLayout,
     w: &mut BitWriter,
 ) {
@@ -2321,7 +2556,13 @@ fn write_frame_header_modular_flags(
     if has_alpha {
         w.write(2, 0b00);
     }
-    w.write(1, 1); // is_last
+    if saved_first {
+        w.write(1, 0); // not the last frame
+        w.write(2, 0); // save_as_reference = 0
+        w.write(1, 0); // save_before_color_transform = false
+    } else {
+        w.write(1, 1); // is_last
+    }
     w.write(2, 0b00); // name length = 0
     w.write(1, 0); // loop_filter NOT all_default
     w.write(1, 0); // no gaborish
@@ -2819,6 +3060,11 @@ const MA_FINAL_SPLIT_COST_BITS: f32 = 50.0;
 const MA_MAX_LEAVES: usize = LZ77_MAX_CONTEXTS - 1;
 /// Minimum samples in a node before it must become a leaf.
 const MA_MIN_NODE_SAMPLES: usize = 128;
+/// Grow-then-prune of palette index trees (`with_ma_prune`): growth split
+/// cost and minimum node, and the bits the prune charges per kept leaf.
+const MA_PRUNE_SPLIT_COST_BITS: f32 = 20.0;
+const MA_PRUNE_MIN_NODE_SAMPLES: usize = 16;
+const MA_PRUNE_LEAF_BITS: f32 = 40.0;
 /// Predictors each side of a candidate split may choose from (the node's
 /// cheapest ones).
 const MA_SIDE_PREDS: usize = 4;
@@ -3076,7 +3322,7 @@ fn sample_channel_ma<'a, T: Copy + 'a>(
     wp_params: WpParams,
     use_wp: bool,
     stride: usize,
-    mut push: impl FnMut([i32; NUM_MA_PROPS], [u8; NUM_MA_PREDS]),
+    mut push: impl FnMut([i32; NUM_MA_PROPS], [u8; NUM_MA_PREDS], i32),
 ) where
     i64: From<T>,
 {
@@ -3103,7 +3349,7 @@ fn sample_channel_ma_shared<'a, T: Copy + 'a, const USE_WP: bool>(
     refs: &[MaRefPlane<'a>],
     wp_params: WpParams,
     stride: usize,
-    push: &mut dyn FnMut([i32; NUM_MA_PROPS], [u8; NUM_MA_PREDS]),
+    push: &mut dyn FnMut([i32; NUM_MA_PROPS], [u8; NUM_MA_PREDS], i32),
 ) where
     i64: From<T>,
 {
@@ -3209,7 +3455,7 @@ fn sample_channel_ma_shared<'a, T: Copy + 'a, const USE_WP: bool>(
                     let (t, _, _) = uint_encode(pack_signed((value - pv) as i32));
                     tok[pred as usize] = t.min(u8::MAX as u32) as u8;
                 }
-                push(props, tok);
+                push(props, tok, value as i32);
             }
             previous_local_gradient = local_gradient;
             west_west = west;
@@ -3313,7 +3559,7 @@ pub(crate) fn sample_dc_planes(groups: &[DcPlanes], stride: usize) -> MaSamples 
                 WpParams::DEFAULT,
                 true,
                 stride,
-                |props, tok| samples.push(props, tok),
+                |props, tok, _| samples.push(props, tok),
             );
         }
     }
@@ -3372,8 +3618,8 @@ fn emit_learned_tree(tree: &LearnedTree) -> (Vec<Token>, Vec<u32>, u32) {
                 q.push_back(gt);
                 q.push_back(le);
             }
-            MaNode::Leaf { pred } => {
-                push_leaf(&mut tokens, pred);
+            MaNode::Leaf { pred, offset } => {
+                push_leaf_offset(&mut tokens, pred, offset);
                 leaf_ctx[i as usize] = ctx;
                 ctx += 1;
             }
@@ -3474,8 +3720,9 @@ fn gate_ma_tree(
     tree: LearnedTree,
     sample_scale: f64,
     samples: Option<&MaSamples>,
+    leaf_price: Option<f64>,
 ) -> Option<LearnedCandidate> {
-    let mut cand = finish_ma_candidate(tree, sample_scale);
+    let mut cand = finish_ma_candidate(tree, sample_scale, leaf_price);
     if cand.est_real.partial_cmp(&cand.flat_real) != Some(std::cmp::Ordering::Less) {
         return None;
     }
@@ -3487,19 +3734,39 @@ fn gate_ma_tree(
 }
 
 /// The writable candidate of a learned tree, whatever its estimate: tree
-/// tokens, context ids and leaf offsets.
-fn finish_ma_candidate(tree: LearnedTree, sample_scale: f64) -> LearnedCandidate {
+/// tokens, context ids and leaf offsets. `leaf_price` is the all-in bits
+/// per context of a grow-then-prune tree (`ma_leaf_price`), `None` for a
+/// best-first tree.
+fn finish_ma_candidate(
+    tree: LearnedTree,
+    sample_scale: f64,
+    leaf_price: Option<f64>,
+) -> LearnedCandidate {
     let (tree_tokens, leaf_ctx, num_ctx) = emit_learned_tree(&tree);
     // Contexts are clustered into at most 128 histograms before coding, so
     // the header grows with the context map (a few bits per context) and
     // the cluster count, not with every context. Charging 200 bits per
     // context had a 4095-leaf tree fail its gate on a grainy photo and hand
     // the frame to the 32-leaf coarse tree (+6%).
-    let overhead_bits =
-        tree_tokens.len() as f64 * 10.0 + (num_ctx.min(128) as f64) * 200.0 + num_ctx as f64 * 8.0;
+    let clusters_bits = (num_ctx.min(128) as f64) * 200.0;
+    let overhead_bits = match leaf_price {
+        // A pruned tree kept every leaf against this price (its tree tokens,
+        // context-map entry and clustering loss together); the best-first
+        // formula's ~78 bits per leaf had 1100-leaf trees whose frames coded
+        // 2-3% smaller fail the palette gate.
+        Some(price) => num_ctx as f64 * price + clusters_bits,
+        None => tree_tokens.len() as f64 * 10.0 + clusters_bits + num_ctx as f64 * 8.0,
+    };
     let est_real = tree.est_bits * sample_scale + overhead_bits;
     let flat_real = tree.flat_bits * sample_scale;
-    let leaf_offset = vec![0; num_ctx as usize];
+    let mut leaf_offset = vec![0; num_ctx as usize];
+    for (node, &ctx) in tree.nodes.iter().zip(&leaf_ctx) {
+        if let MaNode::Leaf { offset, .. } = *node
+            && ctx != u32::MAX
+        {
+            leaf_offset[ctx as usize] = offset;
+        }
+    }
     let estimated_savings = 1.0 - tree.est_bits / tree.flat_bits.max(f64::MIN_POSITIVE);
     LearnedCandidate {
         tree,
@@ -3521,8 +3788,16 @@ fn ma_learn_params_final(
     max_candidates: usize,
     split_scale: f64,
     use_wp: bool,
+    modal_offsets: bool,
 ) -> MaLearnParams {
-    let mut params = ma_learn_params(min_symbol, max_leaves, max_candidates, split_scale, use_wp);
+    let mut params = ma_learn_params(
+        min_symbol,
+        max_leaves,
+        max_candidates,
+        split_scale,
+        use_wp,
+        modal_offsets,
+    );
     params.split_cost_bits = MA_FINAL_SPLIT_COST_BITS / split_scale as f32;
     params
 }
@@ -3533,6 +3808,7 @@ fn ma_learn_params(
     max_candidates: usize,
     split_scale: f64,
     use_wp: bool,
+    modal_offsets: bool,
 ) -> MaLearnParams {
     MaLearnParams {
         alphabet: min_symbol as usize,
@@ -3543,7 +3819,27 @@ fn ma_learn_params(
         allowed_preds: u16::MAX,
         side_preds: MA_SIDE_PREDS,
         max_candidates,
+        modal_offsets,
+        prune_leaf_bits: 0.0,
     }
+}
+
+/// A final learn of a palette index source (`modal_offsets`) grows then
+/// prunes (`MaLearnParams::prune_leaf_bits`); RCT sources keep best-first
+/// growth.
+fn with_ma_prune(mut params: MaLearnParams, split_scale: f64) -> MaLearnParams {
+    if params.modal_offsets {
+        params.split_cost_bits = MA_PRUNE_SPLIT_COST_BITS / split_scale as f32;
+        params.min_node = MA_PRUNE_MIN_NODE_SAMPLES;
+        params.prune_leaf_bits = MA_PRUNE_LEAF_BITS / split_scale as f32;
+    }
+    params
+}
+
+/// `finish_ma_candidate`'s per-context price of a tree learned with
+/// `params`: a pruned tree's own leaf cost (image domain), else `None`.
+fn ma_leaf_price(params: &MaLearnParams, split_scale: f64) -> Option<f64> {
+    (params.prune_leaf_bits > 0.0).then_some(params.prune_leaf_bits as f64 * split_scale)
 }
 
 /// First learning stage: the merged samples with a gated coarse tree (or the
@@ -3576,19 +3872,40 @@ fn learn_ma_coarse(
         return None;
     }
     if samples.len() <= MA_COARSE_TARGET_SAMPLES {
-        let tree = learn_ma_tree(
-            &samples,
+        let best_first = || {
             ma_learn_params(
                 min_symbol,
                 max_leaves,
                 max_candidates,
                 stride as f64,
                 use_wp,
-            ),
-            pool,
-            scratch,
-        );
-        let candidate = gate_ma_tree(tree, stride as f64, leaf_offsets.then_some(&samples))?;
+                !leaf_offsets,
+            )
+        };
+        let params = with_ma_prune(best_first(), stride as f64);
+        let pruned = params.prune_leaf_bits > 0.0;
+        let leaf_price = ma_leaf_price(&params, stride as f64);
+        let tree = learn_ma_tree(&samples, params, pool, scratch);
+        let candidate = match gate_ma_tree(
+            tree,
+            stride as f64,
+            leaf_offsets.then_some(&samples),
+            leaf_price,
+        ) {
+            Some(candidate) => candidate,
+            // A pruned tree can keep more contexts than the gate's overhead
+            // allows a small source (a glyph atlas: 158 contexts priced at
+            // 58.5 K bits against 57.7 K flat), which would hand the source
+            // to the fixed trees at three times the size; the best-first
+            // tree stands in.
+            None if pruned => gate_ma_tree(
+                learn_ma_tree(&samples, best_first(), pool, scratch),
+                stride as f64,
+                leaf_offsets.then_some(&samples),
+                None,
+            )?,
+            None => return None,
+        };
         return Some(CoarseLearn {
             samples,
             stride,
@@ -3609,11 +3926,12 @@ fn learn_ma_coarse(
             max_candidates,
             coarse_scale,
             use_wp,
+            !leaf_offsets,
         ),
         pool,
         scratch,
     );
-    let candidate = gate_ma_tree(coarse_tree, coarse_scale, None)?;
+    let candidate = gate_ma_tree(coarse_tree, coarse_scale, None, None)?;
     let coarse_leaves = candidate.tree.nodes.len().div_ceil(2);
     let coarse_savings = 1.0 - candidate.est_real / candidate.flat_real;
     let deepen = coarse_leaves == MA_COARSE_MAX_LEAVES && coarse_savings >= MA_DEEPEN_MIN_SAVINGS;
@@ -3641,12 +3959,16 @@ fn finish_ma_learn(
     if !coarse.deepen {
         return coarse.candidate;
     }
-    let mut params = ma_learn_params_final(
-        min_symbol,
-        max_leaves,
-        coarse.max_candidates,
+    let mut params = with_ma_prune(
+        ma_learn_params_final(
+            min_symbol,
+            max_leaves,
+            coarse.max_candidates,
+            coarse.stride as f64,
+            use_wp,
+            !coarse.leaf_offsets,
+        ),
         coarse.stride as f64,
-        use_wp,
     );
     if !speed.effort().tree_deep_final && coarse.stride > 1 {
         params.max_leaves = params.max_leaves.min(MA_LITE_MAX_LEAVES);
@@ -3657,6 +3979,7 @@ fn finish_ma_learn(
     if coarse.leaf_offsets && speed.effort().tree_wide_side_preds {
         params.side_preds = MA_WIDE_SIDE_PREDS;
     }
+    let leaf_price = ma_leaf_price(&params, coarse.stride as f64);
     let (deep_tree, samples) = deepen_ma_tree(
         coarse.samples,
         params,
@@ -3668,6 +3991,7 @@ fn finish_ma_learn(
         deep_tree,
         coarse.stride as f64,
         coarse.leaf_offsets.then_some(&samples),
+        leaf_price,
     )
     .unwrap_or(coarse.candidate)
 }
@@ -3806,7 +4130,10 @@ impl LearnedCandidate {
             gt: 1,
             le: 2,
         });
-        nodes.push(MaNode::Leaf { pred: 0 });
+        nodes.push(MaNode::Leaf {
+            pred: 0,
+            offset: value,
+        });
         nodes.extend(self.tree.nodes.iter().map(|node| match *node {
             MaNode::Split { prop, val, gt, le } => MaNode::Split {
                 prop,
@@ -4338,20 +4665,27 @@ fn learn_ma_candidate(
     let mut samples = MaSamples {
         props: vec![[0; NUM_MA_PROPS]; total_samples],
         tok: vec![[0; NUM_MA_PREDS]; total_samples],
+        val: vec![0; total_samples],
     };
     let mut props = samples.props.as_mut_slice();
     let mut tok = samples.tok.as_mut_slice();
+    let mut val = samples.val.as_mut_slice();
     let mut ranges = Vec::with_capacity(jobs.len());
     for count in counts {
         let (p, rest_p) = props.split_at_mut(count);
         let (t, rest_t) = tok.split_at_mut(count);
-        ranges.push((p, t));
-        (props, tok) = (rest_p, rest_t);
+        let (v, rest_v) = val.split_at_mut(count);
+        ranges.push((p, t, v));
+        (props, tok, val) = (rest_p, rest_t, rest_v);
     }
     pool.steal_for_each_mut(scratch, &mut ranges, |i, range, _scratch| {
         let job = &jobs[i];
         let ch = source.channel_at(job.group_override, job.channel);
-        let mut rows = range.0.iter_mut().zip(range.1.iter_mut());
+        let mut rows = range
+            .0
+            .iter_mut()
+            .zip(range.1.iter_mut())
+            .zip(range.2.iter_mut());
         with_ma_pixels!(ch, |pixels| sample_channel_ma(
             |y| &pixels[(job.y0 + y) * ch.w + job.x0..][..job.w],
             job.w,
@@ -4362,10 +4696,11 @@ fn learn_ma_candidate(
             wp_params,
             use_wp,
             stride,
-            |p, t| {
-                let (props, tok) = rows.next().expect("sample count");
+            |p, t, v| {
+                let ((props, tok), val) = rows.next().expect("sample count");
                 *props = p;
                 *tok = t;
+                *val = v;
             },
         ));
         debug_assert!(rows.next().is_none());
@@ -4594,7 +4929,7 @@ fn write_learned_tree_frame(
     // A patched frame's dictionary opens its first section, before the
     // dequant/tree bits, exactly as on the flat path.
     let dictionary: Option<BitWriter> = match frame_kind {
-        ModularFrameKind::Patched(references) => {
+        ModularFrameKind::Patched { references, .. } => {
             let mut w = BitWriter::new();
             write_patch_dictionary(references, has_alpha, scratch, &mut w);
             Some(w)
@@ -5052,10 +5387,7 @@ fn write_local_tree_sections(
                     wp_params,
                     use_wp,
                     stride,
-                    |props, tok| {
-                        samples.props.push(props);
-                        samples.tok.push(tok);
-                    },
+                    |props, tok, val| samples.push_val(props, tok, val),
                 ));
             }
             // Too few samples to learn from: the root alone (one predictor).
@@ -5070,21 +5402,23 @@ fn write_local_tree_sections(
             let offsets = (leaf_offsets && max_leaves > 1).then(|| MaSamples {
                 props: samples.props.iter().step_by(4).copied().collect(),
                 tok: samples.tok.iter().step_by(4).copied().collect(),
+                val: Vec::new(),
             });
-            let tree = learn_ma_tree_in_place(
-                &mut samples,
+            let params = with_ma_prune(
                 ma_learn_params(
                     min_symbol,
                     max_leaves,
                     max_candidates,
                     stride as f64,
                     use_wp,
+                    !leaf_offsets,
                 ),
-                pool,
-                scratch,
+                stride as f64,
             );
+            let leaf_price = ma_leaf_price(&params, stride as f64);
+            let tree = learn_ma_tree_in_place(&mut samples, params, pool, scratch);
             drop(samples);
-            let mut cand = finish_ma_candidate(tree, stride as f64);
+            let mut cand = finish_ma_candidate(tree, stride as f64, leaf_price);
             if let Some(offsets) = offsets {
                 cand.set_leaf_offsets(offsets.props.iter().zip(&offsets.tok));
             }
@@ -5906,7 +6240,7 @@ fn try_encode_context_tree_single_group(
     // Frame header + single section (a patched frame's dictionary first).
     write_frame_header_modular_kind(alpha.is_some(), frame_kind, layout, writer);
     let mut section = BitWriter::new();
-    if let ModularFrameKind::Patched(references) = frame_kind {
+    if let ModularFrameKind::Patched { references, .. } = frame_kind {
         write_patch_dictionary(references, alpha.is_some(), scratch, &mut section);
     }
     section.write(1, 1); // dc_quant all_default = 1
@@ -6076,7 +6410,7 @@ fn try_encode_context_tree_multi_group(
     // A patched frame's dictionary opens the first section (written before
     // the code borrows the entropy scratch).
     let dictionary: Option<BitWriter> = match frame_kind {
-        ModularFrameKind::Patched(references) => {
+        ModularFrameKind::Patched { references, .. } => {
             let mut w = BitWriter::new();
             write_patch_dictionary(references, alpha.is_some(), scratch, &mut w);
             Some(w)
@@ -6930,7 +7264,7 @@ mod ma_sampling_tests {
                         params,
                         true,
                         stride,
-                        |p, t| actual.push(p, t),
+                        |p, t, _| actual.push(p, t),
                     );
                     assert_eq!(actual.len(), ma_channel_sample_count(width, height, stride));
                     assert_eq!(
@@ -7018,15 +7352,15 @@ mod context_tree_tests {
                     gt: 1,
                     le: 2,
                 },
-                MaNode::Leaf { pred: 1 },
+                MaNode::Leaf { pred: 1, offset: 0 },
                 MaNode::Split {
                     prop: 3,
                     val: 3,
                     gt: 3,
                     le: 4,
                 },
-                MaNode::Leaf { pred: 6 },
-                MaNode::Leaf { pred: 0 },
+                MaNode::Leaf { pred: 6, offset: 0 },
+                MaNode::Leaf { pred: 0, offset: 0 },
             ],
             est_bits: 100.,
             flat_bits: 10000.,
@@ -7042,7 +7376,7 @@ mod context_tree_tests {
         }
         for with_offsets in [false, true] {
             let candidate =
-                gate_ma_tree(tree.clone(), 1., with_offsets.then_some(&samples)).unwrap();
+                gate_ma_tree(tree.clone(), 1., with_offsets.then_some(&samples), None).unwrap();
             let offsets = if with_offsets { [-3, 5, 0] } else { [0; 3] };
             assert_eq!(candidate.leaf_offset, offsets);
             assert_eq!(candidate.leaf_ctx, [u32::MAX, 0, u32::MAX, 1, 2]);
@@ -7075,10 +7409,11 @@ mod context_tree_tests {
         let retained = MaSamples {
             props: samples.props.iter().step_by(4).copied().collect(),
             tok: samples.tok.iter().step_by(4).copied().collect(),
+            val: Vec::new(),
         };
         samples.props.reverse();
         samples.tok.reverse();
-        let mut retained_candidate = finish_ma_candidate(tree.clone(), 1.);
+        let mut retained_candidate = finish_ma_candidate(tree.clone(), 1., None);
         retained_candidate.set_leaf_offsets(retained.props.iter().zip(&retained.tok));
         assert_eq!(retained_candidate.leaf_offset, [-3, 5, 0]);
 
@@ -7091,7 +7426,8 @@ mod context_tree_tests {
                         ..tree.clone()
                     },
                     1.,
-                    Some(&samples)
+                    Some(&samples),
+                    None,
                 )
                 .is_none()
             );
@@ -7132,16 +7468,16 @@ mod context_tree_tests {
                     gt: 2,
                     le: 3,
                 },
-                MaNode::Leaf { pred: 6 },
-                MaNode::Leaf { pred: 1 },
+                MaNode::Leaf { pred: 6, offset: 0 },
+                MaNode::Leaf { pred: 1, offset: 0 },
                 MaNode::Split {
                     prop: 3,
                     val: 3,
                     gt: 5,
                     le: 6,
                 },
-                MaNode::Leaf { pred: 5 },
-                MaNode::Leaf { pred: 1 },
+                MaNode::Leaf { pred: 5, offset: 0 },
+                MaNode::Leaf { pred: 1, offset: 0 },
             ],
             est_bits: 0.,
             flat_bits: 0.,
@@ -7250,13 +7586,13 @@ mod constant_channel_tests {
                     gt: 1,
                     le: 2,
                 },
-                MaNode::Leaf { pred: 5 },
-                MaNode::Leaf { pred: 6 },
+                MaNode::Leaf { pred: 5, offset: 0 },
+                MaNode::Leaf { pred: 6, offset: 0 },
             ],
             est_bits: 100.0,
             flat_bits: 200.0,
         };
-        let mut cand = finish_ma_candidate(tree, 1.0);
+        let mut cand = finish_ma_candidate(tree, 1.0, None);
         cand.leaf_offset = vec![-3, 4];
         let wrapped = cand.with_constant_channel(3, 255);
         assert_eq!(wrapped.num_ctx, 3);

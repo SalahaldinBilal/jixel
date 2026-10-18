@@ -83,6 +83,7 @@ mod neon;
 mod orientation;
 mod patches;
 mod quant_weights;
+mod region_frames;
 #[cfg(feature = "splines")]
 mod splines;
 mod squeeze;

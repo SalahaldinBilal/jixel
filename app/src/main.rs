@@ -10,7 +10,7 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/Screenshot 2026-10-18 at 13.08.33.png")).unwrap();
+    let image = image::open(Path::new("./assets/Screenshot 2026-10-17 at 21.00.25.png")).unwrap();
     let rgb_img = image.to_rgba8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
@@ -44,7 +44,7 @@ fn main() {
     let width = image.width() as usize;
     let height = image.height() as usize;
     let cfg = EncodeConfig::default()
-        .with_lossless(false)
+        .with_lossless(true)
         .with_distance(distance)
         .with_speed(Speed::Slow)
         .with_progressive(false)

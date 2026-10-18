@@ -79,7 +79,7 @@ impl MaLookup {
         index: u32,
     ) -> u32 {
         match tree.nodes[index as usize] {
-            MaNode::Leaf { pred } => {
+            MaNode::Leaf { pred, .. } => {
                 let context = contexts[index as usize];
                 assert!(pred < NUM_MA_PREDS as u32);
                 assert!(context < LZ77_MAX_CONTEXTS as u32);
@@ -160,8 +160,11 @@ mod tests {
                             gt: 1,
                             le: 2,
                         },
-                        MaNode::Leaf { pred: 13 },
-                        MaNode::Leaf { pred: 6 },
+                        MaNode::Leaf {
+                            pred: 13,
+                            offset: 0,
+                        },
+                        MaNode::Leaf { pred: 6, offset: 0 },
                     ],
                     est_bits: 0.,
                     flat_bits: 0.,
@@ -204,11 +207,12 @@ mod tests {
             leaves: &mut u32,
         ) -> u32 {
             let index = nodes.len() as u32;
-            nodes.push(MaNode::Leaf { pred: 0 });
+            nodes.push(MaNode::Leaf { pred: 0, offset: 0 });
             contexts.push(u32::MAX);
             if depth == 0 {
                 nodes[index as usize] = MaNode::Leaf {
                     pred: *leaves % NUM_MA_PREDS as u32,
+                    offset: 0,
                 };
                 contexts[index as usize] = SPLIT_CAPACITY as u32 - 1 - *leaves;
                 *leaves += 1;
@@ -251,11 +255,12 @@ mod tests {
             (
                 vec![MaNode::Leaf {
                     pred: NUM_MA_PREDS as u32,
+                    offset: 0,
                 }],
                 vec![0],
             ),
             (
-                vec![MaNode::Leaf { pred: 0 }],
+                vec![MaNode::Leaf { pred: 0, offset: 0 }],
                 vec![LZ77_MAX_CONTEXTS as u32],
             ),
             (

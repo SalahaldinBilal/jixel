@@ -31,6 +31,7 @@
 
 use crate::adaptive_quant::dirty_log2f;
 use crate::coder_scratch::CoderScratch;
+use crate::entropy::{pack_signed, uint_encode};
 use crate::thread_pool::ThreadPool;
 use crate::util::heap_array;
 use std::sync::OnceLock;
@@ -73,7 +74,8 @@ fn split_props(allow_wp: bool) -> &'static [u8] {
     }
 }
 
-/// Weighted predictor id in the decoder predictor enumeration.
+/// Zero and Weighted predictor ids in the decoder predictor enumeration.
+pub(crate) const PRED_ZERO: usize = 0;
 pub(crate) const PRED_WEIGHTED: usize = 6;
 
 /// Split candidates examined per property per node. Sixteen quantiles retain
@@ -111,6 +113,9 @@ pub(crate) enum MaNode {
     },
     Leaf {
         pred: u32,
+        /// Added to the prediction (libjxl `predictor_offset`); nonzero only
+        /// for modal Zero leaves, which predict the leaf's most frequent value.
+        offset: i32,
     },
 }
 
@@ -135,7 +140,7 @@ impl LearnedTree {
                 MaNode::Split { prop, val, gt, le } => {
                     i = if p[prop as usize] > val { gt } else { le } as usize;
                 }
-                MaNode::Leaf { pred } => return (i as u32, pred),
+                MaNode::Leaf { pred, .. } => return (i as u32, pred),
             }
         }
     }
@@ -144,6 +149,9 @@ impl LearnedTree {
 pub(crate) struct MaSamples {
     pub(crate) props: Vec<[i32; NUM_MA_PROPS]>,
     pub(crate) tok: Vec<[u8; NUM_MA_PREDS]>,
+    /// The sampled value itself, for modal Zero leaves (`MaLearnParams::
+    /// modal_offsets`); empty when the learn does not use them.
+    pub(crate) val: Vec<i32>,
 }
 
 fn select_rows<T: Copy>(rows: &[T], indices: &[u32]) -> Vec<T> {
@@ -160,6 +168,7 @@ impl MaSamples {
         Self {
             props: Vec::with_capacity(capacity),
             tok: Vec::with_capacity(capacity),
+            val: Vec::new(),
         }
     }
 
@@ -167,6 +176,19 @@ impl MaSamples {
     pub(crate) fn push(&mut self, props: [i32; NUM_MA_PROPS], tok: [u8; NUM_MA_PREDS]) {
         self.props.push(props);
         self.tok.push(tok);
+    }
+
+    /// `push` with the sample's value (every row of a set has one or none).
+    #[inline]
+    pub(crate) fn push_val(
+        &mut self,
+        props: [i32; NUM_MA_PROPS],
+        tok: [u8; NUM_MA_PREDS],
+        val: i32,
+    ) {
+        self.props.push(props);
+        self.tok.push(tok);
+        self.val.push(val);
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -179,6 +201,11 @@ impl MaSamples {
         Self {
             props: select_rows(&self.props, indices),
             tok: select_rows(&self.tok, indices),
+            val: if self.val.is_empty() {
+                Vec::new()
+            } else {
+                select_rows(&self.val, indices)
+            },
         }
     }
 
@@ -193,6 +220,7 @@ impl MaSamples {
             }
             let props = self.props[start];
             let tok = self.tok[start];
+            let val = self.val.get(start).copied();
             let mut dst = start;
             loop {
                 let src = indices[dst] as usize;
@@ -200,10 +228,16 @@ impl MaSamples {
                 if src == start {
                     self.props[dst] = props;
                     self.tok[dst] = tok;
+                    if let Some(val) = val {
+                        self.val[dst] = val;
+                    }
                     break;
                 }
                 self.props[dst] = self.props[src];
                 self.tok[dst] = self.tok[src];
+                if val.is_some() {
+                    self.val[dst] = self.val[src];
+                }
                 dst = src;
             }
         }
@@ -243,6 +277,18 @@ pub(crate) struct MaLearnParams {
     /// Photos want the full 32; near-deterministic palette index images
     /// overfit at more than 16.
     pub(crate) max_candidates: usize,
+    /// Modal Zero leaves: the Zero predictor of every node carries the node's
+    /// most frequent sample value as its offset, so a leaf predicts the
+    /// constant its context implies (an AA level of a palette index image)
+    /// instead of 0. Needs `MaSamples::val`.
+    pub(crate) modal_offsets: bool,
+    /// Grow-then-prune: bits one kept leaf is charged. 0 keeps best-first
+    /// growth as it is. Otherwise the tree grows to its leaf cap at the
+    /// caller's (small) `split_cost_bits` and `min_node`, then sibling
+    /// leaves are merged bottom-up while the parent codes no more than the
+    /// two of them plus this; greedy growth stops where no single split
+    /// pays, pruning keeps a split whose descendants do.
+    pub(crate) prune_leaf_bits: f32,
 }
 
 /// Reusable scratch for scoring one property of one MA-tree node. One lives in
@@ -307,8 +353,29 @@ struct Learner<'a> {
     s: &'a mut MaSamples,
     p: MaLearnParams,
     nodes: Vec<MaNode>,
+    /// Per node: what it codes as a leaf, kept once it is split.
+    info: Vec<NodeInfo>,
     leaves: u32,
     est_bits: f64,
+}
+
+/// A node's cost and leaf predictor, so pruning can turn a split node back
+/// into the leaf it was scored as.
+#[derive(Clone, Copy)]
+struct NodeInfo {
+    base_bits: f32,
+    pred: u32,
+    offset: i32,
+}
+
+impl NodeInfo {
+    fn of(pending: &Pending) -> Self {
+        Self {
+            base_bits: pending.base_bits,
+            pred: pending.pred,
+            offset: pending.offset,
+        }
+    }
 }
 
 #[inline]
@@ -848,6 +915,7 @@ impl Learner<'_> {
         start: usize,
         end: usize,
         depth: u16,
+        zero_offset: i32,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
@@ -858,8 +926,22 @@ impl Learner<'_> {
             &self.s.props[start..end],
             &self.s.tok[start..end],
             depth,
+            zero_offset,
             pool,
             scratch,
+        )
+    }
+
+    /// `rebase_zero` over the learner's rows `start..end` (0 without
+    /// `modal_offsets`).
+    fn rebase(&mut self, start: usize, end: usize, scratch: &mut CoderScratch) -> i32 {
+        if !self.p.modal_offsets || self.s.val.is_empty() {
+            return 0;
+        }
+        rebase_zero(
+            &mut self.s.tok[start..end],
+            &self.s.val[start..end],
+            &mut scratch.ma_property.multi_bin_count,
         )
     }
 
@@ -875,6 +957,7 @@ impl Learner<'_> {
         properties: &[[i32; NUM_MA_PROPS]],
         tokens: &[[u8; NUM_MA_PREDS]],
         depth: u16,
+        zero_offset: i32,
         pool: &ThreadPool,
         scratch: &mut CoderScratch,
     ) -> Pending {
@@ -1076,6 +1159,11 @@ impl Learner<'_> {
             split,
             gain,
             pred: base_pred as u32,
+            offset: if base_pred == PRED_ZERO {
+                zero_offset
+            } else {
+                0
+            },
         }
     }
 }
@@ -1085,6 +1173,9 @@ struct Pending {
     node_id: u32,
     /// Best single predictor of the node (becomes the leaf predictor).
     pred: u32,
+    /// Leaf offset: the node's modal value when `pred` is Zero under
+    /// `modal_offsets`, else 0.
+    offset: i32,
     start: usize,
     end: usize,
     depth: u16,
@@ -1115,9 +1206,26 @@ fn new_learner(samples: &mut MaSamples, params: MaLearnParams, nodes: Vec<MaNode
         .iter()
         .filter(|node| matches!(node, MaNode::Leaf { .. }))
         .count() as u32;
+    // Seed splits have no leaf score: never pruned.
+    let info = nodes
+        .iter()
+        .map(|node| match *node {
+            MaNode::Leaf { pred, offset } => NodeInfo {
+                base_bits: 0.0,
+                pred,
+                offset,
+            },
+            MaNode::Split { .. } => NodeInfo {
+                base_bits: f32::INFINITY,
+                pred: 0,
+                offset: 0,
+            },
+        })
+        .collect();
     Learner {
         s: samples,
         nodes,
+        info,
         leaves,
         est_bits: 0.0,
         p: params,
@@ -1158,7 +1266,10 @@ struct Ahead {
 /// This is what keeps the deep tail of small nodes, where a node's own scan
 /// is too small to parallelize, off a single thread.
 fn speculative_splits(pool: &ThreadPool) -> usize {
-    (pool.num_threads() / 2).clamp(1, 8)
+    match pool.num_threads() {
+        1 => 1,
+        threads => (2 * threads).min(8),
+    }
 }
 
 /// Rows of a node scored ahead of its turn are partitioned on a copy, so the
@@ -1171,6 +1282,7 @@ const SPECULATE_MAX_ROWS: usize = 1 << 16;
 fn partition_rows(
     props: &mut [[i32; NUM_MA_PROPS]],
     tok: &mut [[u8; NUM_MA_PREDS]],
+    val: &mut [i32],
     prop: u8,
     threshold: i32,
 ) -> usize {
@@ -1183,9 +1295,54 @@ fn partition_rows(
             hi -= 1;
             props.swap(lo, hi);
             tok.swap(lo, hi);
+            if !val.is_empty() {
+                val.swap(lo, hi);
+            }
         }
     }
     lo
+}
+
+/// `val[start..end]`, or an empty slice for a sample set without values.
+fn val_range(val: &mut [i32], start: usize, end: usize) -> &mut [i32] {
+    let n = val.len();
+    &mut val[start.min(n)..end.min(n)]
+}
+
+/// Widest value span a node may have for a modal offset (a histogram of that
+/// many bins is built per node).
+const MODAL_MAX_SPAN: i64 = 4096;
+
+/// Rebase a node's Zero-predictor tokens on its modal value: the node's
+/// Zero leaf predicts that value (offset) and the split scan prices both
+/// children against it. Returns the offset (0 when the node has no values
+/// or spans too wide a range). `hist` is scratch (the bin counts, idle
+/// between node scores).
+fn rebase_zero(tok: &mut [[u8; NUM_MA_PREDS]], val: &[i32], hist: &mut Vec<u32>) -> i32 {
+    let (Some(&lo), Some(&hi)) = (val.iter().min(), val.iter().max()) else {
+        return 0;
+    };
+    let span = i64::from(hi) - i64::from(lo) + 1;
+    let mode = if span > MODAL_MAX_SPAN {
+        0
+    } else {
+        hist.clear();
+        hist.resize(span as usize, 0);
+        for &v in val {
+            hist[(v - lo) as usize] += 1;
+        }
+        let (best, _) =
+            hist.iter().enumerate().fold(
+                (0usize, 0u32),
+                |acc, (i, &c)| if c > acc.1 { (i, c) } else { acc },
+            );
+        lo + best as i32
+    };
+    for (t, &v) in tok.iter_mut().zip(val) {
+        let (token, _, _) = uint_encode(pack_signed(v - mode));
+        t[PRED_ZERO] = token.min(u8::MAX as u32) as u8;
+    }
+    mode
 }
 
 fn grow_tree(
@@ -1205,8 +1362,11 @@ fn grow_tree(
         lo: usize,
         end: usize,
         depth: u16,
+        /// Modal offsets of the `gt` and `le` children.
+        offsets: (i32, i32),
         copy: Option<MaSamples>,
     }
+    let modal = learner.p.modal_offsets && !learner.s.val.is_empty();
     while learner.leaves < learner.p.max_leaves as u32 {
         let Some(p) = heap.pop() else { break };
         let (prop, threshold) = p.split.expect("only splittable nodes are queued");
@@ -1220,15 +1380,21 @@ fn grow_tree(
                 + partition_rows(
                     &mut learner.s.props[p.start..p.end],
                     &mut learner.s.tok[p.start..p.end],
+                    val_range(&mut learner.s.val, p.start, p.end),
                     prop,
                     threshold,
                 );
+            let offsets = (
+                learner.rebase(p.start, lo, scratch),
+                learner.rebase(lo, p.end, scratch),
+            );
             jobs.push(Job {
                 node_id: p.node_id,
                 start: p.start,
                 lo,
                 end: p.end,
                 depth: p.depth + 1,
+                offsets,
                 copy: None,
             });
             if window > 1 {
@@ -1249,15 +1415,36 @@ fn grow_tree(
                     let mut copy = MaSamples {
                         props: learner.s.props[q.start..q.end].to_vec(),
                         tok: learner.s.tok[q.start..q.end].to_vec(),
+                        val: if modal {
+                            learner.s.val[q.start..q.end].to_vec()
+                        } else {
+                            Vec::new()
+                        },
                     };
-                    let lo =
-                        q.start + partition_rows(&mut copy.props, &mut copy.tok, prop, threshold);
+                    let split_at = partition_rows(
+                        &mut copy.props,
+                        &mut copy.tok,
+                        &mut copy.val,
+                        prop,
+                        threshold,
+                    );
+                    let offsets = if modal {
+                        let hist = &mut scratch.ma_property.multi_bin_count;
+                        (
+                            rebase_zero(&mut copy.tok[..split_at], &copy.val[..split_at], hist),
+                            rebase_zero(&mut copy.tok[split_at..], &copy.val[split_at..], hist),
+                        )
+                    } else {
+                        (0, 0)
+                    };
+                    let lo = q.start + split_at;
                     jobs.push(Job {
                         node_id: q.node_id,
                         start: q.start,
                         lo,
                         end: q.end,
                         depth: q.depth + 1,
+                        offsets,
                         copy: Some(copy),
                     });
                 }
@@ -1269,13 +1456,15 @@ fn grow_tree(
             let learner_ref = &learner;
             let score = |k: usize, worker_scratch: &mut CoderScratch| {
                 let job = live[k / 2];
-                let (start, end) = if k.is_multiple_of(2) {
-                    (job.start, job.lo)
+                let (start, end, offset) = if k.is_multiple_of(2) {
+                    (job.start, job.lo, job.offsets.0)
                 } else {
-                    (job.lo, job.end)
+                    (job.lo, job.end, job.offsets.1)
                 };
                 match &job.copy {
-                    None => learner_ref.evaluate(0, start, end, job.depth, pool, worker_scratch),
+                    None => {
+                        learner_ref.evaluate(0, start, end, job.depth, offset, pool, worker_scratch)
+                    }
                     Some(copy) => {
                         let rows = start - job.start..end - job.start;
                         learner_ref.evaluate_rows(
@@ -1285,6 +1474,7 @@ fn grow_tree(
                             &copy.props[rows.clone()],
                             &copy.tok[rows],
                             job.depth,
+                            offset,
                             pool,
                             worker_scratch,
                         )
@@ -1313,13 +1503,18 @@ fn grow_tree(
                 ahead.insert(job.node_id, Ahead { children });
             }
         } else {
-            // Scored ahead on a copy: partition the learner's rows now.
-            partition_rows(
-                &mut learner.s.props[p.start..p.end],
-                &mut learner.s.tok[p.start..p.end],
-                prop,
-                threshold,
-            );
+            // Scored ahead on a copy: partition the learner's rows now, and
+            // rebase the children's Zero tokens as the copy was.
+            let lo = p.start
+                + partition_rows(
+                    &mut learner.s.props[p.start..p.end],
+                    &mut learner.s.tok[p.start..p.end],
+                    val_range(&mut learner.s.val, p.start, p.end),
+                    prop,
+                    threshold,
+                );
+            learner.rebase(p.start, lo, scratch);
+            learner.rebase(lo, p.end, scratch);
         }
         let Some((_, mut gt, mut le)) = ahead.remove(&p.node_id).expect("scored ahead").children
         else {
@@ -1328,15 +1523,24 @@ fn grow_tree(
         };
 
         let gt_id = learner.nodes.len() as u32;
-        learner.nodes.push(MaNode::Leaf { pred: gt.pred });
+        learner.nodes.push(MaNode::Leaf {
+            pred: gt.pred,
+            offset: gt.offset,
+        });
         let le_id = learner.nodes.len() as u32;
-        learner.nodes.push(MaNode::Leaf { pred: le.pred });
+        learner.nodes.push(MaNode::Leaf {
+            pred: le.pred,
+            offset: le.offset,
+        });
         learner.nodes[p.node_id as usize] = MaNode::Split {
             prop,
             val: threshold,
             gt: gt_id,
             le: le_id,
         };
+        learner.info[p.node_id as usize] = NodeInfo::of(&p);
+        learner.info.push(NodeInfo::of(&gt));
+        learner.info.push(NodeInfo::of(&le));
         learner.leaves += 1;
         gt.node_id = gt_id;
         le.node_id = le_id;
@@ -1349,11 +1553,70 @@ fn grow_tree(
         }
     }
 
+    if learner.p.prune_leaf_bits > 0.0 {
+        learner.est_bits = prune_tree(&mut learner.nodes, &learner.info, learner.p.prune_leaf_bits);
+    }
+
     LearnedTree {
         est_bits: learner.est_bits,
         flat_bits,
         nodes: learner.nodes,
     }
+}
+
+/// Grow-then-prune (`MaLearnParams::prune_leaf_bits`): merge sibling leaves
+/// bottom-up while their parent, as the leaf it was scored as, codes no more
+/// than the two of them plus one leaf's bits, then renumber the reachable
+/// nodes in preorder. Children are numbered after their parent, so one
+/// descending pass visits every child first and merges cascade up the
+/// tree. Returns the pruned tree's estimated bits.
+fn prune_tree(nodes: &mut Vec<MaNode>, info: &[NodeInfo], leaf_bits: f32) -> f64 {
+    let n = nodes.len();
+    let mut subtree_bits = vec![0.0f64; n];
+    for i in (0..n).rev() {
+        match nodes[i] {
+            MaNode::Leaf { .. } => subtree_bits[i] = info[i].base_bits as f64,
+            MaNode::Split { gt, le, .. } => {
+                let children = subtree_bits[gt as usize] + subtree_bits[le as usize];
+                let both_leaves = matches!(nodes[gt as usize], MaNode::Leaf { .. })
+                    && matches!(nodes[le as usize], MaNode::Leaf { .. });
+                if both_leaves && info[i].base_bits as f64 <= children + leaf_bits as f64 {
+                    nodes[i] = MaNode::Leaf {
+                        pred: info[i].pred,
+                        offset: info[i].offset,
+                    };
+                    subtree_bits[i] = info[i].base_bits as f64;
+                } else {
+                    subtree_bits[i] = children;
+                }
+            }
+        }
+    }
+    let mut new_index = vec![u32::MAX; n];
+    let mut order = Vec::with_capacity(n);
+    let mut stack = vec![0u32];
+    while let Some(i) = stack.pop() {
+        new_index[i as usize] = order.len() as u32;
+        order.push(i);
+        if let MaNode::Split { gt, le, .. } = nodes[i as usize] {
+            stack.push(le);
+            stack.push(gt);
+        }
+    }
+    let compact = order
+        .iter()
+        .map(|&i| match nodes[i as usize] {
+            MaNode::Split { prop, val, gt, le } => MaNode::Split {
+                prop,
+                val,
+                gt: new_index[gt as usize],
+                le: new_index[le as usize],
+            },
+            leaf => leaf,
+        })
+        .collect();
+    *nodes = compact;
+    subtree_bits[0]
 }
 
 /// Learn a context tree from `samples`. Never fails; a degenerate sample set
@@ -1394,11 +1657,16 @@ pub(crate) fn learn_ma_tree_in_place(
     scratch: &mut CoderScratch,
 ) -> LearnedTree {
     let n = samples.len();
-    let mut learner = new_learner(samples, params, vec![MaNode::Leaf { pred: 0 }]);
+    let mut learner = new_learner(samples, params, vec![MaNode::Leaf { pred: 0, offset: 0 }]);
     let flat_bits = flat_cost(&learner, scratch);
     let mut heap = std::collections::BinaryHeap::new();
-    let root = learner.evaluate(0, 0, n, 0, pool, scratch);
-    learner.nodes[0] = MaNode::Leaf { pred: root.pred };
+    let offset = learner.rebase(0, n, scratch);
+    let root = learner.evaluate(0, 0, n, 0, offset, pool, scratch);
+    learner.nodes[0] = MaNode::Leaf {
+        pred: root.pred,
+        offset: root.offset,
+    };
+    learner.info[0] = NodeInfo::of(&root);
     learner.est_bits = root.base_bits as f64;
     if root.split.is_some() {
         heap.push(root);
@@ -1463,6 +1731,10 @@ pub(crate) fn deepen_ma_tree(
     let seed_leaves: Vec<usize> = (0..learner.nodes.len())
         .filter(|&node| matches!(learner.nodes[node], MaNode::Leaf { .. }) && counts[node] != 0)
         .collect();
+    let modal_offsets: Vec<i32> = seed_leaves
+        .iter()
+        .map(|&node| learner.rebase(offsets[node], offsets[node + 1], scratch))
+        .collect();
     let pendings = {
         let learner_ref = &learner;
         pool.steal_map(scratch, seed_leaves.len(), |k, worker_scratch| {
@@ -1472,13 +1744,18 @@ pub(crate) fn deepen_ma_tree(
                 offsets[node],
                 offsets[node + 1],
                 depths[node],
+                modal_offsets[k],
                 pool,
                 worker_scratch,
             )
         })
     };
     for pending in pendings {
-        learner.nodes[pending.node_id as usize] = MaNode::Leaf { pred: pending.pred };
+        learner.nodes[pending.node_id as usize] = MaNode::Leaf {
+            pred: pending.pred,
+            offset: pending.offset,
+        };
+        learner.info[pending.node_id as usize] = NodeInfo::of(&pending);
         learner.est_bits += pending.base_bits as f64;
         if pending.split.is_some() {
             heap.push(pending);
@@ -1760,6 +2037,8 @@ mod tests {
                 allowed_preds: u16::MAX,
                 side_preds: NUM_MA_PREDS,
                 max_candidates: MAX_CANDIDATES,
+                modal_offsets: false,
+                prune_leaf_bits: 0.0,
             },
             &serial_pool,
             &mut serial_scratch,
@@ -1777,6 +2056,8 @@ mod tests {
                 allowed_preds: u16::MAX,
                 side_preds: NUM_MA_PREDS,
                 max_candidates: MAX_CANDIDATES,
+                modal_offsets: false,
+                prune_leaf_bits: 0.0,
             },
             &parallel_pool,
             &mut parallel_scratch,
@@ -1816,6 +2097,8 @@ mod tests {
                 allowed_preds: u16::MAX,
                 side_preds: NUM_MA_PREDS,
                 max_candidates: MAX_CANDIDATES,
+                modal_offsets: false,
+                prune_leaf_bits: 0.0,
             },
             &ThreadPool::new(1),
             &mut CoderScratch::default(),
@@ -1856,6 +2139,8 @@ mod tests {
             allowed_preds: u16::MAX,
             side_preds: NUM_MA_PREDS,
             max_candidates: MAX_CANDIDATES,
+            modal_offsets: false,
+            prune_leaf_bits: 0.0,
         };
         let pool = ThreadPool::new(1);
         let indexed = learn_ma_tree_indexed(
@@ -1878,5 +2163,47 @@ mod tests {
             in_place.flat_bits.to_bits(),
             materialized.flat_bits.to_bits()
         );
+    }
+
+    #[test]
+    fn prune_merges_sibling_leaves_bottom_up_and_compacts() {
+        let leaf = |pred: u32| MaNode::Leaf { pred, offset: 0 };
+        let split = |gt: u32, le: u32| MaNode::Split {
+            prop: 2,
+            val: 0,
+            gt,
+            le,
+        };
+        let info = |base_bits: f32, pred: u32, offset: i32| NodeInfo {
+            base_bits,
+            pred,
+            offset,
+        };
+        // Root (200 bits as a leaf) over an inner split (100 bits) with leaf
+        // children of 40 + 45 bits, and a 50-bit leaf.
+        let grown = vec![split(1, 2), split(3, 4), leaf(1), leaf(2), leaf(3)];
+        let infos = [
+            info(200.0, 5, 0),
+            info(100.0, 0, 7),
+            info(50.0, 1, 0),
+            info(40.0, 2, 0),
+            info(45.0, 3, 0),
+        ];
+
+        // 20 bits per leaf: the inner split (40 + 45 + 20 >= 100) merges
+        // into its Zero+7 leaf; the root (100 + 50 + 20 < 200) stays.
+        let mut nodes = grown.clone();
+        let est = prune_tree(&mut nodes, &infos, 20.0);
+        assert_eq!(
+            nodes,
+            vec![split(1, 2), MaNode::Leaf { pred: 0, offset: 7 }, leaf(1)]
+        );
+        assert_eq!(est, 150.0);
+
+        // 60 bits per leaf: the merge cascades to the root.
+        let mut nodes = grown;
+        let est = prune_tree(&mut nodes, &infos, 60.0);
+        assert_eq!(nodes, vec![leaf(5)]);
+        assert_eq!(est, 200.0);
     }
 }

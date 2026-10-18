@@ -1348,7 +1348,7 @@ const INK_STACK_STEP: f64 = 1.15;
 fn ink_levels(distance: f32, inks: usize) -> u32 {
     (7.0 / distance.max(0.01))
         .round()
-        .clamp(1.0, (255 / inks.max(1)) as f32) as u32
+        .clamp(2.0, (255 / inks.max(1)) as f32) as u32
 }
 
 /// One VarDCT base and its palette coverage frame.
@@ -1584,7 +1584,9 @@ fn encode_ink_frame(
         }
     }
     let alpha = AlphaPlane::from_u8(alpha);
-    let speed = if config.speed >= Speed::ExtraSlow {
+    // The ink frame is a full-resolution learned-tree frame: Slow's LZ77 and
+    // refinement take 14% off it on text and the base already paid the time.
+    let speed = if config.speed >= Speed::Slow {
         Speed::Slow
     } else {
         Speed::Medium

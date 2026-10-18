@@ -206,6 +206,36 @@ pub(crate) fn write_ac_group_alpha(
     }
 }
 
+/// The GlobalModular part of a palette-coded extra channel larger than a
+/// group: its Palette transform and the palette itself (one row of
+/// `entries`, `bits` deep) under a local one-leaf tree; the indices follow
+/// per AC group.
+pub(crate) fn write_global_palette_alpha_modular(
+    entries: &[i32],
+    bits: u8,
+    scratch: &mut CoderScratch,
+    w: &mut BitWriter,
+) {
+    let meta = if bits <= 8 {
+        AlphaPlane::U8(entries.iter().map(|&v| v as u8).collect())
+    } else {
+        AlphaPlane::U16 {
+            data: entries.iter().map(|&v| v as u16).collect(),
+            bits,
+        }
+    };
+    let tokens = tokenize_channel(&meta, entries.len(), 1);
+    w.write(1, 0); // use_global_tree = false
+    w.write(1, 1); // wp_header all_default
+    crate::lossless::write_palette_transform(1, entries.len() as u32, w);
+    let pixel_code = build_pixel_code(&tokens, scratch);
+    write_tree_and_pixel_histograms(&pixel_code, scratch, w);
+    let code_ref = pixel_code.as_ref();
+    for tok in &tokens {
+        write_token(*tok, &code_ref, w);
+    }
+}
+
 /// Snap a plane onto the lattice `{max - step·n}`: the maximum (no ink for
 /// a K channel, opaque for alpha) stays exact and every value moves by at
 /// most half a step.

@@ -10,13 +10,13 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/Campfire_and_sparks_in_Anttoora_3.jpg")).unwrap();
-    let rgb_img = image.to_rgb8();
+    let image = image::open(Path::new("./assets/Screenshot 2026-10-18 at 13.08.33.png")).unwrap();
+    let rgb_img = image.to_rgba8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
-    let distance = 0.87;
-    for _ in 0..3 {
+    let distance = 1.0;
+    for _ in 0..0 {
         let instant = Instant::now();
         let _d_bytes = jixel::encode_image(
             &rgb_img,
@@ -59,9 +59,9 @@ fn main() {
         )
         .with_ink_layer(true)
         .with_vector_layers(true)
-        .with_splines(true)
+        .with_splines(false)
         .with_dots(false);
-    let bytes = jixel::encode_image(&rgb_img, width, height, &cfg).unwrap();
+    let bytes = jixel::encode_image_with_alpha(&rgb_img, width, height, &cfg).unwrap();
     std::fs::write(output, &bytes).expect("failed to write output");
     // let width = 2000;
     // let height = 1000;

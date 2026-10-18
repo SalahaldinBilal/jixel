@@ -29,6 +29,7 @@
 
 mod dc_rdo;
 mod dc_smoothing;
+mod extra_tree;
 mod loop_arbiter;
 mod loop_group_map;
 use dc_smoothing::{
@@ -877,6 +878,12 @@ pub(crate) fn write_context_tree(
     huffman_pool: &mut Vec<crate::entropy::HuffmanNode>,
     writer: &mut BitWriter,
 ) {
+    let tokens = context_tree_tokens(num_dc_groups, dc_gradient);
+    write_tree_tokens(&tokens, huffman_pool, writer);
+}
+
+/// The static context tree's tokens.
+fn context_tree_tokens(num_dc_groups: usize, dc_gradient: &DcPredictorChoice) -> Vec<Token> {
     // Build tokens with the patched value at index 1.
     let mut tokens: Vec<Token> = Vec::with_capacity(K_CONTEXT_TREE_TOKENS.len());
     for (i, &(ctx, val)) in K_CONTEXT_TREE_TOKENS.iter().enumerate() {
@@ -913,7 +920,7 @@ pub(crate) fn write_context_tree(
             }
         }
     }
-    write_tree_tokens(&tokens, huffman_pool, writer);
+    tokens
 }
 
 /// Serialize a context tree's token stream (its own entropy code included).
@@ -940,6 +947,15 @@ pub(crate) enum DcTreeChoice {
     Static(DcPredictorChoice),
     /// A per-image learned tree, already serialized to tokens.
     Learned(Vec<Token>),
+}
+
+impl DcTreeChoice {
+    fn tokens(&self, num_dc_groups: usize) -> Vec<Token> {
+        match self {
+            Self::Static(grad) => context_tree_tokens(num_dc_groups, grad),
+            Self::Learned(tokens) => tokens.clone(),
+        }
+    }
 }
 
 fn write_frame_dimension(value: usize, w: &mut BitWriter) {
@@ -1314,19 +1330,78 @@ impl ExtraSections {
     }
 }
 
-/// Code the extra channel losslessly and, when the context asks for a lossy
-/// one, also squeezed and quantized; keep the smaller. The lossless coding
-/// wins wherever it is no larger, so solid and hard-edged planes stay exact
-/// and cost what they did. `global_code_ans` is whether the frame's global
-/// tree carries an ANS code.
+/// A lossless extra channel of few distinct values, coded through a Palette
+/// transform: the values in index order and one index per sample.
+struct ExtraPalette {
+    entries: Vec<i32>,
+    indices: AlphaPlane,
+}
+
+/// Largest palette an extra channel is coded through.
+const EXTRA_PALETTE_MAX_COLORS: usize = 256;
+/// The global tree has not cut a plane's fixed lossless coding below a
+/// quarter; past that the squeezed coding is out of its reach.
+const GLOBAL_TREE_MAX_SAVING: usize = 4;
+
+/// The palette of an integer extra channel whose distinct values number at
+/// most `EXTRA_PALETTE_MAX_COLORS` and at most half its span, so that the
+/// index image is narrower than the values.
+fn extra_palette(plane: &AlphaPlane) -> Option<ExtraPalette> {
+    let range = match plane {
+        AlphaPlane::U8(_) => 1usize << 8,
+        AlphaPlane::U16 { bits, .. } => 1usize << bits,
+        AlphaPlane::F32(_) => return None,
+    };
+    let mut seen = vec![false; range];
+    for i in 0..plane.len() {
+        let v = plane.get_i32(i);
+        if v < 0 || v as usize >= range {
+            return None;
+        }
+        seen[v as usize] = true;
+    }
+    let entries: Vec<i32> = (0..range as i32).filter(|&v| seen[v as usize]).collect();
+    let (Some(&lo), Some(&hi)) = (entries.first(), entries.last()) else {
+        return None;
+    };
+    if entries.len() < 2
+        || entries.len() > EXTRA_PALETTE_MAX_COLORS
+        || 2 * entries.len() as i64 > i64::from(hi - lo) + 1
+    {
+        return None;
+    }
+    let mut index_of = vec![0u8; range];
+    for (index, &v) in entries.iter().enumerate() {
+        index_of[v as usize] = index as u8;
+    }
+    let indices = (0..plane.len())
+        .map(|i| index_of[plane.get_i32(i) as usize])
+        .collect();
+    Some(ExtraPalette {
+        entries,
+        indices: AlphaPlane::U8(indices),
+    })
+}
+
+/// Code the extra channel losslessly — through a Palette transform when it
+/// has few distinct values, and through the frame's global tree where that
+/// beats the fixed local trees — and, when the context asks for a lossy one,
+/// also squeezed and quantized; keep the smaller. The lossless coding wins
+/// wherever it is no larger, so solid and hard-edged planes stay exact. A
+/// winning global-tree coding moves the frame's DC streams onto the merged
+/// tree through `streams`.
 fn prepare_extra_sections(
     ctx: &EncodingContext,
     plane: &AlphaPlane,
     dim: &ImageDim,
     dc_group_coords: &[(usize, usize)],
-    global_code_ans: bool,
+    last_pass: usize,
+    mut streams: extra_tree::GlobalStreams<'_>,
     scratch: &mut CoderScratch,
 ) -> ExtraSections {
+    let single = dim.xsize <= K_GROUP_DIM && dim.ysize <= K_GROUP_DIM;
+    let lossless_plane = ctx.extra_step == 1 && !plane.is_constant();
+    let palette = lossless_plane.then(|| extra_palette(plane)).flatten();
     let mut lossless = ExtraSections {
         global: BitWriter::new(),
         lf: (0..dc_group_coords.len())
@@ -1334,15 +1409,29 @@ fn prepare_extra_sections(
             .collect(),
         ac: Vec::new(),
     };
-    crate::modular::write_global_alpha_modular(
-        plane,
-        dim.xsize,
-        dim.ysize,
-        ctx.extra_step,
-        global_code_ans,
-        scratch,
-        &mut lossless.global,
-    );
+    // A multi-group palette-coded channel codes its palette locally in the
+    // global stream and its indices per AC group. A single-group one keeps
+    // the values' section as the local alternative of its global-tree
+    // coding, which carries the palette.
+    let coded = palette.as_ref().filter(|_| !single);
+    match coded {
+        Some(p) => crate::modular::write_global_palette_alpha_modular(
+            &p.entries,
+            plane.bits(),
+            scratch,
+            &mut lossless.global,
+        ),
+        None => crate::modular::write_global_alpha_modular(
+            plane,
+            dim.xsize,
+            dim.ysize,
+            ctx.extra_step,
+            !streams.code.use_prefix_code,
+            scratch,
+            &mut lossless.global,
+        ),
+    }
+    let ac_plane = coded.map_or(plane, |p| &p.indices);
     lossless.ac = ctx
         .thread_pool
         .steal_map(scratch, dim.num_groups, |group_id, scratch| {
@@ -1350,7 +1439,7 @@ fn prepare_extra_sections(
             let y0 = (group_id / dim.xsize_groups) * K_GROUP_DIM;
             let mut w = BitWriter::new();
             crate::modular::write_ac_group_alpha(
-                plane,
+                ac_plane,
                 dim.xsize,
                 dim.ysize,
                 x0,
@@ -1363,48 +1452,73 @@ fn prepare_extra_sections(
             );
             w
         });
-    if ctx.extra_squeeze_distance <= 0.0 || plane.is_constant() {
-        return lossless;
-    }
-    let Some(squeezed) = crate::lossless::ExtraSqueeze::new(
-        plane,
-        dim.xsize,
-        dim.ysize,
-        ctx.extra_squeeze_distance,
-        ctx.extra_learned_trees,
-    ) else {
-        return lossless;
-    };
-    let mut lossy = ExtraSections {
-        global: BitWriter::new(),
-        lf: Vec::new(),
-        ac: Vec::new(),
-    };
-    squeezed.write_global(scratch, &mut lossy.global);
-    lossy.lf = ctx
-        .thread_pool
-        .steal_map(scratch, dc_group_coords.len(), |i, scratch| {
-            let (gx, gy) = dc_group_coords[i];
-            let mut w = BitWriter::new();
-            squeezed.write_lf_group(gx, gy, scratch, &mut w);
-            w
+    let lossy = (ctx.extra_squeeze_distance > 0.0 && !plane.is_constant())
+        .then(|| {
+            crate::lossless::ExtraSqueeze::new(
+                plane,
+                dim.xsize,
+                dim.ysize,
+                ctx.extra_squeeze_distance,
+                ctx.extra_learned_trees,
+            )
+        })
+        .flatten()
+        .map(|squeezed| {
+            let mut lossy = ExtraSections {
+                global: BitWriter::new(),
+                lf: Vec::new(),
+                ac: Vec::new(),
+            };
+            squeezed.write_global(scratch, &mut lossy.global);
+            lossy.lf = ctx
+                .thread_pool
+                .steal_map(scratch, dc_group_coords.len(), |i, scratch| {
+                    let (gx, gy) = dc_group_coords[i];
+                    let mut w = BitWriter::new();
+                    squeezed.write_lf_group(gx, gy, scratch, &mut w);
+                    w
+                });
+            lossy.ac = ctx
+                .thread_pool
+                .steal_map(scratch, dim.num_groups, |group_id, scratch| {
+                    let mut w = BitWriter::new();
+                    squeezed.write_ac_group(
+                        group_id % dim.xsize_groups,
+                        group_id / dim.xsize_groups,
+                        scratch,
+                        &mut w,
+                    );
+                    w
+                });
+            lossy
         });
-    lossy.ac = ctx
-        .thread_pool
-        .steal_map(scratch, dim.num_groups, |group_id, scratch| {
-            let mut w = BitWriter::new();
-            squeezed.write_ac_group(
-                group_id % dim.xsize_groups,
-                group_id / dim.xsize_groups,
-                scratch,
-                &mut w,
-            );
-            w
-        });
-    if lossy.bits() < lossless.bits() {
-        lossy
-    } else {
-        lossless
+    let global_tree = (lossless_plane
+        && ctx.extra_learned_trees
+        && lossy
+            .as_ref()
+            .is_none_or(|lossy| lossless.bits() < GLOBAL_TREE_MAX_SAVING * lossy.bits()))
+    .then(|| {
+        extra_tree::plan_global_extra_tree(
+            ctx,
+            plane,
+            palette.as_ref(),
+            dim,
+            last_pass,
+            &streams,
+            &lossless,
+            scratch,
+        )
+    })
+    .flatten();
+    let lossless_bits = lossless.bits() - global_tree.as_ref().map_or(0, |t| t.saving());
+    match lossy {
+        Some(lossy) if lossy.bits() < lossless_bits => lossy,
+        _ => {
+            if let Some(tree) = global_tree {
+                tree.apply(&mut streams, &mut lossless);
+            }
+            lossless
+        }
     }
 }
 
@@ -4260,17 +4374,26 @@ fn encode_frame_core(
             scratch,
         );
     }
-    let dc_code = dc_code_owned.as_ref();
+    let (mut dc_tree, mut dc_tokens_per_group, mut meta_tokens_per_group) =
+        (dc_tree, dc_tokens_per_group, meta_tokens_per_group);
     let extra = alpha.map(|plane| {
         prepare_extra_sections(
             ctx,
             plane,
             &dim,
             &group_coords,
-            !dc_code.use_prefix_code,
+            num_passes - 1,
+            extra_tree::GlobalStreams {
+                tree: &mut dc_tree,
+                code: &mut dc_code_owned,
+                dc: &mut dc_tokens_per_group,
+                meta: &mut meta_tokens_per_group,
+                dc_written: !use_dc_frame,
+            },
             scratch,
         )
     });
+    let dc_code = dc_code_owned.as_ref();
 
     // Separate scan arms before context planning: each gets its own final
     // context map, hybrid-uint configuration, clustering and ANS refinement.

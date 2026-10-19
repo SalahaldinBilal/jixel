@@ -3787,6 +3787,36 @@ fn encode_frame_core(
     // from real token stats, so a useless threshold costs nothing.
     let qf_threshold = ac_qf_threshold(&dc_datas);
 
+    // The CfL slopes were estimated on fixed 8x8 DCTs so the transform search
+    // could price candidates under them; the final layout and quant field
+    // are known now, so re-estimate them on the coefficients that get coded.
+    if crate::color_correlation::cfl_slope_search(ctx) {
+        let dc_ref = &dc_datas;
+        let maps = ctx
+            .thread_pool
+            .steal_map(scratch, group_coords.len(), |i, scratch| {
+                let (dc_gx, dc_gy) = group_coords[i];
+                let (coeffs, gather) = scratch.ac_group.transform_buffers();
+                crate::color_correlation::refit_cmap_on_layout(
+                    ctx,
+                    opsin,
+                    &dc_ref[i],
+                    dc_gx * K_DC_GROUP_DIM / K_BLOCK_DIM,
+                    dc_gy * K_DC_GROUP_DIM / K_BLOCK_DIM,
+                    distp.scale,
+                    distp.distance,
+                    distp.x_qm_scale,
+                    coeffs,
+                    gather,
+                    &mut scratch.cfl_rdo,
+                )
+            });
+        for (dc, (ytox, ytob)) in dc_datas.iter_mut().zip(maps) {
+            dc.ytox_map = ytox;
+            dc.ytob_map = ytob;
+        }
+    }
+
     let dc_ref = &dc_datas;
     let natural_orders = crate::coeff_order::CoeffOrders::natural();
     // Tally coefficient positions only when the refine pass will run to consume

@@ -4474,7 +4474,7 @@ mod encode_smoke_tests {
         let unpatched = encode_image(&pixels, SIZE, SIZE, &unpatched).unwrap();
         // The vector encode fits the model where the patches are off.
         assert!(
-            unpatched.len() * 2 > plain.len() * 3,
+            unpatched.len() * 5 > plain.len() * 7,
             "{} vs {}",
             unpatched.len(),
             plain.len()

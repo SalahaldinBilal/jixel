@@ -1778,6 +1778,14 @@ pub(crate) struct AcGroupScratch {
     clip: Option<Box<crate::clip_continuation::ClipScratch>>,
 }
 
+impl AcGroupScratch {
+    /// The coefficient planes and edge gather buffer, for forward transforms
+    /// taken outside the writer.
+    pub(crate) fn transform_buffers(&mut self) -> (&mut [[f32; 16384]; 3], &mut [f32; 16384]) {
+        (&mut self.coeffs, &mut self.gather)
+    }
+}
+
 impl Default for AcGroupScratch {
     fn default() -> Self {
         Self {

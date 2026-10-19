@@ -422,7 +422,7 @@ fn dct_input<'a, const W: usize, const H: usize>(
 /// `(px, py)` for one channel into `out` (natural coefficient storage matching
 /// `write_ac_group`). Returns `(cx, cy)` covered-block counts after the
 /// libjxl-tiny `cx ≥ cy` normalisation, i.e. the storage shape in 8-blocks.
-fn forward_transform(
+pub(crate) fn forward_transform(
     ctx: &EncodingContext,
     tmp: &mut [f32],
     strategy: u8,

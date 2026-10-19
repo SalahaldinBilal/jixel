@@ -35,6 +35,73 @@ use std::arch::x86_64::*;
 use super::ac_strategy::{hsum, sse_dequantized_level_f32, sse_log2p1_f32};
 use crate::color_correlation::{CFL_MAGNITUDE_BITS, CFL_NONZERO_BITS, cfl_rd_cost_scalar};
 
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "sse4.1")]
+pub(crate) fn cfl_rdo_refill_sse41(
+    m_x: &mut [f32],
+    s_x: &mut [f32],
+    m_b: &mut [f32],
+    s_b: &mut [f32],
+    y: &[f32],
+    x: &[f32],
+    b: &[f32],
+    qm_x: &[f32],
+    qm_b: &[f32],
+    params: crate::color_correlation::CflRdoRefillParams,
+) {
+    let len = m_x.len();
+    assert_eq!(s_x.len(), len);
+    assert_eq!(m_b.len(), len);
+    assert_eq!(s_b.len(), len);
+    assert_eq!(y.len(), len);
+    assert_eq!(x.len(), len);
+    assert_eq!(b.len(), len);
+    assert_eq!(qm_x.len(), len);
+    assert_eq!(qm_b.len(), len);
+    let q_block = _mm_set1_ps(params.q_block);
+    let x_mul = _mm_set1_ps(params.x_mul);
+    let b_mul = _mm_set1_ps(params.b_mul);
+    let shift_x = _mm_set1_ps(params.shift_x);
+    let shift_b = _mm_set1_ps(params.shift_b);
+    let mut i = 0;
+    while i + 4 <= len {
+        let yv = unsafe { _mm_loadu_ps(y.as_ptr().add(i)) };
+        let xv = unsafe { _mm_loadu_ps(x.as_ptr().add(i)) };
+        let bv = unsafe { _mm_loadu_ps(b.as_ptr().add(i)) };
+        let qx = unsafe { _mm_loadu_ps(qm_x.as_ptr().add(i)) };
+        let qb = unsafe { _mm_loadu_ps(qm_b.as_ptr().add(i)) };
+        // Keep the two quantizer multiplications in the scalar order.
+        let qx = _mm_mul_ps(_mm_mul_ps(qx, q_block), x_mul);
+        let qb = _mm_mul_ps(_mm_mul_ps(qb, q_block), b_mul);
+        let sx = _mm_add_ps(_mm_mul_ps(shift_x, yv), xv);
+        let sb = _mm_add_ps(_mm_mul_ps(shift_b, yv), bv);
+        unsafe {
+            _mm_storeu_ps(m_x.as_mut_ptr().add(i), _mm_mul_ps(yv, qx));
+            _mm_storeu_ps(s_x.as_mut_ptr().add(i), _mm_mul_ps(sx, qx));
+            _mm_storeu_ps(m_b.as_mut_ptr().add(i), _mm_mul_ps(yv, qb));
+            _mm_storeu_ps(s_b.as_mut_ptr().add(i), _mm_mul_ps(sb, qb));
+        }
+        i += 4;
+    }
+    let src = y[i..]
+        .iter()
+        .zip(&x[i..])
+        .zip(&b[i..])
+        .zip(qm_x[i..].iter().zip(&qm_b[i..]));
+    let dst = m_x[i..]
+        .iter_mut()
+        .zip(&mut s_x[i..])
+        .zip(m_b[i..].iter_mut().zip(&mut s_b[i..]));
+    for ((((&y, &x), &b), (&qx, &qb)), ((m_x, s_x), (m_b, s_b))) in src.zip(dst) {
+        let qx = qx * params.q_block * params.x_mul;
+        let qb = qb * params.q_block * params.b_mul;
+        *m_x = y * qx;
+        *s_x = (params.shift_x * y + x) * qx;
+        *m_b = y * qb;
+        *s_b = (params.shift_b * y + b) * qb;
+    }
+}
+
 #[target_feature(enable = "sse4.1")]
 pub(crate) fn cfl_rd_cost_sse41(
     m: &[f32],

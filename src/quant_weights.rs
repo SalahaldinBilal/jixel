@@ -2802,6 +2802,29 @@ impl DequantMatrices {
         &self.matrix_64x32[c]
     }
 
+    /// The inverse quant matrix the AC writer applies to `strategy`'s coefficients.
+    pub(crate) fn inv_matrix_of(&self, strategy: u8, c: usize) -> &[f32] {
+        use crate::dc_group_data::*;
+        match strategy {
+            STRATEGY_DCT => &self.inv_matrix(c)[..],
+            STRATEGY_IDENTITY => &self.inv_matrix_identity(c)[..],
+            STRATEGY_DCT2X2 => &self.inv_matrix_dct2x2(c)[..],
+            STRATEGY_DCT4X4 => &self.inv_matrix_4x4(c)[..],
+            STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => &self.inv_matrix_4x8(c)[..],
+            STRATEGY_AFV0..=STRATEGY_AFV3 => &self.inv_matrix_afv(c)[..],
+            STRATEGY_DCT16X16 => &self.inv_matrix_16x16(c)[..],
+            STRATEGY_DCT32X32 => &self.inv_matrix_32x32(c)[..],
+            STRATEGY_DCT64X64 => &self.inv_matrix_64x64(c)[..],
+            STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => {
+                self.inv_matrix_128(strategy, c)
+            }
+            STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => &self.inv_matrix_64x32(c)[..],
+            STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => &self.inv_matrix_32x16(c)[..],
+            STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => &self.inv_matrix_8x32(c)[..],
+            _ => &self.inv_matrix_16x8(c)[..],
+        }
+    }
+
     #[inline]
     pub(crate) fn inv_matrix_64x32(&self, c: usize) -> &[f32; 2048] {
         &self.inv_matrix_64x32[c]

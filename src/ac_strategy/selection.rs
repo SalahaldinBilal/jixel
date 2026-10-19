@@ -33,8 +33,13 @@ use super::*;
 
 mod leaf_first;
 mod recon64;
+mod search;
 pub(crate) use leaf_first::LeafChoice;
 pub(crate) use recon64::Recon64Scratch;
+use search::{
+    CandidateSearch, FINE_RUNNER_UP_RATIO, MEDIUM_CANDIDATES_PER_REGION,
+    MERGE32_CANDIDATES_PER_REGION, MERGE32_SHORTLIST_RATIO,
+};
 
 #[derive(Clone, Copy)]
 struct AcStrategyParams<'a> {
@@ -179,9 +184,49 @@ fn record_upgrade_candidates(
                 bx: bx as u16,
                 by: by as u16,
                 strategy,
+                relative_cost: band.raw[k] / band.incumbent[k],
             });
         }
     }
+}
+
+fn record_upgrade32_candidates(
+    upgrades: &mut Vec<MergeUpgradeCandidate>,
+    ac_strategy: &AcStrategyImage,
+    bx: usize,
+    by: usize,
+    raw: [f32; 5],
+    children: [[f32; 2]; 2],
+) {
+    let incumbents = [
+        children.iter().flatten().sum(),
+        children[0][0] + children[1][0],
+        children[0][1] + children[1][1],
+        children[0][0] + children[0][1],
+        children[1][0] + children[1][1],
+    ];
+    let mut candidates: Vec<_> = merge32_sites(bx, by)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(k, (x, y, strategy))| {
+            let ratio = raw[k] / incumbents[k];
+            (ratio.is_finite()
+                && ratio <= MERGE32_SHORTLIST_RATIO
+                && ac_strategy.can_place_strategy(x, y, strategy))
+            .then_some(MergeUpgradeCandidate {
+                bx: x as u16,
+                by: y as u16,
+                strategy,
+                relative_cost: ratio,
+            })
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        a.relative_cost
+            .total_cmp(&b.relative_cost)
+            .then_with(|| (a.by, a.bx, a.strategy).cmp(&(b.by, b.bx, b.strategy)))
+    });
+    upgrades.extend(candidates.into_iter().take(MERGE32_CANDIDATES_PER_REGION));
 }
 
 fn select_super_block(
@@ -705,7 +750,7 @@ fn region_qac(
     scale * region_quant(quant_field, bx, by, w, h, butteraugli_target) as f32
 }
 
-fn region_quant(
+pub(super) fn region_quant(
     quant_field: &ImageB,
     bx: usize,
     by: usize,
@@ -915,6 +960,11 @@ fn select_band(
                 let cb = rect32(bx, by + 2, STRATEGY_DCT16X32, 4, 2);
 
                 let raw = [cost32, cl, cr, ct, cb];
+                if CandidateSearch::for_speed(ctx.speed, ctx.arbiter).merge32_upgrades
+                    && distance >= MERGE_UPGRADE_MIN_DISTANCE
+                {
+                    record_upgrade32_candidates(upgrades, ac_strategy, bx, by, raw, children);
+                }
                 let sites = merge32_sites(bx, by);
                 let mut costs = raw.map(|c| merge.bias_rect32 * c);
                 costs[0] = merge.bias_32x32 * cost32;
@@ -1102,25 +1152,25 @@ fn evaluate_sub8(
         with_fine,
         bias_afv,
     );
-    if let Some(fine) = shortlist.fine
-        && fine.biased_j < shortlist.structural_cost
-        && let Some(gain) = fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine.strategy)
-    {
-        let fallback = shortlist
-            .structural
-            .map_or(STRATEGY_DCT, |structural| structural.strategy);
-        return Some(Sub8Pick {
-            gain,
-            fallback,
-            ..fine
-        });
+    if let Some(fine) = fine_recon_choose(
+        params,
+        scratch,
+        bx,
+        by,
+        qac,
+        meta_r,
+        [shortlist.fine, shortlist.fine_alt],
+        shortlist.structural_cost,
+    ) {
+        let fallback = shortlist.structural.map_or(STRATEGY_DCT, |p| p.strategy);
+        return Some(Sub8Pick { fallback, ..fine });
     }
     shortlist.structural
 }
 
 /// Coefficient-domain shortlist of one block's sub-8 family: the best
 /// DCT4/AFV candidate (final on its own comparison against DCT8) and the
-/// best IDENTITY/DCT2X2 candidate, which still needs [`fine_recon_admit`].
+/// near-tied IDENTITY/DCT2X2 candidates, which need [`fine_recon_choose`].
 struct Sub8Shortlist {
     /// The DCT4/AFV winner when it beats DCT8 on the coefficient model.
     structural: Option<Sub8Pick>,
@@ -1129,6 +1179,7 @@ struct Sub8Shortlist {
     structural_cost: f32,
     /// IDENTITY/DCT2X2 shortlisted against DCT8 (gain not yet known).
     fine: Option<Sub8Pick>,
+    fine_alt: Option<Sub8Pick>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1198,10 +1249,20 @@ fn sub8_shortlist(
         }
         (best, bc)
     };
-    let (fine, fine_coeff_cost) = if cost_identity < cost_dct2x2 {
-        (STRATEGY_IDENTITY, cost_identity)
+    let (fine, fine_coeff_cost, runner, runner_cost) = if cost_identity < cost_dct2x2 {
+        (
+            STRATEGY_IDENTITY,
+            cost_identity,
+            STRATEGY_DCT2X2,
+            cost_dct2x2,
+        )
     } else {
-        (STRATEGY_DCT2X2, cost_dct2x2)
+        (
+            STRATEGY_DCT2X2,
+            cost_dct2x2,
+            STRATEGY_IDENTITY,
+            cost_identity,
+        )
     };
     Sub8Shortlist {
         structural: (cand_cost < cost8).then_some(Sub8Pick {
@@ -1217,6 +1278,15 @@ fn sub8_shortlist(
             gain: 0.0,
             fallback: STRATEGY_DCT,
         }),
+        fine_alt: (CandidateSearch::for_speed(ctx.speed, ctx.arbiter).fine_runner_up
+            && runner_cost < cost8
+            && runner_cost <= fine_coeff_cost * FINE_RUNNER_UP_RATIO)
+            .then_some(Sub8Pick {
+                strategy: runner,
+                biased_j: runner_cost,
+                gain: 0.0,
+                fallback: STRATEGY_DCT,
+            }),
     }
 }
 
@@ -1249,15 +1319,20 @@ fn fine_admit_charge(learned: bool, distance: f32, rate: f32) -> (f32, f32) {
 /// Reconstruction-domain admission of a shortlisted IDENTITY/DCT2X2 block:
 /// the gain over DCT8 when the candidate beats it by the margin, after the
 /// fitted rate charge.
-fn fine_recon_admit(
+fn fine_recon_choose(
     params: AcStrategyParams<'_>,
     scratch: &mut CoderScratch,
     bx: usize,
     by: usize,
     qac: f32,
     meta_r: f32,
-    fine: u8,
-) -> Option<f32> {
+    candidates: [Option<Sub8Pick>; 2],
+    limit: f32,
+) -> Option<Sub8Pick> {
+    let candidates = candidates.map(|p| p.filter(|p| p.biased_j < limit));
+    if candidates.iter().all(Option::is_none) {
+        return None;
+    }
     let ctx = params.ctx;
     let px = params.dc_group_px + bx * 8;
     let py = params.dc_group_py + by * 8;
@@ -1287,19 +1362,20 @@ fn fine_recon_admit(
         )
     };
     let recon8 = reconstruction_cost(scratch, STRATEGY_DCT).cost;
-    let candidate = reconstruction_cost(scratch, fine);
-    // The reconstruction scorer over-credits fine transforms; charge the
-    // fitted per-block correction (the fixed model's at the floored lambda,
-    // see the constant) before the margin test below.
-    let (lambda, correction) = fine_admit_charge(
-        scratch.rate_prices.is_some(),
-        params.distance,
-        candidate.rate,
-    );
-    let recon_fine = fmla(lambda, correction, candidate.cost);
-    // A small safety margin absorbs the remaining mismatch between the local
-    // reconstruction metric and the final post-filtered image.
-    (recon_fine < recon8 * FINE_RECON_MARGIN).then_some(recon8 - recon_fine)
+    let mut best: Option<Sub8Pick> = None;
+    for candidate in candidates.into_iter().flatten() {
+        let score = reconstruction_cost(scratch, candidate.strategy);
+        let (lambda, correction) =
+            fine_admit_charge(scratch.rate_prices.is_some(), params.distance, score.rate);
+        let cost = fmla(lambda, correction, score.cost);
+        if cost < recon8 * FINE_RECON_MARGIN {
+            let gain = recon8 - cost;
+            if best.is_none_or(|p| gain > p.gain) {
+                best = Some(Sub8Pick { gain, ..candidate });
+            }
+        }
+    }
+    best
 }
 
 /// Partition `[0, ysize)` into at most `n` contiguous bands whose interior
@@ -1547,8 +1623,9 @@ const BIAS_8X32: f32 = 1.1;
 /// Replace whole 8-wide x 32-tall columns (DCT32X8) or 32-wide x 8-tall rows
 /// (DCT8X32) of every aligned 4x4-block region when one transform prices
 /// below the DCT8 / pair blocks that tile the strip. Each region keeps the
-/// orientation with the larger total saving, and the frame keeps them only if
-/// together they pay the signaled table's header. Returns the replaced strips.
+/// orientation with the larger total saving. With multiple DC groups, retain
+/// provisional placements so `account_matrix_headers` can share the table fee
+/// across the whole frame. Returns the replaced strips.
 fn place_dct8x32(
     params: &AcStrategyParams<'_>,
     scratch: &mut CoderScratch,
@@ -1610,9 +1687,9 @@ fn place_dct8x32(
         }
         (covered == w * h).then_some(total)
     };
-    // Decide every region first; commit only if the summed saving pays the
-    // table's header fee, so the frame-level matrix gate never has to undo
-    // placements (its fallback would keep the merged quantizer).
+    // A sole DC group is the whole frame and may reject the table locally.
+    // Otherwise retain the candidates for the shared frame-level decision;
+    // fallback quantizers come from `block_quant_field`, before merging.
     let mut chosen: Vec<(usize, usize, u8)> = Vec::new();
     let mut gain_bits = 0.0f32;
     let (xsize, ysize) = (ac_strategy.xsize(), ac_strategy.ysize());
@@ -1648,11 +1725,15 @@ fn place_dct8x32(
             gain_bits += gt.max(gw) / RD_LAMBDA;
         }
     }
-    let header = crate::quant_weights::MatrixHeaderCost::new(p.ctx.matrices());
-    let others = header.custom_mask() & !(1 << 12);
-    let fee = header.payload[12] as f32 + if others == 0 { 17.0 * 3.0 } else { 0.0 };
-    if gain_bits < fee {
-        return Vec::new();
+    if p.opsin.xsize() <= crate::frame::K_DC_GROUP_DIM
+        && p.opsin.ysize() <= crate::frame::K_DC_GROUP_DIM
+    {
+        let header = crate::quant_weights::MatrixHeaderCost::new(p.ctx.matrices());
+        let others = header.custom_mask() & !(1 << 12);
+        let fee = header.payload[12] as f32 + if others == 0 { 17.0 * 3.0 } else { 0.0 };
+        if gain_bits < fee {
+            return Vec::new();
+        }
     }
     let mut changed = Vec::new();
     for (x, y, st) in chosen {
@@ -2035,6 +2116,31 @@ fn select_transforms(
                 merge_upgrade_margin(distance),
             );
         }
+    }
+
+    let medium_upgrades = pass == SelectionPass::Full
+        && CandidateSearch::for_speed(speed, ctx.arbiter).medium_upgrades
+        && (MERGE_UPGRADE_MIN_DISTANCE..=MERGE_UPGRADE_LOW_DISTANCE).contains(&distance);
+    if medium_upgrades && !reranked {
+        pipeline.prepare_rerank(xsize, ysize);
+        pipeline.current_costs.fill(f32::NAN);
+        let rerank = RerankContext {
+            params,
+            quant_field,
+            bands: &pipeline.bands,
+            num_threads,
+            leaf_first,
+            leaves: &[],
+        };
+        let band_count = pipeline.bands.len();
+        rerank_upgrade_merges(
+            &rerank,
+            scratch,
+            ac_strategy,
+            &mut pipeline.band_scratch[..band_count],
+            &mut pipeline.current_costs,
+            merge_upgrade_margin(distance),
+        );
     }
 
     let mut strips_placed = false;
@@ -3040,6 +3146,28 @@ fn footprint_is_self_contained(
     area == cov_x * cov_y
 }
 
+fn cap_medium_upgrade_candidates(indices: &mut Vec<usize>, candidates: &[MergeUpgradeCandidate]) {
+    indices.sort_by(|&a, &b| {
+        let (a, b) = (candidates[a], candidates[b]);
+        (a.by / 4, a.bx / 4)
+            .cmp(&(b.by / 4, b.bx / 4))
+            .then_with(|| a.relative_cost.total_cmp(&b.relative_cost))
+            .then_with(|| (a.by, a.bx, a.strategy).cmp(&(b.by, b.bx, b.strategy)))
+    });
+    let mut previous = None;
+    let mut count = 0;
+    indices.retain(|&i| {
+        let c = candidates[i];
+        let region = (c.by / 4, c.bx / 4);
+        if previous != Some(region) {
+            previous = Some(region);
+            count = 0;
+        }
+        count += 1;
+        count <= MEDIUM_CANDIDATES_PER_REGION
+    });
+}
+
 /// Evaluate this band's shortlisted merges against the committed layout of
 /// their footprints (reconstruction domain, same metadata and pair-gradient
 /// treatment as the downgrade pass) and collect the accepted ones.
@@ -3051,17 +3179,65 @@ fn find_merge_upgrades(
     output: &mut AcStrategyBandScratch,
     margin: f32,
 ) {
+    find_merge_upgrades_at_level(rerank, scratch, ac_strategy, band, output, margin, false);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn find_merge_upgrades_at_level(
+    rerank: &RerankContext<'_>,
+    scratch: &mut CoderScratch,
+    ac_strategy: &AcStrategyImage,
+    band: (usize, usize),
+    output: &mut AcStrategyBandScratch,
+    margin: f32,
+    large: bool,
+) {
     let params = rerank.params;
     let ctx = params.ctx;
     let (y0, y1) = band;
     let meta_r = RERANK_META_R;
     output.merge_upgrades.clear();
-    // Every shortlist is contained in an aligned 2x2 super-block. Score all
+    // Each shortlist lies in an aligned 2x2 or 4x4 region. Score all
     // candidates before choosing its best compatible subset; enumeration
     // order must not decide between a square and two better rectangles.
     let mut groups =
         std::collections::BTreeMap::<(usize, usize), [Option<(MergeUpgrade, f32)>; 5]>::new();
-    for ci in 0..output.upgrade_candidates.len() {
+    let medium = CandidateSearch::for_speed(ctx.speed, ctx.arbiter).medium_upgrades;
+    let mut indices = Vec::new();
+    for (ci, cand) in output.upgrade_candidates.iter().enumerate() {
+        let (x, y, strategy) = (cand.bx as usize, cand.by as usize, cand.strategy);
+        let w = AcStrategyImage::covered_blocks_x_of(strategy);
+        let h = AcStrategyImage::covered_blocks_y_of(strategy);
+        if (w.max(h) > 2) != large
+            || y < y0
+            || y >= y1
+            || !ac_strategy.can_place_strategy(x, y, strategy)
+            || (ac_strategy.is_first_block(x, y) && ac_strategy.raw_strategy(x, y) == strategy)
+            || !footprint_is_self_contained(ac_strategy, x, y, w, h)
+        {
+            continue;
+        }
+        // Avoid stale legacy sub-8 activation credits when an upgrade would
+        // remove such a leaf. Leaf-first credits are recomputed at the end.
+        if (medium || (large && !rerank.leaf_first))
+            && (y..y + h).any(|by| {
+                (x..x + w).any(|bx| {
+                    let s = ac_strategy.raw_strategy(bx, by);
+                    AcStrategyImage::covered_blocks_x_of(s)
+                        * AcStrategyImage::covered_blocks_y_of(s)
+                        == 1
+                        && s != STRATEGY_DCT
+                })
+            })
+        {
+            continue;
+        }
+        indices.push(ci);
+    }
+    if medium {
+        cap_medium_upgrade_candidates(&mut indices, &output.upgrade_candidates);
+    }
+    for ci in indices {
         let cand = output.upgrade_candidates[ci];
         let (bx, by, strategy) = (cand.bx as usize, cand.by as usize, cand.strategy);
         if by < y0 || by >= y1 {
@@ -3132,13 +3308,28 @@ fn find_merge_upgrades(
         }
         let gain = j_layout - big.cost / margin;
         if gain > 0.0 {
-            let k = match strategy {
-                STRATEGY_DCT16X16 => 0,
-                STRATEGY_DCT16X8 => 1 + bx % 2,
-                STRATEGY_DCT8X16 => 3 + by % 2,
-                _ => unreachable!("upgrade outside the 16x16 shortlist"),
+            let (k, side) = if large {
+                (
+                    match strategy {
+                        STRATEGY_DCT32X32 => 0,
+                        STRATEGY_DCT32X16 => 1 + (bx % 4) / 2,
+                        STRATEGY_DCT16X32 => 3 + (by % 4) / 2,
+                        _ => unreachable!("upgrade outside the 32x32 shortlist"),
+                    },
+                    4,
+                )
+            } else {
+                (
+                    match strategy {
+                        STRATEGY_DCT16X16 => 0,
+                        STRATEGY_DCT16X8 => 1 + bx % 2,
+                        STRATEGY_DCT8X16 => 3 + by % 2,
+                        _ => unreachable!("upgrade outside the 16x16 shortlist"),
+                    },
+                    2,
+                )
             };
-            groups.entry((by / 2, bx / 2)).or_insert([None; 5])[k] = Some((
+            groups.entry((by / side, bx / side)).or_insert([None; 5])[k] = Some((
                 MergeUpgrade {
                     bx,
                     by,
@@ -3524,6 +3715,40 @@ fn rerank_upgrade_merges(
     current_costs: &mut [f32],
     margin: f32,
 ) {
+    rerank_upgrade_level(
+        rerank,
+        scratch,
+        ac_strategy,
+        band_scratch,
+        current_costs,
+        margin,
+        false,
+    );
+    if CandidateSearch::for_speed(rerank.params.ctx.speed, rerank.params.ctx.arbiter)
+        .merge32_upgrades
+    {
+        rerank_upgrade_level(
+            rerank,
+            scratch,
+            ac_strategy,
+            band_scratch,
+            current_costs,
+            1.0,
+            true,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rerank_upgrade_level(
+    rerank: &RerankContext<'_>,
+    scratch: &mut CoderScratch,
+    ac_strategy: &mut AcStrategyImage,
+    band_scratch: &mut [AcStrategyBandScratch],
+    current_costs: &mut [f32],
+    margin: f32,
+    large: bool,
+) {
     let xsize = ac_strategy.xsize();
     let map_ref: &AcStrategyImage = ac_strategy;
     rerank
@@ -3536,14 +3761,26 @@ fn rerank_upgrade_merges(
             rerank.num_threads,
             |i, output, scratch| {
                 let mut scratch = rerank.params.price(scratch);
-                find_merge_upgrades(
-                    rerank,
-                    &mut scratch,
-                    map_ref,
-                    rerank.bands[i],
-                    output,
-                    margin,
-                );
+                if large {
+                    find_merge_upgrades_at_level(
+                        rerank,
+                        &mut scratch,
+                        map_ref,
+                        rerank.bands[i],
+                        output,
+                        margin,
+                        true,
+                    );
+                } else {
+                    find_merge_upgrades(
+                        rerank,
+                        &mut scratch,
+                        map_ref,
+                        rerank.bands[i],
+                        output,
+                        margin,
+                    );
+                }
             },
         );
     for band in &band_scratch[..rerank.bands.len()] {
@@ -3618,6 +3855,273 @@ fn rerank_large_transforms(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn candidate_search_respects_speed_and_arbiter() {
+        for arbiter in [crate::Arbiter::Ssimulacra2, crate::Arbiter::Cvvdp] {
+            for speed in [
+                crate::Speed::UltraFast,
+                crate::Speed::Fastest,
+                crate::Speed::Fast,
+                crate::Speed::ExtraSlow,
+            ] {
+                let p = super::CandidateSearch::for_speed(speed, arbiter);
+                assert!(!p.fine_runner_up && !p.medium_upgrades && !p.merge32_upgrades);
+            }
+            let medium = super::CandidateSearch::for_speed(crate::Speed::Medium, arbiter);
+            assert!(medium.fine_runner_up && medium.medium_upgrades && !medium.merge32_upgrades);
+            let slow = super::CandidateSearch::for_speed(crate::Speed::Slow, arbiter);
+            assert!(!slow.fine_runner_up && !slow.medium_upgrades);
+            assert_eq!(slow.merge32_upgrades, arbiter == crate::Arbiter::Cvvdp);
+        }
+    }
+
+    #[test]
+    fn merge32_shortlist_retains_near_winners_with_a_fixed_budget() {
+        let map = AcStrategyImage::new(4, 4);
+        let mut candidates = Vec::new();
+        super::record_upgrade32_candidates(
+            &mut candidates,
+            &map,
+            0,
+            0,
+            [10.2, 5.1, 5.2, 5.0, 6.0],
+            [[2.5; 2]; 2],
+        );
+        assert_eq!(candidates.len(), 3);
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.strategy == crate::dc_group_data::STRATEGY_DCT32X32)
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|c| c.relative_cost <= super::MERGE32_SHORTLIST_RATIO)
+        );
+        assert!(candidates.iter().any(|c| c.relative_cost > 1.0));
+    }
+
+    #[test]
+    fn medium_shortlist_budget_is_local_and_order_independent() {
+        let mut candidates = Vec::new();
+        for region in 0..2u16 {
+            for k in 0..4u16 {
+                candidates.push(crate::coder_scratch::MergeUpgradeCandidate {
+                    bx: region * 4 + k % 2 * 2,
+                    by: k / 2 * 2,
+                    strategy: STRATEGY_DCT16X16,
+                    relative_cost: 0.9 - k as f32 * 0.02,
+                });
+            }
+        }
+        let chosen = |candidates: &[crate::coder_scratch::MergeUpgradeCandidate]| {
+            let mut indices: Vec<_> = (0..candidates.len()).collect();
+            super::cap_medium_upgrade_candidates(&mut indices, candidates);
+            indices
+                .iter()
+                .map(|&i| (candidates[i].bx, candidates[i].by))
+                .collect::<Vec<_>>()
+        };
+        let forward = chosen(&candidates);
+        assert_eq!(forward.len(), 4);
+        candidates.reverse();
+        assert_eq!(forward, chosen(&candidates));
+    }
+
+    #[test]
+    fn fine_reconstruction_can_choose_the_coefficient_runner_up() {
+        let maps = ImageSB::new_fill(1, 1, 0);
+        let mut admitted = 0;
+        let mut runner_wins = 0;
+        for pattern in 0..4 {
+            let mut opsin = Image3F::new(8, 8);
+            for y in 0..8 {
+                for x in 0..8 {
+                    let ink = match pattern {
+                        0 => x == 3,
+                        1 => x == 3 || y == 3,
+                        2 => (x / 2 + y / 2) % 2 == 0,
+                        _ => x == y,
+                    };
+                    opsin.plane_row_mut(0, y)[x] = if ink { 0.08 } else { 0.0 };
+                    opsin.plane_row_mut(1, y)[x] = if ink { 0.65 } else { 0.12 };
+                    opsin.plane_row_mut(2, y)[x] = if ink { 0.45 } else { 0.12 };
+                }
+            }
+            for distance in [0.5, 1.5, 2.0, 4.0] {
+                let ctx = EncodingContext::new(
+                    crate::Speed::Slow,
+                    crate::Arbiter::Ssimulacra2,
+                    crate::xyb::XybMatrix::SPEC,
+                    distance,
+                    1,
+                );
+                let params = AcStrategyParams {
+                    ctx: &ctx,
+                    opsin: &opsin,
+                    dc_group_px: 0,
+                    dc_group_py: 0,
+                    distance,
+                    scale: 1.0,
+                    qm_mult_x: 1.0,
+                    ytox_map: &maps,
+                    ytob_map: &maps,
+                    prices: None,
+                };
+                for q in [0.08, 0.16, 0.32, 0.64] {
+                    let mut scratch = CoderScratch::default();
+                    for order in [
+                        [
+                            crate::dc_group_data::STRATEGY_IDENTITY,
+                            crate::dc_group_data::STRATEGY_DCT2X2,
+                        ],
+                        [
+                            crate::dc_group_data::STRATEGY_DCT2X2,
+                            crate::dc_group_data::STRATEGY_IDENTITY,
+                        ],
+                    ] {
+                        let a = super::Sub8Pick {
+                            strategy: order[0],
+                            biased_j: 1.0,
+                            gain: 0.0,
+                            fallback: STRATEGY_DCT,
+                        };
+                        let b = super::Sub8Pick {
+                            strategy: order[1],
+                            biased_j: 1.01,
+                            gain: 0.0,
+                            fallback: STRATEGY_DCT,
+                        };
+                        let first = super::fine_recon_choose(
+                            params,
+                            &mut scratch,
+                            0,
+                            0,
+                            q,
+                            META_R,
+                            [Some(a), None],
+                            2.0,
+                        );
+                        let second = super::fine_recon_choose(
+                            params,
+                            &mut scratch,
+                            0,
+                            0,
+                            q,
+                            META_R,
+                            [Some(b), None],
+                            2.0,
+                        );
+                        let expected = match (first, second) {
+                            (Some(a), Some(b)) => Some(if a.gain >= b.gain { a } else { b }),
+                            (a, b) => a.or(b),
+                        };
+                        let both = super::fine_recon_choose(
+                            params,
+                            &mut scratch,
+                            0,
+                            0,
+                            q,
+                            META_R,
+                            [Some(a), Some(b)],
+                            2.0,
+                        );
+                        assert_eq!(
+                            both.map(|p| (p.strategy, p.gain.to_bits())),
+                            expected.map(|p| (p.strategy, p.gain.to_bits()))
+                        );
+                        admitted += usize::from(both.is_some());
+                        runner_wins += usize::from(both.is_some_and(|p| p.strategy == b.strategy));
+                    }
+                }
+            }
+        }
+        assert!(admitted > 0 && runner_wins > 0);
+    }
+
+    #[test]
+    fn strip_candidates_reach_the_frame_header_gate() {
+        use super::{adjust_quant_field, place_dct8x32};
+        use crate::dc_group_data::{STRATEGY_DCT8X32, STRATEGY_DCT32X8};
+        let distance = 3.0;
+        let ctx = EncodingContext::new(
+            crate::Speed::Slow,
+            crate::Arbiter::Ssimulacra2,
+            crate::xyb::XybMatrix::SPEC,
+            distance,
+            1,
+        );
+        let opsin = Image3F::new(crate::frame::K_DC_GROUP_DIM + 32, 32);
+        let maps = ImageSB::new_fill(1, 1, 0);
+        let mut group = crate::dc_group_data::DcGroupData::new(4, 4).unwrap();
+        for y in 0..4 {
+            group.raw_quant_field.row_mut(y).fill(6);
+        }
+        group.block_quant_field = Some(group.raw_quant_field.clone());
+        let params = AcStrategyParams {
+            ctx: &ctx,
+            opsin: &opsin,
+            dc_group_px: 0,
+            dc_group_py: 0,
+            distance,
+            scale: 1.0,
+            qm_mult_x: 1.0,
+            ytox_map: &maps,
+            ytob_map: &maps,
+            prices: None,
+        };
+        let mut scratch = CoderScratch::default();
+        // Four zero-coefficient strips save only a few metadata bits locally,
+        // less than one table header. Other DC groups may share that header.
+        let changed = place_dct8x32(
+            &params,
+            &mut scratch,
+            &group.raw_quant_field,
+            &mut group.ac_strategy,
+            &[],
+        );
+        assert_eq!(
+            changed.len(),
+            4,
+            "defer activation until all DC groups are known"
+        );
+        adjust_quant_field(&group.ac_strategy, distance, &mut group.raw_quant_field);
+        super::super::account_matrix_headers(
+            &ctx,
+            &mut scratch,
+            &opsin,
+            distance,
+            1.0,
+            2,
+            &[(0, 0)],
+            std::slice::from_mut(&mut group),
+        );
+        for (_, _, strategy) in group.ac_strategy.iter_first_blocks() {
+            assert!(!matches!(strategy, STRATEGY_DCT32X8 | STRATEGY_DCT8X32));
+        }
+        for y in 0..4 {
+            assert_eq!(group.raw_quant_field.row(y), &[6; 4]);
+        }
+        assert_map_valid(&group.ac_strategy);
+        // With one DC group there is nothing to share: retain the original
+        // local rejection, rather than opening new single-group layouts.
+        let single_opsin = Image3F::new(32, 32);
+        let single = AcStrategyParams {
+            opsin: &single_opsin,
+            ..params
+        };
+        assert!(
+            place_dct8x32(
+                &single,
+                &mut scratch,
+                &group.raw_quant_field,
+                &mut AcStrategyImage::new(4, 4),
+                &[],
+            )
+            .is_empty()
+        );
+    }
+
     #[test]
     fn quantizer_cache_excludes_rerank_only_gradient_penalties() {
         let distance = 2.5;

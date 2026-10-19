@@ -41,7 +41,7 @@ use crate::jpeg::BrotliCompression;
 use crate::lossless::{encode_frame_lossless, encode_frame_lossless_float, forward_ycocg};
 use crate::orientation::Orientation;
 use crate::xyb::XybMatrix;
-use crate::{ColorEncoding, EncodeError};
+use crate::{ColorEncoding, EncodeError, Grain};
 use std::num::NonZero;
 use std::sync::Arc;
 use std::thread::available_parallelism;
@@ -447,6 +447,11 @@ pub struct EncodeConfig {
     pub gain_map: Option<GainMap>,
     /// Color transform of lossy frames (see [`CodingTransform`]).
     pub coding_transform: CodingTransform,
+    /// Decoder-side grain synthesis over lossy VarDCT frames (see
+    /// [`Grain`]). The decoder adds fine high-passed noise scaled per
+    /// intensity; the frame carries only the 8-point strength table. Lossy
+    /// modular frames and lossless encodes ignore it. Default [`Grain::Off`].
+    pub grain: Grain,
 }
 
 /// Order in which a lossy VarDCT frame stores its groups. A progressive
@@ -533,6 +538,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) decoding_speed: DecodingSpeed,
     /// Pre-encoded `jhgm` gain map bundle (see `EncodeConfig::gain_map`).
     pub(crate) gain_map: Option<EncodedGainMap>,
+    /// Decoder-side grain synthesis (see `EncodeConfig::grain`).
+    pub(crate) grain: Grain,
 }
 
 impl Default for EncodeConfig {
@@ -575,6 +582,7 @@ impl Default for EncodeConfig {
             learned_rate: true,
             gain_map: None,
             coding_transform: CodingTransform::Xyb,
+            grain: Grain::Off,
         }
     }
 }
@@ -613,6 +621,7 @@ impl Default for EncodeConfigImpl {
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
             gain_map: None,
+            grain: Grain::Off,
         }
     }
 }
@@ -718,6 +727,11 @@ impl EncodeConfigImpl {
         self
     }
 
+    pub(crate) fn with_grain(mut self, grain: Grain) -> Self {
+        self.grain = grain;
+        self
+    }
+
     /// Copy frame settings from a public `EncodeConfig`.
     pub(crate) fn with_progressive_from(self, config: &EncodeConfig) -> Self {
         #[cfg(feature = "splines")]
@@ -725,6 +739,7 @@ impl EncodeConfigImpl {
         #[cfg(not(feature = "splines"))]
         let this = self;
         this.with_progressive(config.progressive)
+            .with_grain(config.grain)
             .with_fill_invisible(config.fill_invisible)
             .with_patches(config.patches)
             .with_progressive_passes(config.progressive_passes)
@@ -908,6 +923,12 @@ impl EncodeConfig {
         self
     }
 
+    /// Decoder-side grain synthesis (see [`EncodeConfig::grain`]).
+    pub fn with_grain(mut self, grain: Grain) -> Self {
+        self.grain = grain;
+        self
+    }
+
     /// Select the lossy encoding arm (see [`LossyModular`]).
     pub fn with_lossy_modular(mut self, mode: LossyModular) -> Self {
         self.lossy_modular = mode;
@@ -1069,6 +1090,7 @@ pub(crate) fn lossy_context(
     ctx.progressive_dc_levels = config.progressive_dc_levels;
     ctx.group_order = config.group_order;
     ctx.learned_rate = config.learned_rate && config.speed.effort().learned_rate;
+    ctx.grain = config.grain;
     let alpha_distance = match config.alpha_distance {
         None => distance,
         Some(d) if d.is_nan() => 0.0,
@@ -1085,7 +1107,7 @@ pub(crate) fn lossy_context(
     ctx
 }
 
-fn for_each_linear_band<F>(
+pub(crate) fn for_each_linear_band<F>(
     image: &mut Image3F,
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,

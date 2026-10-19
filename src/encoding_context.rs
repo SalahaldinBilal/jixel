@@ -80,6 +80,8 @@ pub(crate) struct EncodingContext {
     pub(crate) group_order: crate::GroupOrder,
     /// Metric the lossy decisions are tuned for (see [`crate::Arbiter`]).
     pub(crate) arbiter: crate::Arbiter,
+    /// Decoder-side grain synthesis (see `EncodeConfig::grain`).
+    pub(crate) grain: crate::Grain,
     /// Experimental spline coding (see `EncodeConfig::splines`).
     #[cfg(feature = "splines")]
     pub(crate) splines: bool,
@@ -488,6 +490,7 @@ impl EncodingContext {
             progressive_dc_levels: None,
             group_order: crate::GroupOrder::Scanline,
             arbiter,
+            grain: crate::Grain::Off,
             #[cfg(feature = "splines")]
             splines: false,
             #[cfg(feature = "splines")]

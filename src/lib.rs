@@ -80,6 +80,7 @@ mod modular;
 mod mosaic_seam;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 mod neon;
+mod noise;
 mod orientation;
 mod patches;
 mod quant_weights;
@@ -121,5 +122,6 @@ pub use iso_gain_map::{GainMapFloats, IsoGainMap};
 pub use jpeg::{
     BrotliCompression, JpegTranscodeConfig, encode_jpeg_lossless, encode_jpeg_lossless_with_config,
 };
+pub use noise::Grain;
 pub use orientation::Orientation;
 pub use util::EncodeError;

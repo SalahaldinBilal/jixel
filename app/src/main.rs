@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 // use image::imageops::FilterType;
-use jixel::{CodingTransform, ColorEncoding, DecodingSpeed, EncodeConfig, Speed};
+use jixel::{CodingTransform, ColorEncoding, DecodingSpeed, EncodeConfig, Grain, Speed};
 use std::num::NonZero;
 use std::path::Path;
 use std::thread::available_parallelism;
@@ -10,7 +10,7 @@ use std::time::Instant;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/Screenshot 2026-10-17 at 21.00.25.png")).unwrap();
+    let image = image::open(Path::new("./assets/Kodak/20.png")).unwrap();
     let rgb_img = image.to_rgba8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
@@ -44,7 +44,7 @@ fn main() {
     let width = image.width() as usize;
     let height = image.height() as usize;
     let cfg = EncodeConfig::default()
-        .with_lossless(true)
+        .with_lossless(false)
         .with_distance(distance)
         .with_speed(Speed::Slow)
         .with_progressive(false)

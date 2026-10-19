@@ -985,6 +985,7 @@ fn write_frame_header_kind(
     coeff_shifts: &[u32],
     kind: VarDctFrameKind<'_>,
     has_splines: bool,
+    has_noise: bool,
     skip_dc_smoothing: bool,
     use_dc_frame: bool,
     coding: crate::coding::CodingTransform,
@@ -1003,6 +1004,7 @@ fn write_frame_header_kind(
             coeff_shifts,
             false,
             has_splines,
+            has_noise,
             skip_dc_smoothing,
             use_dc_frame,
             coding,
@@ -1020,6 +1022,7 @@ fn write_frame_header_kind(
             coeff_shifts,
             true,
             has_splines,
+            has_noise,
             skip_dc_smoothing,
             use_dc_frame,
             coding,
@@ -1109,6 +1112,7 @@ fn write_frame_header(
     coeff_shifts: &[u32],
     has_patches: bool,
     has_splines: bool,
+    has_noise: bool,
     skip_dc_smoothing: bool,
     use_dc_frame: bool,
     coding: crate::coding::CodingTransform,
@@ -1119,10 +1123,14 @@ fn write_frame_header(
     w.write(1, 0); // not all default
     w.write(2, 0); // regular frame
     w.write(1, 0); // vardct
-    // Optional flags: kPatches (2), kSplines (16), kUseDcFrame (32) and
-    // kSkipAdaptiveDCSmoothing (128), chosen per frame by `skip_dc_smoothing`.
-    // A DC frame implies no smoothing.
-    let flags = if has_patches { 2u64 } else { 0 }
+    // Optional flags: kNoise (1), kPatches (2), kSplines (16), kUseDcFrame
+    // (32) and kSkipAdaptiveDCSmoothing (128), chosen per frame by
+    // `skip_dc_smoothing`. A DC frame implies no smoothing.
+    let flags = if has_noise {
+        crate::noise::FLAG_NOISE
+    } else {
+        0
+    } + if has_patches { 2u64 } else { 0 }
         + if has_splines { 16 } else { 0 }
         + if use_dc_frame { 32 } else { 0 }
         + if skip_dc_smoothing && !use_dc_frame {
@@ -3056,8 +3064,14 @@ impl PreparedVarDct {
         if let Some(set) = &self.splines {
             crate::splines::write_splines(set, scratch, &mut extras);
         }
+        let noise_bits = if ctx.grain.enabled() {
+            crate::noise::NoiseParams::BITS as f64
+        } else {
+            0.0
+        };
         let bits = self.prefix.bits_written() as f64
             + extras.bits_written() as f64
+            + noise_bits
             + estimate_residual_bits(ctx, scratch, distance, &self.base, alpha, coeff_shifts)?;
         self.estimated_bits = Some(bits);
         Ok(bits)
@@ -3583,6 +3597,17 @@ fn encode_frame_core(
 ) -> Result<usize, EncodeError> {
     let num_threads = ctx.thread_pool.num_threads();
     let dim = ImageDim::new(opsin.xsize(), opsin.ysize());
+    // Grain is measured on the source XYB before any frame processing; only
+    // displayed frames carry it (an atlas frame's header has no flags).
+    let mut opsin = opsin;
+    let noise = if matches!(
+        frame_kind,
+        VarDctFrameKind::Regular | VarDctFrameKind::Patched(_)
+    ) {
+        crate::noise::NoiseParams::resolve(ctx.grain, ctx, scratch, distance, &mut opsin)
+    } else {
+        None
+    };
     let mut distp = compute_distance_params(distance);
     if ctx.coding.is_xyb() {
         if ctx.x_heavy() && distp.x_qm_scale == 2 {
@@ -4515,6 +4540,9 @@ fn encode_frame_core(
     if let Some(set) = splines {
         crate::splines::write_splines(set, scratch, &mut sections[0]);
     }
+    if let Some(noise) = &noise {
+        noise.write(&mut sections[0]);
+    }
     write_dc_global(
         &distp,
         dim.num_dc_groups,
@@ -4666,6 +4694,7 @@ fn encode_frame_core(
         coeff_shifts,
         frame_kind,
         has_splines,
+        noise.is_some(),
         skip_dc_smoothing,
         use_dc_frame,
         ctx.coding,

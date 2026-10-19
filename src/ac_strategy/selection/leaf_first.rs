@@ -44,6 +44,8 @@ pub(crate) struct LeafChoice {
     pub(crate) fine: u8,
     /// The fine candidate's coefficient-domain decision cost.
     pub(crate) fine_j: f32,
+    pub(crate) fine_alt: u8,
+    pub(crate) fine_alt_j: f32,
     /// The 1x1 incumbent an admitted fine transform replaced; `gain` is
     /// measured against it, so the metadata gate restores it on rejection.
     pub(crate) fallback: u8,
@@ -57,6 +59,8 @@ impl Default for LeafChoice {
             gain: 0.0,
             fine: NO_CHILD_BLOCK,
             fine_j: f32::INFINITY,
+            fine_alt: NO_CHILD_BLOCK,
+            fine_alt_j: f32::INFINITY,
             fallback: STRATEGY_DCT,
         }
     }
@@ -467,19 +471,28 @@ pub(super) fn select_band_leaf_first(
             };
             leaf.fine = fine.strategy;
             leaf.fine_j = fine.biased_j;
-            // Learned prices make a fine candidate's rate comparable with
-            // the merges', so it is admitted here and the merges above
-            // have to beat it.
+            if let Some(alt) = shortlist.fine_alt {
+                leaf.fine_alt = alt.strategy;
+                leaf.fine_alt_j = alt.biased_j;
+            }
+            // Both eligible fine candidates share one reconstructed DCT8 reference.
             let structural = *leaf;
             if fine_leaves
-                && fine.biased_j < structural.j
-                && let Some(gain) =
-                    fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine.strategy)
+                && let Some(pick) = fine_recon_choose(
+                    params,
+                    scratch,
+                    bx,
+                    by,
+                    qac,
+                    meta_r,
+                    [shortlist.fine, shortlist.fine_alt],
+                    structural.j,
+                )
             {
                 output.leaves[(by - y_begin) * xsize + bx] = LeafChoice {
-                    strategy: fine.strategy,
-                    j: fine.biased_j,
-                    gain,
+                    strategy: pick.strategy,
+                    j: pick.biased_j,
+                    gain: pick.gain,
                     fallback: structural.strategy,
                     ..LeafChoice::default()
                 };
@@ -583,6 +596,11 @@ pub(super) fn select_band_leaf_first(
                 let cb = rect32(bx, by + 2, STRATEGY_DCT16X32, 4, 2);
 
                 let raw = [cost32, cl, cr, ct, cb];
+                if CandidateSearch::for_speed(ctx.speed, ctx.arbiter).merge32_upgrades
+                    && distance >= MERGE_UPGRADE_MIN_DISTANCE
+                {
+                    record_upgrade32_candidates(upgrades, ac_strategy, bx, by, raw, children);
+                }
                 let sites = merge32_sites(bx, by);
                 let mut costs = raw.map(|c| merge.bias_rect32 * c);
                 costs[0] = merge.bias_32x32 * cost32;
@@ -698,10 +716,30 @@ pub(super) fn select_band_leaf_first(
                     continue;
                 }
                 let qac = region_qac(quant_field, bx, by, 1, 1, scale, distance);
-                if let Some(gain) = fine_recon_admit(params, scratch, bx, by, qac, meta_r, fine) {
-                    ac_strategy.set_first(bx, by, fine);
+                let pick = |strategy, biased_j| {
+                    (strategy != NO_CHILD_BLOCK).then_some(Sub8Pick {
+                        strategy,
+                        biased_j,
+                        gain: 0.0,
+                        fallback: incumbent,
+                    })
+                };
+                if let Some(pick) = fine_recon_choose(
+                    params,
+                    scratch,
+                    bx,
+                    by,
+                    qac,
+                    meta_r,
+                    [
+                        pick(fine, leaf.fine_j),
+                        pick(leaf.fine_alt, leaf.fine_alt_j),
+                    ],
+                    leaf.j,
+                ) {
+                    ac_strategy.set_first(bx, by, pick.strategy);
                     let leaf = &mut output.leaves[(by - y_begin) * xsize + bx];
-                    leaf.gain = gain;
+                    leaf.gain = pick.gain;
                     leaf.fallback = incumbent;
                 }
             }

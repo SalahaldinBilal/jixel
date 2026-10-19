@@ -693,7 +693,9 @@ impl RatePrices {
         // Quantized levels of the block at `(bx, by)`, its coefficient
         // dimensions and its quant class.
         let quantize = |scratch: &mut CoderScratch, bx: usize, by: usize, block: &mut [i32]| {
-            let quant = quant_field.row(by)[bx];
+            // Learn at the quantizer this whole footprint will receive,
+            // including its quant class, rather than its first block alone.
+            let quant = selection::region_quant(quant_field, bx, by, cx, cy, distance);
             let (pcx, pcy, _) = transform_block(
                 ctx,
                 scratch,
@@ -1169,6 +1171,89 @@ mod tests {
             None,
             1,
         )
+    }
+
+    #[test]
+    fn sampled_merge_quantizers_match_the_committed_footprint() {
+        let opsin = noise(128);
+        let maps = ImageSB::new_fill(2, 2, 0);
+        for distance in [1.0, 3.0] {
+            let ctx = EncodingContext::new(
+                crate::Speed::Slow,
+                crate::Arbiter::Ssimulacra2,
+                crate::xyb::XybMatrix::SPEC,
+                distance,
+                1,
+            );
+            for strategy in [
+                STRATEGY_DCT16X8,
+                STRATEGY_DCT8X16,
+                STRATEGY_DCT16X16,
+                STRATEGY_DCT32X16,
+                STRATEGY_DCT16X32,
+                STRATEGY_DCT32X32,
+                STRATEGY_DCT32X8,
+                STRATEGY_DCT8X32,
+                STRATEGY_DCT64X32,
+                STRATEGY_DCT32X64,
+                STRATEGY_DCT64X64,
+            ] {
+                let (w, h) = (
+                    AcStrategyImage::covered_blocks_x_of(strategy),
+                    AcStrategyImage::covered_blocks_y_of(strategy),
+                );
+                let mut field = ImageB::new_fill(16, 16, 19);
+                let mut layout = AcStrategyImage::new(16, 16);
+                for y in (0..16).step_by(h) {
+                    for x in (0..16).step_by(w) {
+                        field.row_mut(y)[x] = 3;
+                        layout.set_first(x, y, strategy);
+                    }
+                }
+                // The committed layout has one quantizer per transform. Its
+                // learned prices must equal those learned before reconciliation.
+                let mut committed = field.clone();
+                selection::adjust_quant_field(&layout, distance, &mut committed);
+                for pilot in [None, Some(&layout)] {
+                    let learn = |field: &ImageB| {
+                        RatePrices::learn_transform(
+                            &ctx,
+                            &mut CoderScratch::default(),
+                            strategy,
+                            &opsin,
+                            (0, 0),
+                            (16, 16),
+                            field,
+                            (&maps, &maps),
+                            0.04,
+                            1.0,
+                            distance,
+                            8,
+                            pilot,
+                        )
+                        .unwrap()
+                        .table
+                    };
+                    let actual = learn(&field);
+                    let expected = learn(&committed);
+                    assert!(
+                        actual.rows == expected.rows,
+                        "price rows: strategy={strategy} d={distance}"
+                    );
+                    assert!(
+                        actual.bits == expected.bits,
+                        "prices: strategy={strategy} d={distance}"
+                    );
+                    for c in 0..3 {
+                        let code = STRATEGY_CODE_LUT[strategy as usize];
+                        assert_eq!(
+                            actual.orders.scan_for(code, c),
+                            expected.orders.scan_for(code, c)
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

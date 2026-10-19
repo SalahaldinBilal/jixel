@@ -187,14 +187,15 @@ pub(crate) struct FineMergeRollback {
     pub(crate) benefit: f32,
 }
 
-/// A pair/16x16 merge that beat its tiled incumbent on the raw coefficient
-/// model. Retained even if a parent/competing arm won: a reconstruction
-/// downgrade may expose the footprint again (see `MERGE_UPGRADE_MARGIN`).
+/// A pair/16x16 raw winner or a shortlisted near-winning 32-family merge.
+/// Retained even if another arm won: reconstruction passes may expose the
+/// footprint again (see `MERGE_UPGRADE_MARGIN`).
 #[derive(Clone, Copy)]
 pub(crate) struct MergeUpgradeCandidate {
     pub(crate) bx: u16,
     pub(crate) by: u16,
     pub(crate) strategy: u8,
+    pub(crate) relative_cost: f32,
 }
 
 /// A candidate the reconstruction comparison accepted; installed after the

@@ -348,6 +348,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         group_order: crate::GroupOrder::Scanline,
         learned_rate: base.learned_rate,
         gain_map: None,
+        grain: crate::Grain::Off,
         coding_transform: crate::CodingTransform::Xyb,
     };
 

@@ -637,6 +637,7 @@ pub(crate) fn reuse_tile_quadrants(
                 height: HALF,
                 ref_frame: packed[q.tile].ref_frame,
                 add: false,
+                mul: false,
                 positions,
             }),
             None => remaining.push(positions),
@@ -810,6 +811,7 @@ pub(crate) fn pack_lossy_atlas_sized(
             atlas_y,
             ref_frame,
             add: false,
+            mul: false,
             positions,
         });
     }
@@ -837,6 +839,9 @@ pub(crate) struct PatchReference {
     pub(crate) ref_frame: u32,
     /// Blend with kAdd instead of kReplace.
     pub(crate) add: bool,
+    /// Blend with kMul (the entry scales what is already there); `add` is
+    /// then the hint that the entry is not a Replace rectangle.
+    pub(crate) mul: bool,
     pub(crate) positions: Vec<(usize, usize)>,
 }
 
@@ -1021,6 +1026,7 @@ pub(crate) fn find_lossless_patches(
             atlas_y,
             ref_frame: PATCH_REF_ID,
             add: false,
+            mul: false,
             positions,
         });
     }
@@ -1340,6 +1346,7 @@ pub(crate) fn find_lossless_glyph_patches(linear: &Image3Si) -> Option<LosslessP
             height: s.h,
             ref_frame: PATCH_REF_ID,
             add: false,
+            mul: false,
             positions,
         });
     }
@@ -1767,6 +1774,7 @@ pub(crate) fn find_lossy_glyph_patches(
             height: s.h,
             ref_frame: MODULAR_PATCH_REF_ID,
             add: true,
+            mul: false,
             positions,
         });
     }
@@ -2443,6 +2451,7 @@ mod tests {
             height: tile,
             ref_frame: PATCH_REF_ID,
             add: false,
+            mul: false,
             positions: vec![(0, 0)],
         }];
         let groups = vec![

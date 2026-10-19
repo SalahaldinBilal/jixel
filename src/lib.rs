@@ -73,6 +73,7 @@ mod ink_layer;
 mod invisible;
 mod iso_gain_map;
 mod jpeg;
+mod lattice_patches;
 mod lossless;
 mod lz77_ac;
 mod lz_match;

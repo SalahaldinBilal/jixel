@@ -2371,6 +2371,7 @@ fn encode_frame_vardct(
 
     // Compare bounded residual samples plus the actual atlas, dictionary and
     // spline costs. Only the selected plan receives a full-frame encode.
+    let lattice = crate::lattice_patches::find(&xyb);
     let glyphs = GlyphStage::find(ctx, scratch, distance, &xyb, alpha);
     let mut best = prepare_vardct_variant(
         ctx,
@@ -2386,12 +2387,27 @@ fn encode_frame_vardct(
         #[cfg(feature = "splines")]
         stage.as_ref(),
     )?;
-    if !best.used_tiles {
+    if !best.used_tiles && lattice.is_none() {
         drop(xyb);
         return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
     }
     #[allow(unused_mut)]
     let mut best_bits = best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+    if let Some(plan) = lattice {
+        drop(xyb);
+        // A lattice arm codes what the tile leaves at the frame's own distance,
+        // where an exact-tile plan repeats it at the finer atlas distance, so
+        // near-equal bits buy only a coarser remainder.
+        best_bits *= LATTICE_BITS_MARGIN;
+        for mut arm in lattice_variants(ctx, scratch, distance, distp, plan, alpha)? {
+            let bits = arm.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+            if bits < best_bits {
+                best = arm;
+                best_bits = bits;
+            }
+        }
+        return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
+    }
     #[cfg(feature = "splines")]
     if best.tiles_touched {
         let stage = SplineStage {
@@ -2440,6 +2456,78 @@ fn encode_frame_vardct(
         drop(no_tiles);
     }
     best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer)
+}
+
+/// The kAdd and kMul lattice arms of a frame whose luma repeats on an integer
+/// lattice; both race the tile/glyph plans on estimated bits.
+#[allow(clippy::too_many_arguments)]
+fn lattice_variants(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    distp: &DistanceParams,
+    plan: crate::lattice_patches::LatticePlan,
+    alpha: Option<&AlphaPlane>,
+) -> Result<Vec<PreparedVarDct>, EncodeError> {
+    let (px, py) = plan.period;
+    let add_references = plan.add_references();
+    let mul_references = plan.mul_references();
+    let atlas_alpha = zero_alpha_for_lossy(alpha, px * py);
+    let modular_atlas = |atlas: &[Vec<i32>; 3], scratch: &mut CoderScratch| {
+        let mut bits = BitWriter::new();
+        crate::lossless::encode_modular_xyb_atlas_tree(
+            atlas,
+            px,
+            py,
+            atlas_alpha.as_ref(),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut bits,
+        );
+        bits
+    };
+    let prepared =
+        |prefix: BitWriter, mut base: Image3F, references: Vec<crate::patches::PatchReference>| {
+            gaborize(&mut base, distp);
+            PreparedVarDct {
+                prefix,
+                base,
+                references,
+                #[cfg(feature = "splines")]
+                splines: None,
+                tiles_touched: false,
+                used_tiles: false,
+                estimated_bits: None,
+            }
+        };
+    let add = prepared(
+        modular_atlas(&plan.add_atlas, scratch),
+        plan.add_base,
+        add_references,
+    );
+    let mut mul_prefix = modular_atlas(&plan.mul_atlas, scratch);
+    let (w, h) = (plan.residual.xsize(), plan.residual.ysize());
+    let mut residual = plan.residual;
+    gaborize(&mut residual, distp);
+    let residual_alpha = zero_alpha_for_lossy(alpha, w * h);
+    encode_frame_core(
+        ctx,
+        scratch,
+        distance,
+        residual,
+        residual_alpha.as_ref(),
+        &[0],
+        VarDctFrameKind::ReferenceOnly {
+            width: w,
+            height: h,
+        },
+        #[cfg(feature = "splines")]
+        None,
+        &mut mul_prefix,
+    )?;
+    let mul = prepared(mul_prefix, plan.gain, mul_references);
+    Ok(vec![add, mul])
 }
 
 /// Spline selection of one frame variant.
@@ -3212,6 +3300,8 @@ const GLYPH_CHECK_MIN_DISTANCE: f32 = 6.0;
 const GLYPH_CHECK_ATLAS_SHARE: f64 = 0.35;
 /// Patched bits may exceed the regular frame's by this factor.
 const GLYPH_BITS_MARGIN: f64 = 1.10;
+/// A lattice arm must stay under this share of the best tile/glyph plan's bits.
+const LATTICE_BITS_MARGIN: f64 = 0.5;
 /// Tile patches are used only when they cover this share of the frame.
 const PATCH_TILE_MIN_COVER: f64 = 0.03;
 const NEAR_TILES_MAX: f32 = 2.0;

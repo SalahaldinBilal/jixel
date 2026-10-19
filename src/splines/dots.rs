@@ -879,6 +879,7 @@ pub(super) fn build_dot_patches_with_templates(
             height: side,
             ref_frame: DOT_PATCH_REF_ID,
             add: true,
+            mul: false,
             positions,
         });
     }

@@ -42,6 +42,7 @@ mod arbiter;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod bit_writer;
+mod clip_continuation;
 mod cmyk;
 mod coder_scratch;
 mod coding;

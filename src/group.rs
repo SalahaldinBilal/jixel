@@ -1775,6 +1775,7 @@ pub(crate) struct AcGroupScratch {
     few_color_keys: Vec<u64>,
     /// Y coefficient error and its pixel-domain image for the recon capture.
     recon: Option<ReconScratch>,
+    clip: Option<Box<crate::clip_continuation::ClipScratch>>,
 }
 
 impl Default for AcGroupScratch {
@@ -1787,6 +1788,7 @@ impl Default for AcGroupScratch {
             rdoq: None,
             gather: heap_array(0.0),
             few_color_keys: Vec::new(),
+            clip: None,
             recon: None,
         }
     }
@@ -1882,6 +1884,7 @@ pub(crate) fn write_ac_group(
         gather,
         few_color_keys,
         recon: recon_scratch,
+        clip: clip_scratch,
     } = scratch;
 
     // Reuse this small vector across channels and blocks. Only memo misses
@@ -1999,11 +2002,80 @@ pub(crate) fn write_ac_group(
                 } else {
                     1.0
                 };
+                let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
+                STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
+                STRATEGY_IDENTITY => (
+                    &matrices.inv_matrix_identity(1)[..],
+                    &matrices.matrix_identity(1)[..],
+                ),
+                STRATEGY_DCT2X2 => (
+                    &matrices.inv_matrix_dct2x2(1)[..],
+                    &matrices.matrix_dct2x2(1)[..],
+                ),
+                STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
+                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
+                    (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
+                }
+                STRATEGY_AFV0..=STRATEGY_AFV3 => {
+                    (&matrices.inv_matrix_afv(1)[..], &matrices.matrix_afv(1)[..])
+                }
+                STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
+                STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
+                STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
+                STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => (
+                    matrices.inv_matrix_128(raw_strategy, 1),
+                    matrices.matrix_128(raw_strategy, 1),
+                ),
+                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => {
+                    (&matrices.inv_matrix_64x32(1)[..], &matrices.matrix_64x32(1)[..])
+                }
+                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
+                    (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
+                }
+                STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
+                    (&matrices.inv_matrix_8x32(1)[..], &matrices.matrix_8x32(1)[..])
+                }
+                _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
+            };
+                // Saturated pixels get a free target beyond the clip limit;
+                // the shift rides on Y and B.
+                let clip_shift = ctx.speed.effort().clip_continuation && !hit[1] && {
+                    let (input, stride) = footprint.pixels(opsin.plane(1), &mut gather[..]);
+                    crate::clip_continuation::continue_saturated(
+                        ctx,
+                        raw_strategy,
+                        cx,
+                        cy,
+                        inv_qm_y,
+                        qm_y,
+                        quant_ac,
+                        scale,
+                        distance,
+                        input,
+                        stride,
+                        clip_scratch.get_or_insert_with(Default::default),
+                    )
+                };
                 for c in 0..3 {
                     if hit[c] {
                         continue;
                     }
                     let (input, stride) = footprint.pixels(opsin.plane(c), &mut gather[..]);
+                    let (input, stride) = if clip_shift && c != 0 {
+                        let (pw, ph) = crate::inflated_cost::strategy_pixel_dims(raw_strategy);
+                        (
+                            crate::clip_continuation::shifted_input(
+                                clip_scratch.as_mut().expect("shift computed"),
+                                input,
+                                stride,
+                                pw,
+                                ph,
+                            ),
+                            pw,
+                        )
+                    } else {
+                        (input, stride)
+                    };
                     match raw_strategy {
                         STRATEGY_DCT => {
                             let dst: &mut [f32; 64] = coeffs[c].first_chunk_mut::<64>().unwrap();
@@ -2161,41 +2233,6 @@ pub(crate) fn write_ac_group(
                 // Quantize Y AC with roundtrip (modifies coeffs[1] to dequantized).
                 // Matrix selection: DCT8 uses 8×8 weights, DCT16X8/8X16 share the
                 // 128-float 16×8 weights, DCT16X16 uses the 256-float 16×16 weights.
-                let (inv_qm_y, qm_y): (&[f32], &[f32]) = match raw_strategy {
-                STRATEGY_DCT => (&matrices.inv_matrix(1)[..], &matrices.matrix(1)[..]),
-                STRATEGY_IDENTITY => (
-                    &matrices.inv_matrix_identity(1)[..],
-                    &matrices.matrix_identity(1)[..],
-                ),
-                STRATEGY_DCT2X2 => (
-                    &matrices.inv_matrix_dct2x2(1)[..],
-                    &matrices.matrix_dct2x2(1)[..],
-                ),
-                STRATEGY_DCT4X4 => (&matrices.inv_matrix_4x4(1)[..], &matrices.matrix_4x4(1)[..]),
-                STRATEGY_DCT4X8 | STRATEGY_DCT8X4 => {
-                    (&matrices.inv_matrix_4x8(1)[..], &matrices.matrix_4x8(1)[..])
-                }
-                STRATEGY_AFV0..=STRATEGY_AFV3 => {
-                    (&matrices.inv_matrix_afv(1)[..], &matrices.matrix_afv(1)[..])
-                }
-                STRATEGY_DCT16X16 => (&matrices.inv_matrix_16x16(1)[..], &matrices.matrix_16x16(1)[..]),
-                STRATEGY_DCT32X32 => (&matrices.inv_matrix_32x32(1)[..], &matrices.matrix_32x32(1)[..]),
-                STRATEGY_DCT64X64 => (&matrices.inv_matrix_64x64(1)[..], &matrices.matrix_64x64(1)[..]),
-                STRATEGY_DCT128X128 | STRATEGY_DCT128X64 | STRATEGY_DCT64X128 => (
-                    matrices.inv_matrix_128(raw_strategy, 1),
-                    matrices.matrix_128(raw_strategy, 1),
-                ),
-                STRATEGY_DCT64X32 | STRATEGY_DCT32X64 => {
-                    (&matrices.inv_matrix_64x32(1)[..], &matrices.matrix_64x32(1)[..])
-                }
-                STRATEGY_DCT32X16 | STRATEGY_DCT16X32 => {
-                    (&matrices.inv_matrix_32x16(1)[..], &matrices.matrix_32x16(1)[..])
-                }
-                STRATEGY_DCT32X8 | STRATEGY_DCT8X32 => {
-                    (&matrices.inv_matrix_8x32(1)[..], &matrices.matrix_8x32(1)[..])
-                }
-                _ /* 16X8/8X16 */ => (&matrices.inv_matrix_16x8(1)[..], &matrices.matrix_16x8(1)[..]),
-            };
                 if let Some(m) = memo.as_deref().filter(|_| hit[1]) {
                     // The levels are skipped above when the tokens are cached too.
                     for j in 0..cov_y {

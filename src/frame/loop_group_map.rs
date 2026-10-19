@@ -154,7 +154,9 @@ impl LoopGroupMap {
 mod tests {
     use super::*;
 
-    fn fixture(width: usize, height: usize) -> (Vec<(usize, usize)>, Vec<(usize, usize, usize)>) {
+    type Fixture = (Vec<(usize, usize)>, Vec<(usize, usize, usize)>);
+
+    fn fixture(width: usize, height: usize) -> Fixture {
         let mut groups: Vec<_> = (0..height.div_ceil(K_DC_GROUP_DIM))
             .flat_map(|gy| (0..width.div_ceil(K_DC_GROUP_DIM)).map(move |gx| (gx, gy)))
             .collect();

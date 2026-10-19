@@ -78,6 +78,73 @@ pub(crate) fn cfl_regression_wasm(
     reduce_transposed_4x4(ca_x, cb_x, ca_b, cb_b)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "simd128")]
+pub(crate) fn cfl_rdo_refill_wasm(
+    m_x: &mut [f32],
+    s_x: &mut [f32],
+    m_b: &mut [f32],
+    s_b: &mut [f32],
+    y: &[f32],
+    x: &[f32],
+    b: &[f32],
+    qm_x: &[f32],
+    qm_b: &[f32],
+    params: crate::color_correlation::CflRdoRefillParams,
+) {
+    let len = m_x.len();
+    assert_eq!(s_x.len(), len);
+    assert_eq!(m_b.len(), len);
+    assert_eq!(s_b.len(), len);
+    assert_eq!(y.len(), len);
+    assert_eq!(x.len(), len);
+    assert_eq!(b.len(), len);
+    assert_eq!(qm_x.len(), len);
+    assert_eq!(qm_b.len(), len);
+    let q_block = f32x4_splat(params.q_block);
+    let x_mul = f32x4_splat(params.x_mul);
+    let b_mul = f32x4_splat(params.b_mul);
+    let shift_x = f32x4_splat(params.shift_x);
+    let shift_b = f32x4_splat(params.shift_b);
+    let mut i = 0;
+    while i + 4 <= len {
+        let yv = unsafe { v128_load(y.as_ptr().add(i).cast()) };
+        let xv = unsafe { v128_load(x.as_ptr().add(i).cast()) };
+        let bv = unsafe { v128_load(b.as_ptr().add(i).cast()) };
+        let qx = unsafe { v128_load(qm_x.as_ptr().add(i).cast()) };
+        let qb = unsafe { v128_load(qm_b.as_ptr().add(i).cast()) };
+        // Keep the two quantizer multiplications in the scalar order.
+        let qx = f32x4_mul(f32x4_mul(qx, q_block), x_mul);
+        let qb = f32x4_mul(f32x4_mul(qb, q_block), b_mul);
+        let sx = f32x4_add(f32x4_mul(shift_x, yv), xv);
+        let sb = f32x4_add(f32x4_mul(shift_b, yv), bv);
+        unsafe {
+            v128_store(m_x.as_mut_ptr().add(i).cast(), f32x4_mul(yv, qx));
+            v128_store(s_x.as_mut_ptr().add(i).cast(), f32x4_mul(sx, qx));
+            v128_store(m_b.as_mut_ptr().add(i).cast(), f32x4_mul(yv, qb));
+            v128_store(s_b.as_mut_ptr().add(i).cast(), f32x4_mul(sb, qb));
+        }
+        i += 4;
+    }
+    let src = y[i..]
+        .iter()
+        .zip(&x[i..])
+        .zip(&b[i..])
+        .zip(qm_x[i..].iter().zip(&qm_b[i..]));
+    let dst = m_x[i..]
+        .iter_mut()
+        .zip(&mut s_x[i..])
+        .zip(m_b[i..].iter_mut().zip(&mut s_b[i..]));
+    for ((((&y, &x), &b), (&qx, &qb)), ((m_x, s_x), (m_b, s_b))) in src.zip(dst) {
+        let qx = qx * params.q_block * params.x_mul;
+        let qb = qb * params.q_block * params.b_mul;
+        *m_x = y * qx;
+        *s_x = (params.shift_x * y + x) * qx;
+        *m_b = y * qb;
+        *s_b = (params.shift_b * y + b) * qb;
+    }
+}
+
 #[target_feature(enable = "simd128")]
 pub(crate) fn cfl_rdo_block_wasm(
     m_x: &mut [f32; 63],

@@ -38,6 +38,7 @@ mod haar;
 mod inflated_cost;
 mod lossless_grad;
 mod lz_match;
+mod noise;
 mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
@@ -51,7 +52,10 @@ pub(crate) use ac_strategy::{
 };
 pub(crate) use adaptive_quant::fill_quant_field;
 pub(crate) use afv::{afv0_wasm, afv1_wasm, afv2_wasm, afv3_wasm};
-pub(crate) use cfl::{apply_cfl_wasm, cfl_rdo_block_wasm, cfl_rdo_stats_wasm, cfl_regression_wasm};
+pub(crate) use cfl::{
+    apply_cfl_wasm, cfl_rdo_block_wasm, cfl_rdo_refill_wasm, cfl_rdo_stats_wasm,
+    cfl_regression_wasm,
+};
 pub(crate) use dc_ops::{adjust_b_dc_wasm, compensate_b_dc_wasm, reconstruct_dc_wasm};
 pub(crate) use dct::*;
 pub(crate) use entropy::counts_bit_cost_wasm;
@@ -63,6 +67,7 @@ pub(crate) use inflated_cost::{
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lz_match::{match_len_compact_wasm, match_len_wasm};
+pub(crate) use noise::{noise_laplacian_stats_wasm, noise_shrink_wasm, noise_texture_score_wasm};
 pub(crate) use quant::{
     quantize_block_ac_wasm, quantize_dc_cfl_i32_wasm, quantize_dc_cfl_wasm, quantize_dc_i32_wasm,
     quantize_dc_wasm,

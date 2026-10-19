@@ -64,6 +64,80 @@ pub(crate) type CflRdoBlockFn = fn(
 pub(crate) type CflRdoStatsFn = fn(&[f32], &[f32]) -> [f32; 4];
 pub(crate) type CflRdCostFn = fn(&[f32], &[f32], f32, f32, f32, crate::group::DequantBias) -> f32;
 
+#[derive(Clone, Copy)]
+pub(crate) struct CflRdoRefillParams {
+    pub(crate) q_block: f32,
+    pub(crate) x_mul: f32,
+    pub(crate) b_mul: f32,
+    pub(crate) shift_x: f32,
+    pub(crate) shift_b: f32,
+}
+
+/// Refill one contiguous span of AC coefficients, with equally sized slices.
+pub(crate) type CflRdoRefillFn = fn(
+    &mut [f32],
+    &mut [f32],
+    &mut [f32],
+    &mut [f32],
+    &[f32],
+    &[f32],
+    &[f32],
+    &[f32],
+    &[f32],
+    CflRdoRefillParams,
+);
+
+#[allow(dead_code, clippy::too_many_arguments)]
+pub(crate) fn cfl_rdo_refill_scalar(
+    m_x: &mut [f32],
+    s_x: &mut [f32],
+    m_b: &mut [f32],
+    s_b: &mut [f32],
+    y: &[f32],
+    x: &[f32],
+    b: &[f32],
+    qm_x: &[f32],
+    qm_b: &[f32],
+    params: CflRdoRefillParams,
+) {
+    for i in 0..m_x.len() {
+        let qx = qm_x[i] * params.q_block * params.x_mul;
+        let qb = qm_b[i] * params.q_block * params.b_mul;
+        m_x[i] = y[i] * qx;
+        s_x[i] = fmla(params.shift_x, y[i], x[i]) * qx;
+        m_b[i] = y[i] * qb;
+        s_b[i] = fmla(params.shift_b, y[i], b[i]) * qb;
+    }
+}
+
+pub(crate) fn selected_cfl_rdo_refill_fn() -> CflRdoRefillFn {
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        |m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params| unsafe {
+            crate::neon::cfl_rdo_refill_neon(m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params)
+        }
+    }
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+        return |m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params| unsafe {
+            crate::avx::cfl_rdo_refill_avx2(m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params)
+        };
+    }
+    #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+    if std::arch::is_x86_feature_detected!("sse4.1") {
+        return |m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params| unsafe {
+            crate::sse::cfl_rdo_refill_sse41(m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params)
+        };
+    }
+    #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]
+    return crate::wasm::cfl_rdo_refill_wasm;
+    #[cfg(not(any(
+        all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"),
+        all(target_arch = "aarch64", feature = "neon")
+    )))]
+    cfl_rdo_refill_scalar
+}
+
 /// Context-free rate of a coded residual coefficient in bits: a nonzero plus
 /// its magnitude. The tile is scored before any entropy code exists.
 pub(crate) const CFL_NONZERO_BITS: f32 = 4.0;
@@ -406,6 +480,47 @@ impl CflRdoScratch {
             len: 0,
         }
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn refill(
+        &mut self,
+        refill_fn: CflRdoRefillFn,
+        coeffs: [&[f32]; 3],
+        qm: [&[f32]; 2],
+        cx: usize,
+        cy: usize,
+        params: CflRdoRefillParams,
+    ) {
+        let [x, y, b] = coeffs;
+        let [qm_x, qm_b] = qm;
+        let width = cx * K_BLOCK_DIM;
+        let size = cx * cy * K_BLOCK_DIM * K_BLOCK_DIM;
+        // Each of the first cy rows skips cx DC coefficients. Merge the last
+        // such row with all remaining rows into one contiguous span, keeping
+        // the packed AC order without per-coefficient division or masking.
+        for row in 0..cy {
+            let start = row * width + cx;
+            let end = if row + 1 < cy {
+                (row + 1) * width
+            } else {
+                size
+            };
+            let dst = self.len..self.len + end - start;
+            refill_fn(
+                &mut self.m_x[dst.clone()],
+                &mut self.s_x[dst.clone()],
+                &mut self.m_b[dst.clone()],
+                &mut self.s_b[dst],
+                &y[start..end],
+                &x[start..end],
+                &b[start..end],
+                &qm_x[start..end],
+                &qm_b[start..end],
+                params,
+            );
+            self.len += end - start;
+        }
+    }
 }
 
 impl Default for CflRdoScratch {
@@ -447,9 +562,9 @@ fn cmap_residual_bits(res: i32) -> f32 {
 }
 
 /// Pick one channel's multiplier by candidate search around the least-squares
-/// slope and the spatial prediction: quantized-residual RD cost plus the map
-/// token's rate. `m`/`s` are luma/chroma coefficients in quant-step units;
-/// `base` is the base correlation the signaled value offsets.
+/// slope, the spatial prediction and an optional incumbent: quantized-residual
+/// RD cost plus the map token's rate. `m`/`s` are luma/chroma coefficients in
+/// quant-step units; `base` is the base correlation the signaled value offsets.
 #[allow(clippy::too_many_arguments)]
 fn optimize_channel_rdo(
     stats_fn: CflRdoStatsFn,
@@ -462,6 +577,7 @@ fn optimize_channel_rdo(
     pred: i32,
     base: f32,
     color_factor: f32,
+    incumbent: Option<i32>,
 ) -> i32 {
     if m.is_empty() {
         return if pred.abs() <= 4 { pred } else { 0 };
@@ -474,7 +590,7 @@ fn optimize_channel_rdo(
         .round()
         .clamp(-128.0, 127.0) as i32;
 
-    let mut cands = [0i32; 19];
+    let mut cands = [0i32; 28];
     let mut num_cands = 0usize;
     let mut add_cand = |cand: i32| {
         let cand = cand.clamp(-128, 127);
@@ -491,6 +607,13 @@ fn optimize_channel_rdo(
         add_cand(target_cand + d);
         add_cand(pred - d);
         add_cand(pred + d);
+    }
+    if let Some(incumbent) = incumbent {
+        add_cand(incumbent);
+        for d in 1..=4 {
+            add_cand(incumbent - d);
+            add_cand(incumbent + d);
+        }
     }
 
     let mut best = (f32::MAX, 0i32);
@@ -636,6 +759,7 @@ fn compute_cmap_tile_rdo(
         prediction.ytox,
         0.0,
         color_factor,
+        None,
     );
     let ytob = optimize_channel_rdo(
         ctx.cfl_rdo_stats,
@@ -648,6 +772,7 @@ fn compute_cmap_tile_rdo(
         prediction.ytob,
         1.0,
         color_factor,
+        None,
     );
     (ytox, ytob)
 }
@@ -679,11 +804,7 @@ pub(crate) fn fill_cmap(
         block_y: [0.; 64],
     };
 
-    // YCbCr chroma follows luma with large, content-dependent slopes, which
-    // the regression's deadzone misses; it searches them at Fast too.
-    let ycbcr =
-        ctx.coding == crate::coding::CodingTransform::YCbCr && ctx.speed.effort().cfl_ycbcr_rdo;
-    let use_rdo = ctx.speed.effort().cfl_rdo || ycbcr;
+    let use_rdo = cfl_slope_search(ctx);
 
     for ty in 0..ytiles {
         for tx in 0..xtiles {
@@ -745,6 +866,153 @@ pub(crate) fn fill_cmap(
             ytob_map.row_mut(ty)[tx] = ytob as i8;
         }
     }
+}
+
+/// Whether this frame searches its CfL slopes with the kill-rule model
+/// (otherwise the closed-form regression).
+pub(crate) fn cfl_slope_search(ctx: &EncodingContext) -> bool {
+    // YCbCr chroma follows luma with large, content-dependent slopes, which
+    // the regression's deadzone misses; it searches them at Fast too.
+    let ycbcr =
+        ctx.coding == crate::coding::CodingTransform::YCbCr && ctx.speed.effort().cfl_ycbcr_rdo;
+    ctx.speed.effort().cfl_rdo || ycbcr
+}
+
+/// Re-estimate one DC group's per-tile slopes on the coefficients of its
+/// final transform layout and quant field, with the same kill-rule model
+/// `compute_cmap_tile_rdo` scored the fixed-DCT8 estimate on. A block's
+/// coefficients take the slope of the tile holding its first block, as the AC
+/// writer reads them; its lowest frequencies ride on the DC path and are left
+/// out. The candidates add the slope the layout was chosen under. `coeffs` and
+/// `gather` are the writer's transform buffers.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refit_cmap_on_layout(
+    ctx: &EncodingContext,
+    opsin: &Image3F,
+    dc_data: &DcGroupData,
+    dc_group_x0_blocks: usize,
+    dc_group_y0_blocks: usize,
+    scale: f32,
+    distance: f32,
+    x_qm_scale: u32,
+    coeffs: &mut [[f32; 16384]; 3],
+    gather: &mut [f32; 16384],
+    rdo: &mut CflRdoScratch,
+) -> (ImageSB, ImageSB) {
+    let mut ytox_map = dc_data.ytox_map.clone();
+    let mut ytob_map = dc_data.ytob_map.clone();
+    let xtiles = ytox_map.xsize();
+    let ytiles = ytox_map.ysize();
+    let strategy = &dc_data.ac_strategy;
+    let matrices = ctx.matrices();
+    let x_mul = 1.25f32.powf(x_qm_scale as f32 - 2.0);
+    let b_mul = ctx.b_qm_mul();
+    let lambda = crate::group::rdoq_lambda(ctx.arbiter, 1.0);
+    let chroma_weight = crate::group::chroma_rdoq_weight(distance);
+    let [weight_x, _, weight_b] = crate::group::rdoq_channel_weights(ctx.coding);
+    let color_factor = ctx.cfl_frame().color_factor;
+    let shift_x = -ctx.cfl_base_x();
+    let shift_b = 1.0 - ctx.cfl_base_b();
+    let [coeff_x, coeff_y, coeff_b] = coeffs;
+
+    for ty in 0..ytiles {
+        for tx in 0..xtiles {
+            rdo.len = 0;
+            let bx0 = tx * K_TILE_DIM_IN_BLOCKS;
+            let by0 = ty * K_TILE_DIM_IN_BLOCKS;
+            let bx1 = (bx0 + K_TILE_DIM_IN_BLOCKS).min(strategy.xsize());
+            let by1 = (by0 + K_TILE_DIM_IN_BLOCKS).min(strategy.ysize());
+            for by in by0..by1 {
+                for bx in bx0..bx1 {
+                    if !strategy.is_first_block(bx, by) {
+                        continue;
+                    }
+                    let raw = strategy.raw_strategy(bx, by);
+                    let px = (dc_group_x0_blocks + bx) * K_BLOCK_DIM;
+                    let py = (dc_group_y0_blocks + by) * K_BLOCK_DIM;
+                    let (cx, cy) = crate::ac_strategy::forward_transform(
+                        ctx,
+                        gather,
+                        raw,
+                        opsin.plane(1),
+                        px,
+                        py,
+                        coeff_y,
+                    );
+                    let size = cx * cy * 64;
+                    // Transforms stay inside their tile, whose AC positions
+                    // the scratch holds exactly; the 128 family does not.
+                    if rdo.len + size - cx * cy > CFL_RDO_TILE_AC {
+                        continue;
+                    }
+                    crate::ac_strategy::forward_transform(
+                        ctx,
+                        gather,
+                        raw,
+                        opsin.plane(0),
+                        px,
+                        py,
+                        coeff_x,
+                    );
+                    crate::ac_strategy::forward_transform(
+                        ctx,
+                        gather,
+                        raw,
+                        opsin.plane(2),
+                        px,
+                        py,
+                        coeff_b,
+                    );
+                    let q_block = scale * dc_data.raw_quant_field.row(by)[bx] as f32;
+                    let qm_x = matrices.inv_matrix_of(raw, 0);
+                    let qm_b = matrices.inv_matrix_of(raw, 2);
+                    rdo.refill(
+                        ctx.cfl_rdo_refill,
+                        [coeff_x, coeff_y, coeff_b],
+                        [qm_x, qm_b],
+                        cx,
+                        cy,
+                        CflRdoRefillParams {
+                            q_block,
+                            x_mul,
+                            b_mul,
+                            shift_x,
+                            shift_b,
+                        },
+                    );
+                }
+            }
+            let ytox = optimize_channel_rdo(
+                ctx.cfl_rdo_stats,
+                ctx.cfl_rd_cost,
+                ctx.dequant_bias(0),
+                &rdo.m_x[..rdo.len],
+                &rdo.s_x[..rdo.len],
+                weight_x * chroma_weight,
+                lambda,
+                cmap_tile_pred(&ytox_map, tx, ty),
+                0.0,
+                color_factor,
+                Some(dc_data.ytox_map.row(ty)[tx] as i32),
+            );
+            let ytob = optimize_channel_rdo(
+                ctx.cfl_rdo_stats,
+                ctx.cfl_rd_cost,
+                ctx.dequant_bias(2),
+                &rdo.m_b[..rdo.len],
+                &rdo.s_b[..rdo.len],
+                weight_b * chroma_weight,
+                lambda,
+                cmap_tile_pred(&ytob_map, tx, ty),
+                1.0,
+                color_factor,
+                Some(dc_data.ytob_map.row(ty)[tx] as i32),
+            );
+            ytox_map.row_mut(ty)[tx] = ytox as i8;
+            ytob_map.row_mut(ty)[tx] = ytob as i8;
+        }
+    }
+    (ytox_map, ytob_map)
 }
 
 /// Returns the per-tile factor as a slope (= base_correlation + cmap/84).
@@ -2047,6 +2315,178 @@ mod tests {
     }
 
     #[test]
+    fn rdo_refill_spans_match_scalar() {
+        for (name, refill_fn) in rdo_refill_kernels() {
+            for len in (0..=17).chain([31, 32, 33, 63, 64, 65, CFL_RDO_TILE_AC]) {
+                let y: Vec<f32> = (0..len).map(|i| (i % 37) as f32 * 0.17 - 3.1).collect();
+                let x: Vec<f32> = (0..len).map(|i| (i % 19) as f32 * 0.13 - 1.7).collect();
+                let b: Vec<f32> = (0..len).map(|i| (i % 29) as f32 * 0.11 - 2.3).collect();
+                let qm_x: Vec<f32> = (0..len).map(|i| 0.3 + (i % 11) as f32 * 0.07).collect();
+                let qm_b: Vec<f32> = (0..len).map(|i| 0.7 + (i % 7) as f32 * 0.09).collect();
+                for (shift_x, shift_b) in [(0.0, 0.0), (-0.37, 0.81), (1.13, -0.71)] {
+                    let params = CflRdoRefillParams {
+                        q_block: 1.375,
+                        x_mul: 1.23,
+                        b_mul: 0.87,
+                        shift_x,
+                        shift_b,
+                    };
+                    let mut expected = vec![vec![0.0; len]; 4];
+                    let [m_x, s_x, m_b, s_b] = expected.as_mut_slice() else {
+                        unreachable!()
+                    };
+                    cfl_rdo_refill_scalar(m_x, s_x, m_b, s_b, &y, &x, &b, &qm_x, &qm_b, params);
+
+                    // Offset the destination and guard both ends, including
+                    // empty spans and every SIMD tail length.
+                    let mut actual = vec![vec![f32::INFINITY; len + 2]; 4];
+                    let [m_x, s_x, m_b, s_b] = actual.as_mut_slice() else {
+                        unreachable!()
+                    };
+                    refill_fn(
+                        &mut m_x[1..len + 1],
+                        &mut s_x[1..len + 1],
+                        &mut m_b[1..len + 1],
+                        &mut s_b[1..len + 1],
+                        &y,
+                        &x,
+                        &b,
+                        &qm_x,
+                        &qm_b,
+                        params,
+                    );
+                    for channel in 0..4 {
+                        assert_eq!(actual[channel][0], f32::INFINITY, "{name} prefix");
+                        assert_eq!(actual[channel][len + 1], f32::INFINITY, "{name} suffix");
+                        assert_refill_matches(
+                            name,
+                            channel,
+                            &actual[channel][1..len + 1],
+                            &expected[channel],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    fn rdo_refill_kernels() -> Vec<(&'static str, CflRdoRefillFn)> {
+        #[allow(unused_mut)]
+        let mut kernels: Vec<(&str, CflRdoRefillFn)> = vec![
+            ("scalar", cfl_rdo_refill_scalar),
+            ("selected", selected_cfl_rdo_refill_fn()),
+        ];
+        #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+        {
+            kernels.push((
+                "avx2",
+                |m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params| unsafe {
+                    crate::avx::cfl_rdo_refill_avx2(m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params)
+                },
+            ));
+        }
+        #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "sse"))]
+        if std::arch::is_x86_feature_detected!("sse4.1") {
+            kernels.push((
+                "sse4.1",
+                |m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params| unsafe {
+                    crate::sse::cfl_rdo_refill_sse41(
+                        m_x, s_x, m_b, s_b, y, x, b, qm_x, qm_b, params,
+                    )
+                },
+            ));
+        }
+        kernels
+    }
+
+    fn assert_refill_matches(name: &str, channel: usize, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+            if channel % 2 == 0 {
+                // Multiplication order must be identical even on FMA CPUs.
+                assert_eq!(actual, expected, "{name} channel {channel} coeff {i}");
+            } else {
+                let tolerance = 1e-6 * expected.abs().max(1.0);
+                assert!(
+                    (actual - expected).abs() <= tolerance,
+                    "{name} channel {channel} coeff {i}: SIMD={actual}, scalar={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rdo_refill_packs_layout_ac_and_appends() {
+        for (name, refill_fn) in rdo_refill_kernels() {
+            for cx in [1, 2, 4, 8] {
+                for cy in [1, 2, 4, 8] {
+                    let size = cx * cy * 64;
+                    let width = cx * 8;
+                    let mut y: Vec<f32> = (0..size).map(|i| i as f32 * 0.03 - 4.1).collect();
+                    let mut x: Vec<f32> = (0..size).map(|i| (i % 19) as f32 * 0.17 - 1.1).collect();
+                    let mut b: Vec<f32> = (0..size).map(|i| (i % 29) as f32 * 0.11 - 2.3).collect();
+                    let mut qm_x = vec![0.7; size];
+                    let mut qm_b = vec![1.3; size];
+                    for row in 0..cy {
+                        for col in 0..cx {
+                            let i = row * width + col;
+                            y[i] = f32::NAN;
+                            x[i] = f32::NAN;
+                            b[i] = f32::NAN;
+                            qm_x[i] = f32::NAN;
+                            qm_b[i] = f32::NAN;
+                        }
+                    }
+                    let params = CflRdoRefillParams {
+                        q_block: 1.375,
+                        x_mul: 1.23,
+                        b_mul: 0.87,
+                        shift_x: -0.37,
+                        shift_b: 0.81,
+                    };
+                    let mut expected: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::new());
+                    // Reference the original per-coefficient DC exclusion.
+                    for i in 0..size {
+                        if i / width < cy && i % width < cx {
+                            continue;
+                        }
+                        let qx = qm_x[i] * params.q_block * params.x_mul;
+                        let qb = qm_b[i] * params.q_block * params.b_mul;
+                        expected[0].push(y[i] * qx);
+                        expected[1].push(fmla(params.shift_x, y[i], x[i]) * qx);
+                        expected[2].push(y[i] * qb);
+                        expected[3].push(fmla(params.shift_b, y[i], b[i]) * qb);
+                    }
+                    let mut rdo = CflRdoScratch::new();
+                    let count = size - cx * cy;
+                    // Fill a complete tile with this transform, exercising
+                    // appends at unaligned offsets and the scratch boundary.
+                    for block in 0..64 / (cx * cy) {
+                        rdo.refill(refill_fn, [&x, &y, &b], [&qm_x, &qm_b], cx, cy, params);
+                        assert_eq!(rdo.len, (block + 1) * count);
+                        for (channel, actual) in
+                            [&rdo.m_x, &rdo.s_x, &rdo.m_b, &rdo.s_b].iter().enumerate()
+                        {
+                            assert_refill_matches(
+                                name,
+                                channel,
+                                &actual[block * count..rdo.len],
+                                &expected[channel],
+                            );
+                        }
+                        assert!(rdo.m_x[rdo.len..].iter().all(|&v| v == 0.0));
+                        assert!(rdo.s_x[rdo.len..].iter().all(|&v| v == 0.0));
+                        assert!(rdo.m_b[rdo.len..].iter().all(|&v| v == 0.0));
+                        assert!(rdo.s_b[rdo.len..].iter().all(|&v| v == 0.0));
+                    }
+                    assert_eq!(rdo.len, CFL_RDO_TILE_AC);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn selected_rdo_stats_match_scalar() {
         let stats_fn = selected_cfl_rdo_stats_fn();
         for len in [0, 1, 3, 4, 7, 8, 15, 63, 64, CFL_RDO_TILE_AC] {
@@ -2330,6 +2770,57 @@ mod tests {
         assert!(ytob.abs() < 3, "ytob = {ytob}, expected ~0");
     }
 
+    fn refit_tile(opsin: &Image3F, dc_data: &DcGroupData) -> (i32, i32) {
+        let ctx = EncodingContext::default();
+        let mut coeffs = crate::util::HeapMatrix::<f32, 3, 16384>::new(0.0);
+        let mut gather: Box<[f32; 16384]> = crate::util::heap_array(0.0);
+        let mut rdo = CflRdoScratch::new();
+        let (ytox, ytob) = refit_cmap_on_layout(
+            &ctx,
+            opsin,
+            dc_data,
+            0,
+            0,
+            1.0 / 32.0,
+            1.0,
+            2,
+            &mut coeffs,
+            &mut gather,
+            &mut rdo,
+        );
+        (ytox.row(0)[0] as i32, ytob.row(0)[0] as i32)
+    }
+
+    #[test]
+    fn refit_on_a_dct8_layout_matches_the_tile_search() {
+        // Same coefficients, same quantizer, same candidates: the refit of an
+        // all-DCT8 tile is the tile search.
+        let opsin = correlated_tile(0.3);
+        let mut dc_data = DcGroupData::new(8, 8).unwrap();
+        dc_data.raw_quant_field.as_mut_slice().fill(32);
+        assert_eq!(refit_tile(&opsin, &dc_data), rdo_tile(&opsin, 0, 0));
+    }
+
+    #[test]
+    fn refit_keeps_full_slope_under_a_16x16_layout() {
+        // X = 0.3*Y holds under any linear transform: the refit must find the
+        // same slope (~25) on 16x16 coefficients, skipping their four lowest
+        // frequencies.
+        let opsin = correlated_tile(0.3);
+        let mut dc_data = DcGroupData::new(8, 8).unwrap();
+        dc_data.raw_quant_field.as_mut_slice().fill(32);
+        for y in (0..8).step_by(2) {
+            for x in (0..8).step_by(2) {
+                dc_data
+                    .ac_strategy
+                    .set_first(x, y, crate::dc_group_data::STRATEGY_DCT16X16);
+            }
+        }
+        let (ytox, ytob) = refit_tile(&opsin, &dc_data);
+        assert!((ytox - 25).abs() < 3, "ytox = {ytox}, expected ~25");
+        assert!(ytob.abs() < 3, "ytob = {ytob}, expected ~0");
+    }
+
     #[test]
     fn rdo_returns_zero_on_neutral_tiles() {
         // Achromatic content (X = 0, B = Y): both multipliers must stay 0.
@@ -2361,6 +2852,7 @@ mod tests {
                 pred,
                 0.0,
                 K_COLOR_FACTOR,
+                None,
             )
         };
         assert_eq!(pick(3), 3);

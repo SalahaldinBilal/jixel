@@ -104,9 +104,12 @@ effort_gates! {
     /// 16x16 transform layouts (DCT8 quad, DCT16, rectangle pairs) re-chosen by
     /// the closed loop's exact SSIMULACRA2 arbiter.
     layout_loop,
-    /// Exact DP re-tiling of closed 32x32 regions over 16-level pieces at any
-    /// offset; skipped where `layout_loop` re-chooses layouts exactly.
+    /// Exact DP re-tiling of closed 64x64 tiles over 8/16/32-family pieces at
+    /// any 8-pixel origin; skipped where `layout_loop` re-chooses layouts exactly.
     layout_retile,
+    /// Coefficient-model DP re-tiling of the merge search's tiles over DCT8,
+    /// pairs and 16x16 at any 8-pixel origin; superseded by `layout_retile`.
+    layout_dp_coefficient,
     cfl_rdo,
     yellow_opsin,
     coeff_orders,
@@ -214,6 +217,7 @@ const FAST: Effort = Effort {
     merge_32: true,
     merge_busy_quads: true,
     quant_refine: true,
+    layout_dp_coefficient: true,
     pixel_chromacity_x: true,
     cfl_ycbcr_rdo: true,
     dc_predictor_search: true,

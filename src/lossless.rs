@@ -2585,6 +2585,7 @@ pub(crate) fn write_patch_dictionary(
     const BLEND_MODE: u32 = 5;
     const OFFSET: u32 = 6;
     const COUNT: u32 = 7;
+    const CLAMP: u32 = 9;
 
     let mut tokens = Vec::new();
     tokens.push(Token::new(NUM_REF, references.len() as u32));
@@ -2604,8 +2605,20 @@ pub(crate) fn write_patch_dictionary(
                 tokens.push(Token::new(OFFSET, pack_signed(x as i32 - px as i32)));
                 tokens.push(Token::new(OFFSET, pack_signed(y as i32 - py as i32)));
             }
-            // color = Add (2) or Replace (1)
-            tokens.push(Token::new(BLEND_MODE, if reference.add { 2 } else { 1 }));
+            // color = Mul (3), Add (2) or Replace (1); Mul also signals clamp = false
+            tokens.push(Token::new(
+                BLEND_MODE,
+                if reference.mul {
+                    3
+                } else if reference.add {
+                    2
+                } else {
+                    1
+                },
+            ));
+            if reference.mul {
+                tokens.push(Token::new(CLAMP, 0));
+            }
             if has_alpha {
                 tokens.push(Token::new(BLEND_MODE, 0)); // alpha = None
             }

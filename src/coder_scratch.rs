@@ -27,7 +27,9 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-use crate::ac_strategy::{Chosen32Cost, FineMosaicScratch, LeafChoice, Recon64Scratch, SavedChild};
+use crate::ac_strategy::{
+    Chosen32Cost, FineMosaicScratch, LayoutDpScratch, LeafChoice, Recon64Scratch, SavedChild,
+};
 use crate::adaptive_quant::AqMapScratch;
 use crate::dc_group_data::AcStrategyImage;
 use crate::entropy::{
@@ -219,6 +221,8 @@ pub(crate) struct AcStrategyBandScratch {
     pub(crate) rerank_downgrades: Vec<RerankDowngrade>,
     pub(crate) rerank64_downgrades: Vec<Rerank64Downgrade>,
     pub(crate) recon64: Recon64Scratch,
+    pub(crate) layout_dp: LayoutDpScratch,
+    pub(crate) dp_regions: Vec<crate::dc_group_data::DpRegion>,
     pub(crate) fine_rollbacks: Vec<FineMergeRollback>,
     pub(crate) current_costs: Vec<CachedQuantCost>,
     pub(crate) quant_refinements: Vec<QuantRefinement>,
@@ -240,6 +244,8 @@ impl Default for AcStrategyBandScratch {
             rerank_downgrades: Vec::new(),
             rerank64_downgrades: Vec::new(),
             recon64: Recon64Scratch::default(),
+            layout_dp: LayoutDpScratch::default(),
+            dp_regions: Vec::new(),
             fine_rollbacks: Vec::new(),
             current_costs: Vec::new(),
             quant_refinements: Vec::new(),
@@ -378,6 +384,19 @@ pub(crate) struct CoderScratch {
 }
 
 impl CoderScratch {
+    /// Selection and CfL are finished before AC groups are tokenized. Release
+    /// their working sets before this worker grows its coefficient/token buffers.
+    /// Repeated AC groups keep reusing their own scratch as usual.
+    pub(crate) fn finish_strategy_search(&mut self) {
+        self.ac_strategy = AcStrategyPipelineScratch::default();
+        self.dct8_costs = Vec::new();
+        self.aq_map = AqMapScratch::default();
+        self.recon.value = None;
+        self.transform_gather.value = None;
+        self.strategy_coeffs.value = None;
+        self.cfl_rdo.value = None;
+    }
+
     fn new(reserve_lossy_buffers: bool) -> Self {
         let (aq_map, gradient, order0_entropy, threshold) = if reserve_lossy_buffers {
             (

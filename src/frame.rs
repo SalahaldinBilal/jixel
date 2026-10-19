@@ -2352,7 +2352,7 @@ fn encode_frame_vardct(
         before_tiles: false,
     });
     if !patches {
-        return prepare_vardct_variant(
+        let prepared = prepare_vardct_variant(
             ctx,
             scratch,
             distance,
@@ -2365,12 +2365,15 @@ fn encode_frame_vardct(
             true,
             #[cfg(feature = "splines")]
             stage.as_ref(),
-        )?
-        .encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
+        )?;
+        #[cfg(feature = "splines")]
+        drop(spline_candidates);
+        return prepared.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
     }
 
     // Compare bounded residual samples plus the actual atlas, dictionary and
     // spline costs. Only the selected plan receives a full-frame encode.
+    let lattice = crate::lattice_patches::find(&xyb);
     let glyphs = GlyphStage::find(ctx, scratch, distance, &xyb, alpha);
     let mut best = prepare_vardct_variant(
         ctx,
@@ -2386,12 +2389,33 @@ fn encode_frame_vardct(
         #[cfg(feature = "splines")]
         stage.as_ref(),
     )?;
-    if !best.used_tiles {
+    if !best.used_tiles && lattice.is_none() {
         drop(xyb);
+        drop(glyphs);
+        #[cfg(feature = "splines")]
+        drop(spline_candidates);
         return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
     }
     #[allow(unused_mut)]
     let mut best_bits = best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+    if let Some(plan) = lattice {
+        drop(xyb);
+        drop(glyphs);
+        #[cfg(feature = "splines")]
+        drop(spline_candidates);
+        // A lattice arm codes what the tile leaves at the frame's own distance,
+        // where an exact-tile plan repeats it at the finer atlas distance, so
+        // near-equal bits buy only a coarser remainder.
+        best_bits *= LATTICE_BITS_MARGIN;
+        for mut arm in lattice_variants(ctx, scratch, distance, distp, plan, alpha)? {
+            let bits = arm.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
+            if bits < best_bits {
+                best = arm;
+                best_bits = bits;
+            }
+        }
+        return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
+    }
     #[cfg(feature = "splines")]
     if best.tiles_touched {
         let stage = SplineStage {
@@ -2439,7 +2463,82 @@ fn encode_frame_vardct(
     } else {
         drop(no_tiles);
     }
+    drop(glyphs);
+    #[cfg(feature = "splines")]
+    drop(spline_candidates);
     best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer)
+}
+
+/// The kAdd and kMul lattice arms of a frame whose luma repeats on an integer
+/// lattice; both race the tile/glyph plans on estimated bits.
+#[allow(clippy::too_many_arguments)]
+fn lattice_variants(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    distance: f32,
+    distp: &DistanceParams,
+    plan: crate::lattice_patches::LatticePlan,
+    alpha: Option<&AlphaPlane>,
+) -> Result<Vec<PreparedVarDct>, EncodeError> {
+    let (px, py) = plan.period;
+    let add_references = plan.add_references();
+    let mul_references = plan.mul_references();
+    let atlas_alpha = zero_alpha_for_lossy(alpha, px * py);
+    let modular_atlas = |atlas: &[Vec<i32>; 3], scratch: &mut CoderScratch| {
+        let mut bits = BitWriter::new();
+        crate::lossless::encode_modular_xyb_atlas_tree(
+            atlas,
+            px,
+            py,
+            atlas_alpha.as_ref(),
+            ctx.speed,
+            &ctx.thread_pool,
+            scratch,
+            &mut bits,
+        );
+        bits
+    };
+    let prepared =
+        |prefix: BitWriter, mut base: Image3F, references: Vec<crate::patches::PatchReference>| {
+            gaborize(&mut base, distp);
+            PreparedVarDct {
+                prefix,
+                base,
+                references,
+                #[cfg(feature = "splines")]
+                splines: None,
+                tiles_touched: false,
+                used_tiles: false,
+                estimated_bits: None,
+            }
+        };
+    let add = prepared(
+        modular_atlas(&plan.add_atlas, scratch),
+        plan.add_base,
+        add_references,
+    );
+    let mut mul_prefix = modular_atlas(&plan.mul_atlas, scratch);
+    let (w, h) = (plan.residual.xsize(), plan.residual.ysize());
+    let mut residual = plan.residual;
+    gaborize(&mut residual, distp);
+    let residual_alpha = zero_alpha_for_lossy(alpha, w * h);
+    encode_frame_core(
+        ctx,
+        scratch,
+        distance,
+        residual,
+        residual_alpha.as_ref(),
+        &[0],
+        VarDctFrameKind::ReferenceOnly {
+            width: w,
+            height: h,
+        },
+        #[cfg(feature = "splines")]
+        None,
+        &mut mul_prefix,
+    )?;
+    let mul = prepared(mul_prefix, plan.gain, mul_references);
+    Ok(vec![add, mul])
 }
 
 /// Spline selection of one frame variant.
@@ -2588,7 +2687,7 @@ fn prepare_vardct_variant(
                 scratch,
             );
             let after16 = tiles16.as_ref().map_or(&base, |t| &t.base);
-            let tiles8 = crate::patches::find_lossy_patches_sized(
+            let tiles8 = crate::patches::find_lossy_patch_groups_sized(
                 after16,
                 8,
                 near_tiles,
@@ -2598,9 +2697,9 @@ fn prepare_vardct_variant(
             let covered = tiles16
                 .as_ref()
                 .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 256)
-                + tiles8
-                    .as_ref()
-                    .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 64);
+                + tiles8.as_ref().map_or(0, |groups| {
+                    groups.iter().map(|g| g.len()).sum::<usize>() * 64
+                });
             if covered as f64 >= PATCH_TILE_MIN_COVER * (base.xsize() * base.ysize()) as f64 {
                 let mut tile_refs = Vec::new();
                 let mut tile_atlas: Option<Image3F> = None;
@@ -2612,9 +2711,11 @@ fn prepare_vardct_variant(
                     tile_refs = refs;
                     next_base = Some(t.base);
                 }
-                if let Some(t) = tiles8 {
+                if let Some(groups8) = tiles8 {
+                    let residual = next_base.get_or_insert_with(|| base.clone());
+                    crate::patches::clear_patch_tiles(residual, 8, &groups8);
                     let (reused, groups8) =
-                        crate::patches::reuse_tile_quadrants(&base, &tile_refs, t.groups);
+                        crate::patches::reuse_tile_quadrants(&base, &tile_refs, groups8);
                     tile_refs.extend(reused);
                     if !groups8.is_empty() {
                         let (atlas8, mut refs8) =
@@ -2625,7 +2726,6 @@ fn prepare_vardct_variant(
                         });
                         tile_refs.extend(refs8);
                     }
-                    next_base = Some(t.base);
                 }
                 let tile_atlas = tile_atlas.expect("covered > 0");
                 let atlas_distance = distance * ATLAS_DISTANCE_SCALE;
@@ -2738,7 +2838,7 @@ fn prepare_vardct_variant(
             scratch,
         );
         let after16 = plan16.as_ref().map_or(&xyb, |p| &p.base);
-        let tiles8 = crate::patches::find_lossy_patches_sized(
+        let tiles8 = crate::patches::find_lossy_patch_groups_sized(
             after16,
             8,
             near_tiles,
@@ -2748,9 +2848,9 @@ fn prepare_vardct_variant(
         let covered = plan16
             .as_ref()
             .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 256)
-            + tiles8
-                .as_ref()
-                .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 64);
+            + tiles8.as_ref().map_or(0, |groups| {
+                groups.iter().map(|g| g.len()).sum::<usize>() * 64
+            });
         (covered as f64 >= PATCH_TILE_MIN_COVER * (xyb.xsize() * xyb.ysize()) as f64).then(|| {
             let plan = plan16.unwrap_or_else(|| crate::patches::LossyPatches {
                 base: xyb.clone(),
@@ -2873,9 +2973,10 @@ fn prepare_vardct_variant(
             vardct_atlas = Some(atlas);
             references.extend(vardct_refs);
         }
-        if let Some(t) = tiles8 {
+        if let Some(groups8) = tiles8 {
+            crate::patches::clear_patch_tiles(&mut base, 8, &groups8);
             let (reused, groups8) =
-                crate::patches::reuse_tile_quadrants(&xyb, &references, t.groups);
+                crate::patches::reuse_tile_quadrants(&xyb, &references, groups8);
             references.extend(reused);
             if !groups8.is_empty() {
                 let (atlas8, mut refs8) =
@@ -2886,7 +2987,6 @@ fn prepare_vardct_variant(
                 });
                 references.extend(refs8);
             }
-            base = t.base;
         }
         if let Some(atlas) = vardct_atlas {
             encode_vardct_atlas(atlas, scratch, &mut patched_writer)?;
@@ -3212,6 +3312,8 @@ const GLYPH_CHECK_MIN_DISTANCE: f32 = 6.0;
 const GLYPH_CHECK_ATLAS_SHARE: f64 = 0.35;
 /// Patched bits may exceed the regular frame's by this factor.
 const GLYPH_BITS_MARGIN: f64 = 1.10;
+/// A lattice arm must stay under this share of the best tile/glyph plan's bits.
+const LATTICE_BITS_MARGIN: f64 = 0.5;
 /// Tile patches are used only when they cover this share of the frame.
 const PATCH_TILE_MIN_COVER: f64 = 0.03;
 const NEAR_TILES_MAX: f32 = 2.0;
@@ -3696,6 +3798,36 @@ fn encode_frame_core(
     // coefficient statistics; whether any split is *kept* is decided later
     // from real token stats, so a useless threshold costs nothing.
     let qf_threshold = ac_qf_threshold(&dc_datas);
+
+    // The CfL slopes were estimated on fixed 8x8 DCTs so the transform search
+    // could price candidates under them; the final layout and quant field
+    // are known now, so re-estimate them on the coefficients that get coded.
+    if crate::color_correlation::cfl_slope_search(ctx) {
+        let dc_ref = &dc_datas;
+        let maps = ctx
+            .thread_pool
+            .steal_map(scratch, group_coords.len(), |i, scratch| {
+                let (dc_gx, dc_gy) = group_coords[i];
+                let (coeffs, gather) = scratch.ac_group.transform_buffers();
+                crate::color_correlation::refit_cmap_on_layout(
+                    ctx,
+                    opsin,
+                    &dc_ref[i],
+                    dc_gx * K_DC_GROUP_DIM / K_BLOCK_DIM,
+                    dc_gy * K_DC_GROUP_DIM / K_BLOCK_DIM,
+                    distp.scale,
+                    distp.distance,
+                    distp.x_qm_scale,
+                    coeffs,
+                    gather,
+                    &mut scratch.cfl_rdo,
+                )
+            });
+        for (dc, (ytox, ytob)) in dc_datas.iter_mut().zip(maps) {
+            dc.ytox_map = ytox;
+            dc.ytob_map = ytob;
+        }
+    }
 
     let dc_ref = &dc_datas;
     let natural_orders = crate::coeff_order::CoeffOrders::natural();
@@ -5095,7 +5227,6 @@ fn run_quant_field_loop(
         return None;
     }
     let reference = crate::ssimulacra2::Ssimulacra2Reference::new(opsin)?;
-    let metric = |recon: &Image3F| reference.deficit_and_map(recon);
     let blocks_per_dc = K_DC_GROUP_DIM / K_BLOCK_DIM;
 
     let group_map = LoopGroupMap::new(w, h, group_coords, ac_tasks);
@@ -5549,6 +5680,29 @@ fn run_quant_field_loop(
             if r_f - r_p < 1e-3 {
                 break;
             }
+            // Score one full-frame workspace at a time. Retain only tile
+            // summaries, then reuse the plain evaluation for the coarse arm.
+            // Each score and token reduction is identical to the independent
+            // full-frame comparisons; only their storage lifetimes change.
+            let (d_p, map_p) = if SHIFT_RDOQ {
+                (cur_d, cur_map.clone())
+            } else {
+                reference.deficit_and_map(&plain.recon)
+            };
+            let map_0 = tile_sums(&map_p);
+            drop(map_p);
+            let (d_f, fine_map) = reference.deficit_and_map(&fine.recon);
+            let map_f = tile_sums(&fine_map);
+            drop(fine_map);
+            let bits_f = tile_bits(&block_bits(&fine));
+            let bits_0 = tile_bits(&block_bits(&plain));
+            let cv_pf = loop_state
+                .as_mut()
+                .and_then(LoopArbiter::cvvdp)
+                .map(|judge| {
+                    [&plain, &fine].map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)))
+                });
+            drop(fine);
             // The coarser shift covers half the groups (slope estimate only).
             let half_tasks: Vec<usize> = (0..ac_tasks.len()).step_by(2).collect();
             let half_moves: Vec<(usize, i8)> = (0..n_tiles)
@@ -5559,7 +5713,7 @@ fn run_quant_field_loop(
                 .map(|t| (t, -1))
                 .collect();
             let (_, saved) = apply(dc_datas, &half_moves);
-            let mut coarse = plain.clone();
+            let mut coarse = plain;
             evaluate(
                 ctx,
                 scratch,
@@ -5582,19 +5736,7 @@ fn run_quant_field_loop(
             );
             restore(dc_datas, saved);
             let r_c = rate_term(frame_bits(&coarse));
-            // Bound simultaneous whole-frame workspaces to two. This does not
-            // change any score or its reduction order; the coarse map is unused.
-            let recons = [&plain.recon, &fine.recon, &coarse.recon];
-            let mut scored = ctx
-                .thread_pool
-                .steal_map(scratch, 2, |i, _| metric(recons[i]));
-            let d_c = reference.deficit(recons[2]);
-            let (d_f, fine_map) = scored.pop().expect("fine score");
-            let (d_p, map_p) = if SHIFT_RDOQ {
-                (cur_d, cur_map.clone())
-            } else {
-                scored.pop().expect("plain score")
-            };
+            let d_c = reference.deficit(&coarse.recon);
             let s_fine = (d_p - d_f) / (r_f - r_p);
             let s_coarse = if r_p - r_c > 1e-3 {
                 (d_c - d_p) / (r_p - r_c)
@@ -5606,9 +5748,12 @@ fn run_quant_field_loop(
                 break;
             }
             let mut cv_flat = false;
-            if let Some(judge) = loop_state.as_mut().and_then(LoopArbiter::cvvdp) {
-                let [cv_p, cv_f, cv_c] = [&plain, &fine, &coarse]
-                    .map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)));
+            if let Some([cv_p, cv_f]) = cv_pf {
+                let judge = loop_state
+                    .as_mut()
+                    .and_then(LoopArbiter::cvvdp)
+                    .expect("CV judge");
+                let cv_c = judge.deficit_of(&coarse.recon, &decoded_dc(&coarse, distp));
                 let s_fine = (cv_p - cv_f) / (r_f - r_p);
                 let s_coarse = if r_p - r_c > 1e-3 {
                     (cv_c - cv_p) / (r_p - r_c)
@@ -5618,6 +5763,7 @@ fn run_quant_field_loop(
                 cv_slope = SLOPE_SCALE * 0.5 * (s_fine + s_coarse);
                 cv_flat = !(cv_slope.is_finite() && cv_slope > 0.0);
             }
+            drop(coarse);
             // Near transparency ColorVideoVDP no longer separates the shifts;
             // SSIMULACRA2 arbitrates the frame instead of the loop stopping.
             if cv_flat {
@@ -5626,10 +5772,6 @@ fn run_quant_field_loop(
                 cur_d = state.deficit();
                 loop_state = Some(state);
             }
-            let map_f = tile_sums(&fine_map);
-            let bits_f = tile_bits(&block_bits(&fine));
-            let map_0 = tile_sums(&map_p);
-            let bits_0 = tile_bits(&block_bits(&plain));
             // Per tile: deficit gain (frame units) minus slope times rate cost (%).
             // Only finer moves: coarsening smooth tiles is a blind spot of mean
             // MS-SSIM that SSIMULACRA2 punishes, and edge-difference terms did not
@@ -6278,10 +6420,21 @@ fn run_quant_field_loop(
         if present[STRATEGY_DCT8X16 as usize] {
             variants.push(vec![(STRATEGY_DCT8X16, 0, 0), (STRATEGY_DCT8X16, 0, 1)]);
         }
-        // Sites of each AC task, DC-group-local block coordinates: the aligned
-        // grid first, then the three odd-offset grids (the format allows
-        // unaligned blocks; none may cross a 64px CfL tile).
-        let sites: Vec<Vec<(usize, usize)>> = ac_tasks
+        /// A region the loop re-chooses: a 2x2 site with the 16x16-family
+        /// variants, or a region the exact re-tiling proposed, with that
+        /// proposal as its only variant.
+        struct Site {
+            x: usize,
+            y: usize,
+            w: usize,
+            h: usize,
+            proposal: Option<Parts>,
+        }
+        // Sites of each AC task, DC-group-local block coordinates: the
+        // aligned 2x2 grid, the three odd-offset grids (the format allows
+        // unaligned blocks; none may cross a 64px CfL tile), then the
+        // proposed regions, judged against the refined layout.
+        let sites: Vec<Vec<Site>> = ac_tasks
             .iter()
             .map(|&(dc_idx, gx, gy)| {
                 let st = &dc_datas[dc_idx].ac_strategy;
@@ -6297,25 +6450,44 @@ fn run_quant_field_loop(
                             let x = gx * K_GROUP_DIM_IN_BLOCKS + sx;
                             let y = gy * K_GROUP_DIM_IN_BLOCKS + sy;
                             if x + 2 <= st.xsize() && y + 2 <= st.ysize() {
-                                v.push((x, y));
+                                v.push(Site {
+                                    x,
+                                    y,
+                                    w: 2,
+                                    h: 2,
+                                    proposal: None,
+                                });
                             }
                         }
+                    }
+                }
+                for region in &dc_datas[dc_idx].dp_regions {
+                    let inside = region.bx / K_GROUP_DIM_IN_BLOCKS == gx
+                        && region.by / K_GROUP_DIM_IN_BLOCKS == gy;
+                    if inside && region.pieces.iter().all(|&(st, _, _)| present[st as usize]) {
+                        v.push(Site {
+                            x: region.bx,
+                            y: region.by,
+                            w: region.w,
+                            h: region.h,
+                            proposal: Some(region.pieces.clone()),
+                        });
                     }
                 }
                 v
             })
             .collect();
         // The current layout of a closed site, sorted like `variants`.
-        let site_parts = |st: &AcStrategyImage, x: usize, y: usize| -> Option<Parts> {
+        let site_parts = |st: &AcStrategyImage, site: &Site| -> Option<Parts> {
             let mut parts = Vec::new();
             let mut covered = 0;
-            for dy in 0..2 {
-                for dx in 0..2 {
-                    if st.is_first_block(x + dx, y + dy) {
-                        let raw = st.raw_strategy(x + dx, y + dy);
+            for dy in 0..site.h {
+                for dx in 0..site.w {
+                    if st.is_first_block(site.x + dx, site.y + dy) {
+                        let raw = st.raw_strategy(site.x + dx, site.y + dy);
                         let cw = AcStrategyImage::covered_blocks_x_of(raw);
                         let ch = AcStrategyImage::covered_blocks_y_of(raw);
-                        if dx + cw > 2 || dy + ch > 2 {
+                        if dx + cw > site.w || dy + ch > site.h {
                             return None;
                         }
                         covered += cw * ch;
@@ -6323,74 +6495,75 @@ fn run_quant_field_loop(
                     }
                 }
             }
-            (covered == 4).then_some(parts)
+            (covered == site.w * site.h).then_some(parts)
         };
         /// What placing a variant overwrote: layout, field and memo of the site.
         struct Placed {
             task: usize,
             site: (usize, usize),
+            size: (usize, usize),
             cells: Vec<u8>,
             field: Vec<u8>,
             memo: Option<crate::group::MemoSnapshot>,
         }
         let distance = distp.distance;
-        let place = |dc_datas: &mut [DcGroupData],
-                     task: usize,
-                     (x, y): (usize, usize),
-                     parts: &Parts|
-         -> Placed {
-            let (dc_idx, gx, gy) = ac_tasks[task];
-            let data = &mut dc_datas[dc_idx];
-            let cells = data.ac_strategy.save_region(x, y, 2, 2);
-            let field: Vec<u8> = (y..y + 2)
-                .flat_map(|r| data.raw_quant_field.row(r)[x..x + 2].to_vec())
-                .collect();
-            for &(st, dx, dy) in parts {
-                let (px, py) = (x + dx, y + dy);
-                data.ac_strategy.set_first(px, py, st);
-                let w = AcStrategyImage::covered_blocks_x_of(st);
-                let h = AcStrategyImage::covered_blocks_y_of(st);
-                if w * h > 1 {
-                    let (mut max_q, mut sum) = (0u8, 0u32);
-                    for r in py..py + h {
-                        for &q in &data.raw_quant_field.row(r)[px..px + w] {
-                            max_q = max_q.max(q);
-                            sum += u32::from(q);
+        let place =
+            |dc_datas: &mut [DcGroupData], task: usize, site: &Site, parts: &Parts| -> Placed {
+                let (dc_idx, gx, gy) = ac_tasks[task];
+                let data = &mut dc_datas[dc_idx];
+                let (x, y, w, h) = (site.x, site.y, site.w, site.h);
+                let cells = data.ac_strategy.save_region(x, y, w, h);
+                let field: Vec<u8> = (y..y + h)
+                    .flat_map(|r| data.raw_quant_field.row(r)[x..x + w].to_vec())
+                    .collect();
+                for &(st, dx, dy) in parts {
+                    let (px, py) = (x + dx, y + dy);
+                    data.ac_strategy.set_first(px, py, st);
+                    let w = AcStrategyImage::covered_blocks_x_of(st);
+                    let h = AcStrategyImage::covered_blocks_y_of(st);
+                    if w * h > 1 {
+                        let (mut max_q, mut sum) = (0u8, 0u32);
+                        for r in py..py + h {
+                            for &q in &data.raw_quant_field.row(r)[px..px + w] {
+                                max_q = max_q.max(q);
+                                sum += u32::from(q);
+                            }
+                        }
+                        let q = crate::ac_strategy::aggregate_quant(max_q, sum, w * h, distance);
+                        for r in py..py + h {
+                            data.raw_quant_field.row_mut(r)[px..px + w].fill(q);
                         }
                     }
-                    let q = crate::ac_strategy::aggregate_quant(max_q, sum, w * h, distance);
-                    for r in py..py + h {
-                        data.raw_quant_field.row_mut(r)[px..px + w].fill(q);
-                    }
                 }
-            }
-            let memo_snapshot = memo.and_then(|memo| {
-                let mut guard = memo[task].lock().expect("block memo");
-                let m = guard.as_mut()?;
-                m.compact_tokens();
-                let (lx, ly) = (
-                    x - gx * K_GROUP_DIM_IN_BLOCKS,
-                    y - gy * K_GROUP_DIM_IN_BLOCKS,
-                );
-                let snapshot = m.snapshot(lx, ly, 2, 2);
-                m.invalidate(lx, ly, 2, 2);
-                Some(snapshot)
-            });
-            Placed {
-                task,
-                site: (x, y),
-                cells,
-                field,
-                memo: memo_snapshot,
-            }
-        };
+                let memo_snapshot = memo.and_then(|memo| {
+                    let mut guard = memo[task].lock().expect("block memo");
+                    let m = guard.as_mut()?;
+                    m.compact_tokens();
+                    let (lx, ly) = (
+                        x - gx * K_GROUP_DIM_IN_BLOCKS,
+                        y - gy * K_GROUP_DIM_IN_BLOCKS,
+                    );
+                    let snapshot = m.snapshot(lx, ly, w, h);
+                    m.invalidate(lx, ly, w, h);
+                    Some(snapshot)
+                });
+                Placed {
+                    task,
+                    site: (x, y),
+                    size: (w, h),
+                    cells,
+                    field,
+                    memo: memo_snapshot,
+                }
+            };
         let unplace = |dc_datas: &mut [DcGroupData], p: Placed| {
             let (dc_idx, _, _) = ac_tasks[p.task];
             let data = &mut dc_datas[dc_idx];
             let (x, y) = p.site;
-            data.ac_strategy.restore_region(x, y, 2, &p.cells);
-            for (i, row) in p.field.as_chunks::<2>().0.iter().enumerate() {
-                data.raw_quant_field.row_mut(y + i)[x..x + 2].copy_from_slice(row);
+            let (w, _) = p.size;
+            data.ac_strategy.restore_region(x, y, w, &p.cells);
+            for (i, row) in p.field.chunks_exact(w).enumerate() {
+                data.raw_quant_field.row_mut(y + i)[x..x + w].copy_from_slice(row);
             }
             if let (Some(memo), Some(snapshot)) = (memo, &p.memo)
                 && let Some(m) = memo[p.task].lock().expect("block memo").as_mut()
@@ -6433,28 +6606,37 @@ fn run_quant_field_loop(
                 }
             };
         let mut cur_gbits: Vec<f32> = (0..ac_tasks.len()).map(|t| group_bits(&cur, t)).collect();
-        let mut accepted_sites: Vec<(usize, (usize, usize))> = Vec::new();
+        /// An accepted site: its task, origin and size in blocks.
+        type Accepted = (usize, (usize, usize), (usize, usize));
+        let mut accepted_sites: Vec<Accepted> = Vec::new();
         let max_sites = sites.iter().map(Vec::len).max().unwrap_or(0);
         for si in 0..max_sites {
             // The variants of each task's site that differ from its layout.
             let vars: Vec<Vec<&Parts>> = (0..ac_tasks.len())
                 .map(|t| {
-                    let Some(&(x, y)) = sites[t].get(si) else {
+                    let Some(site) = sites[t].get(si) else {
                         return Vec::new();
                     };
                     let st = &dc_datas[ac_tasks[t].0].ac_strategy;
-                    let Some(mut current) = site_parts(st, x, y) else {
+                    let Some(mut current) = site_parts(st, site) else {
                         return Vec::new();
                     };
                     current.sort_unstable();
-                    variants
-                        .iter()
-                        .filter(|v| {
-                            let mut k = (*v).clone();
-                            k.sort_unstable();
-                            k != current
-                        })
-                        .collect()
+                    let differs = |v: &Parts| {
+                        let mut k = v.clone();
+                        k.sort_unstable();
+                        k != current
+                    };
+                    match &site.proposal {
+                        Some(proposal) => {
+                            if differs(proposal) {
+                                vec![proposal]
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        None => variants.iter().filter(|v| differs(v)).collect(),
+                    }
                 })
                 .collect();
             let max_v = vars.iter().map(Vec::len).max().unwrap_or(0);
@@ -6465,7 +6647,7 @@ fn run_quant_field_loop(
                     .collect();
                 let placed: Vec<Placed> = tasks
                     .iter()
-                    .map(|&t| place(dc_datas, t, sites[t][si], vars[t][vi]))
+                    .map(|&t| place(dc_datas, t, &sites[t][si], vars[t][vi]))
                     .collect();
                 cand.trial = true;
                 let dirty = evaluate(
@@ -6524,7 +6706,7 @@ fn run_quant_field_loop(
             }
             let placed: Vec<Placed> = winners
                 .iter()
-                .map(|&(t, v)| place(dc_datas, t, sites[t][si], vars[t][v]))
+                .map(|&(t, v)| place(dc_datas, t, &sites[t][si], vars[t][v]))
                 .collect();
             let tasks: Vec<usize> = winners.iter().map(|w| w.0).collect();
             let dirty = evaluate(
@@ -6568,7 +6750,7 @@ fn run_quant_field_loop(
                     cur_bits = bits;
                     cur_d = d;
                     j_cur = j;
-                    accepted_sites.push((t, p.site));
+                    accepted_sites.push((t, p.site, p.size));
                 } else {
                     if r.x1 > r.x0 {
                         state.rollback(&checkpoint);
@@ -6616,16 +6798,16 @@ fn run_quant_field_loop(
             let (dc_idx, gx, gy) = ac_tasks[task];
             let (ox, oy) = (gx * K_GROUP_DIM_IN_BLOCKS, gy * K_GROUP_DIM_IN_BLOCKS);
             let dc = &mut dc_datas[dc_idx];
-            for &(_, (x, y)) in accepted_sites.iter().filter(|a| a.0 == task) {
+            for &(_, (x, y), (w, h)) in accepted_sites.iter().filter(|a| a.0 == task) {
                 for (target, src) in [
                     (&mut dc.source_dc_y, &source.y),
                     (&mut dc.source_dc_b, &source.b),
                     (&mut dc.source_dc_x, &source.x),
                 ] {
                     if let Some(target) = target.as_mut() {
-                        for r in y..y + 2 {
-                            target.row_mut(r)[x..x + 2]
-                                .copy_from_slice(&src.row(r - oy)[x - ox..x - ox + 2]);
+                        for r in y..y + h {
+                            target.row_mut(r)[x..x + w]
+                                .copy_from_slice(&src.row(r - oy)[x - ox..x - ox + w]);
                         }
                     }
                 }
@@ -6649,7 +6831,16 @@ fn run_quant_field_loop(
     if race_slope > 0.0 && ctx.coding.is_xyb() {
         let slope = race_slope;
         let b_start = ctx.b_qm_scale();
-        let mut judge = loop_state.as_mut().and_then(LoopArbiter::cvvdp);
+        // No more regional updates: full-frame comparisons do not read the
+        // incremental pyramid, or any accepted evaluation's reconstruction.
+        let mut judge = match loop_state.take() {
+            Some(LoopArbiter::Cvvdp(mut judge)) => {
+                judge.finish_updates();
+                Some(judge)
+            }
+            _ => None,
+        };
+        cur.recon = Image3F::new(0, 0);
         let mut score = |e: &Eval| -> f32 {
             match judge.as_deref_mut() {
                 Some(judge) => judge.deficit_of(&e.recon, &decoded_dc(e, distp)),
@@ -6711,12 +6902,13 @@ fn run_quant_field_loop(
                     if tried.contains(&(x, b)) {
                         break;
                     }
-                    let (e, bits) = arm_eval(x, b, scratch);
+                    let (mut e, bits) = arm_eval(x, b, scratch);
                     let d = score(&e);
                     let j = -d - slope * rate_term(bits);
                     tried.push((x, b));
                     if j > best.0 + 1e-6 {
                         best = (j, x, b);
+                        e.recon = Image3F::new(0, 0);
                         best_eval = Some(e);
                     } else {
                         break;
@@ -6813,6 +7005,7 @@ fn setup_dc_group(
         &mut dc_data.ac_strategy,
         &mut fine_rollbacks,
         &mut fine_fallbacks,
+        &mut dc_data.dp_regions,
         num_threads,
     );
     // A fine mosaic that split an otherwise-retained merge must repay its own
@@ -7103,6 +7296,7 @@ fn process_ac_group(
     capture_recon: bool,
     block_memo: Option<&mut Option<crate::group::AcBlockCache>>,
 ) -> ProcessedAcGroup {
+    scratch.finish_strategy_search();
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
     let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
     let group_x0 = image_gx * K_GROUP_DIM;
@@ -7694,11 +7888,11 @@ mod tests {
         use crate::quant_weights::{DequantMatrices, MatrixHeaderCost};
         for distance in [0.5, 1.5, 2.5, 4.0, 8.0] {
             for matrices in [
-                DequantMatrices::new(distance, crate::Arbiter::Ssimulacra2),
-                DequantMatrices::new_pair_b(distance, crate::Arbiter::Ssimulacra2),
-                DequantMatrices::new_saturated(distance, crate::Arbiter::Ssimulacra2),
+                DequantMatrices::new(distance, crate::Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_pair_b(distance, crate::Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_saturated(distance, crate::Arbiter::Ssimulacra2, false),
                 DequantMatrices::new_x_heavy(distance, crate::Arbiter::Ssimulacra2),
-                DequantMatrices::new_saturated_pair_b(distance, crate::Arbiter::Ssimulacra2),
+                DequantMatrices::new_saturated_pair_b(distance, crate::Arbiter::Ssimulacra2, false),
                 DequantMatrices::new_fast(distance, crate::Arbiter::Ssimulacra2),
             ] {
                 let header = MatrixHeaderCost::new(matrices);
@@ -7845,7 +8039,7 @@ mod tests {
             assert_eq!(ctx.b_qm_scale(), 3, "d={distance}");
             assert!(std::ptr::eq(
                 ctx.matrices(),
-                DequantMatrices::new(0.3, crate::Arbiter::Ssimulacra2)
+                DequantMatrices::new(0.3, crate::Arbiter::Ssimulacra2, false)
             ));
         }
         // Existing mid-band protection and the upper cutoff stay intact.

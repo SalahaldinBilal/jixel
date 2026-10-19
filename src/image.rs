@@ -69,11 +69,6 @@ impl<T: Copy + Default> Plane<T> {
         })
     }
 
-    pub(crate) fn swap_data(&mut self, data: &mut Vec<T>) {
-        assert_eq!(data.len(), self.data.len());
-        std::mem::swap(&mut self.data, data);
-    }
-
     #[cfg(test)]
     fn resize(&mut self, xsize: usize, ysize: usize) {
         self.data.resize(xsize * ysize, T::default());

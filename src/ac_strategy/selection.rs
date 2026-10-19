@@ -31,9 +31,11 @@
 
 use super::*;
 
+mod layout_dp;
 mod leaf_first;
 mod recon64;
 mod search;
+pub(crate) use layout_dp::LayoutDpScratch;
 pub(crate) use leaf_first::LeafChoice;
 pub(crate) use recon64::Recon64Scratch;
 use search::{
@@ -1464,6 +1466,7 @@ fn learn_rate_prices(
             &mut layout,
             &mut rollbacks,
             &mut fallbacks,
+            &mut Vec::new(),
             num_threads,
             None,
             SelectionPass::Pilot,
@@ -1539,6 +1542,7 @@ fn learn_rate_prices(
         &mut layout,
         &mut rollbacks,
         &mut fallbacks,
+        &mut Vec::new(),
         num_threads,
         None,
         SelectionPass::Pilot,
@@ -1575,6 +1579,7 @@ pub(crate) fn fill_ac_strategy(
     ac_strategy: &mut AcStrategyImage,
     fine_rollbacks: &mut Vec<FineMergeRollback>,
     fine_fallbacks: &mut Vec<u8>,
+    dp_regions: &mut Vec<crate::dc_group_data::DpRegion>,
     num_threads: usize,
 ) -> f32 {
     let learned = ctx.learned_rate
@@ -1611,6 +1616,7 @@ pub(crate) fn fill_ac_strategy(
         ac_strategy,
         fine_rollbacks,
         fine_fallbacks,
+        dp_regions,
         num_threads,
         prices,
         SelectionPass::Full,
@@ -1764,6 +1770,7 @@ fn select_transforms(
     ac_strategy: &mut AcStrategyImage,
     fine_rollbacks: &mut Vec<FineMergeRollback>,
     fine_fallbacks: &mut Vec<u8>,
+    dp_regions: &mut Vec<crate::dc_group_data::DpRegion>,
     num_threads: usize,
     prices: Option<std::sync::Arc<RatePrices>>,
     pass: SelectionPass,
@@ -2022,6 +2029,25 @@ fn select_transforms(
         }
     }
 
+    // Tiers without the reconstruction DP re-tile the merge search's tiles
+    // under its own coefficient model before any reconstruction pass.
+    if pass == SelectionPass::Full
+        && speed.effort().layout_dp_coefficient
+        && !speed.effort().layout_retile
+        && ctx.coding.is_xyb()
+    {
+        let band_count = pipeline.bands.len();
+        layout_dp::retile_coefficient(
+            &selection,
+            scratch,
+            ac_strategy,
+            &pipeline.bands,
+            &mut pipeline.band_scratch[..band_count],
+            num_threads,
+            &mut [],
+        );
+    }
+
     // Revisit selected merges in the reconstruction domain. Within each
     // footprint, optimize all aligned subdivisions from DCT8, saved structural
     // leaves and the supported smaller merges. The parent keeps its fitted
@@ -2143,7 +2169,6 @@ fn select_transforms(
         );
     }
 
-    let mut strips_placed = false;
     if scope.rectangles() && ctx.coding.is_xyb() {
         let rollbacks: Vec<(usize, usize, usize, usize)> = pipeline.band_scratch
             [..pipeline.bands.len().max(1)]
@@ -2152,7 +2177,6 @@ fn select_transforms(
             .map(|r| (r.bx, r.by, r.cov_x, r.cov_y))
             .collect();
         let changed = place_dct8x32(&params, scratch, quant_field, ac_strategy, &rollbacks);
-        strips_placed = !changed.is_empty();
         if reranked {
             for (bx, by, w, h) in changed {
                 for y in by..by + h {
@@ -2162,9 +2186,13 @@ fn select_transforms(
         }
     }
 
-    // Free-placement re-tiling of the finished 16-level layout (32x8 strips
-    // included when the frame already pays their table).
-    if reranked && ctx.speed.effort().layout_retile && !ctx.speed.effort().layout_loop {
+    // Exact re-tiling of every closed 64x64 tile over the 8/16/32-family
+    // pieces at any 8-pixel origin, on the rerank's reconstruction costs.
+    if reranked
+        && ctx.speed.effort().layout_retile
+        && !ctx.speed.effort().layout_loop
+        && ctx.coding.is_xyb()
+    {
         let rerank = RerankContext {
             params,
             quant_field,
@@ -2178,15 +2206,47 @@ fn select_transforms(
             },
         };
         let band_count = pipeline.bands.len();
-        rerank_retile_regions(
+        layout_dp::retile(
             &rerank,
             scratch,
             ac_strategy,
             &mut pipeline.band_scratch[..band_count],
             &mut pipeline.current_costs,
-            merge_upgrade_margin(distance),
-            strips_placed,
+            true,
         );
+    }
+
+    // Under the ExtraSlow layout loop the re-tiling only proposes: the
+    // loop's exact arbiter decides every changed region.
+    if reranked
+        && ctx.speed.effort().layout_retile
+        && ctx.speed.effort().layout_loop
+        && ctx.coding.is_xyb()
+    {
+        let rerank = RerankContext {
+            params,
+            quant_field,
+            bands: &pipeline.bands,
+            num_threads,
+            leaf_first,
+            leaves: if leaf_first {
+                &pipeline.rerank_leaves
+            } else {
+                &[]
+            },
+        };
+        let band_count = pipeline.bands.len();
+        layout_dp::retile(
+            &rerank,
+            scratch,
+            ac_strategy,
+            &mut pipeline.band_scratch[..band_count],
+            &mut pipeline.current_costs,
+            false,
+        );
+        for band in &pipeline.band_scratch[..band_count] {
+            dp_regions.extend(band.dp_regions.iter().cloned());
+        }
     }
 
     if leaf_first {
@@ -2770,8 +2830,14 @@ fn find_rerank_downgrades(
         let rectangles = SearchScope::for_speed(ctx.speed).rectangles();
         for iy in 0..cyb {
             for ix in 0..cxb {
+                // Full-image leaves: a layout pass may have merged across
+                // this band's rows.
                 let leaf = if rerank.leaf_first {
-                    output.leaves[(by + iy - y0) * ac_strategy.xsize() + bx + ix].strategy
+                    rerank
+                        .leaves
+                        .get((by + iy) * ac_strategy.xsize() + bx + ix)
+                        .copied()
+                        .unwrap_or(STRATEGY_DCT)
                 } else {
                     saved.map_or(NO_CHILD_BLOCK, |grid| grid[iy * 4 + ix])
                 };
@@ -3347,343 +3413,6 @@ fn find_merge_upgrades_at_level(
             if mask & (1 << k) != 0 {
                 output.merge_upgrades.push(candidate.unwrap().0);
             }
-        }
-    }
-}
-
-/// Pieces of a 4x4-block re-tiling region, aligned or not: (strategy, dx,
-/// dy, w, h). The 32x8 strips are only offered once the frame pays their table.
-static RETILE_PIECES: [(u8, usize, usize, usize, usize); 57] = {
-    let mut out = [(0u8, 0usize, 0usize, 1usize, 1usize); 57];
-    let mut n = 0;
-    let mut i = 0;
-    while i < 4 {
-        out[n] = (STRATEGY_DCT32X8, i, 0, 1, 4);
-        out[n + 1] = (STRATEGY_DCT8X32, 0, i, 4, 1);
-        n += 2;
-        i += 1;
-    }
-    let mut dy = 0;
-    while dy < 4 {
-        let mut dx = 0;
-        while dx < 4 {
-            out[n] = (STRATEGY_DCT, dx, dy, 1, 1);
-            n += 1;
-            if dy < 3 {
-                out[n] = (STRATEGY_DCT16X8, dx, dy, 1, 2);
-                n += 1;
-            }
-            if dx < 3 {
-                out[n] = (STRATEGY_DCT8X16, dx, dy, 2, 1);
-                n += 1;
-            }
-            if dx < 3 && dy < 3 {
-                out[n] = (STRATEGY_DCT16X16, dx, dy, 2, 2);
-                n += 1;
-            }
-            dx += 1;
-        }
-        dy += 1;
-    }
-    out
-};
-
-/// Minimum-cost tiling of the free cells of `mask` (bit = dy*4+dx); the
-/// first free cell in raster order is always the next piece's corner.
-fn retile_dp(mask: u16, cost: &[f32; 57], memo: &mut [f32], choice: &mut [u8]) -> f32 {
-    if mask == 0xffff {
-        return 0.0;
-    }
-    if !memo[mask as usize].is_nan() {
-        return memo[mask as usize];
-    }
-    let p = (!mask).trailing_zeros() as usize;
-    let (px, py) = (p % 4, p / 4);
-    let mut best = (f32::INFINITY, u8::MAX);
-    for (k, &(_, dx, dy, w, h)) in RETILE_PIECES.iter().enumerate() {
-        if dx != px || dy != py {
-            continue;
-        }
-        let mut m = 0u16;
-        for y in dy..dy + h {
-            for x in dx..dx + w {
-                m |= 1 << (y * 4 + x);
-            }
-        }
-        if mask & m != 0 || cost[k].is_infinite() {
-            continue;
-        }
-        let c = cost[k] + retile_dp(mask | m, cost, memo, choice);
-        if c < best.0 {
-            best = (c, k as u8);
-        }
-    }
-    memo[mask as usize] = best.0;
-    choice[mask as usize] = best.1;
-    best.0
-}
-
-/// Re-tile every closed 4x4-block region (no transform crosses it, none larger
-/// than 16x16 apart from 32x8 strips) over all piece placements, aligned to
-/// their own size or not, by exact DP on the rerank's reconstruction costs.
-/// Partial regions at the image border take part with the cells they have.
-#[allow(clippy::too_many_arguments)]
-fn find_retiles(
-    rerank: &RerankContext<'_>,
-    scratch: &mut CoderScratch,
-    ac_strategy: &AcStrategyImage,
-    band: (usize, usize),
-    output: &mut AcStrategyBandScratch,
-    margin: f32,
-    (ox, oy): (usize, usize),
-    strips: bool,
-    rollbacks: &[(usize, usize, usize, usize)],
-) {
-    let params = rerank.params;
-    let ctx = params.ctx;
-    let (y0, y1) = band;
-    output.merge_upgrades.clear();
-    let (xsize, ysize) = (ac_strategy.xsize(), ac_strategy.ysize());
-    let score = |scratch: &mut CoderScratch, s: u8, x: usize, y: usize, cw: usize, ch: usize| {
-        let (px, py) = (params.dc_group_px + x * 8, params.dc_group_py + y * 8);
-        let (ga, gpa) = rerank_pair_gradient_alphas(rerank, s, px, py);
-        reconstruction_strategy_cost_and_base(
-            ctx,
-            scratch,
-            s,
-            params.opsin,
-            px,
-            py,
-            region_qac(
-                rerank.quant_field,
-                x,
-                y,
-                cw,
-                ch,
-                params.scale,
-                params.distance,
-            ),
-            params.qm_mult_x,
-            RERANK_META_R,
-            params.distance,
-            cmap_factors(
-                params.ctx.cfl_frame(),
-                params.ytox_map,
-                params.ytob_map,
-                x,
-                y,
-            ),
-            ga,
-            gpa,
-            None,
-        )
-    };
-    let mut memo = vec![f32::NAN; 1 << 16];
-    let mut choice = vec![u8::MAX; 1 << 16];
-    let mut by0 = (y0 + 4 - oy).div_ceil(4) * 4 + oy - 4;
-    while by0 < y1 && by0 < ysize {
-        let mut bx0 = ox;
-        while bx0 < xsize {
-            let (rx, ry) = (bx0, by0);
-            bx0 += 4;
-            let (rw, rh) = ((xsize - rx).min(4), (ysize - ry).min(4));
-            let mut outside = 0u16;
-            for y in 0..4 {
-                for x in 0..4 {
-                    if x >= rw || y >= rh {
-                        outside |= 1 << (y * 4 + x);
-                    }
-                }
-            }
-            // Every band's mosaics: offset regions may cross a band boundary.
-            let touches_mosaic = rollbacks
-                .iter()
-                .any(|&(bx, by, w, h)| rx < bx + w && bx < rx + rw && ry < by + h && by < ry + rh);
-            if touches_mosaic {
-                continue;
-            }
-            // Closed region of pieces no larger than 2x2.
-            let mut current: Vec<(u8, usize, usize, usize, usize)> = Vec::new();
-            let mut covered = 0;
-            let mut closed = true;
-            for y in ry..ry + rh {
-                for x in rx..rx + rw {
-                    if !ac_strategy.is_first_block(x, y) {
-                        continue;
-                    }
-                    let s = ac_strategy.raw_strategy(x, y);
-                    let w = AcStrategyImage::covered_blocks_x_of(s);
-                    let h = AcStrategyImage::covered_blocks_y_of(s);
-                    let strip = strips && matches!(s, STRATEGY_DCT32X8 | STRATEGY_DCT8X32);
-                    if (!strip && (w > 2 || h > 2)) || x + w > rx + rw || y + h > ry + rh {
-                        closed = false;
-                    }
-                    covered += w * h;
-                    current.push((s, x, y, w, h));
-                }
-            }
-            if !closed || covered != rw * rh {
-                continue;
-            }
-            let single = |x: usize, y: usize| -> u8 {
-                let s = ac_strategy.raw_strategy(x, y);
-                if ac_strategy.is_first_block(x, y)
-                    && AcStrategyImage::covered_blocks_x_of(s) == 1
-                    && AcStrategyImage::covered_blocks_y_of(s) == 1
-                {
-                    s
-                } else if rerank.leaf_first && !rerank.leaves.is_empty() {
-                    rerank.leaves[y * xsize + x]
-                } else {
-                    STRATEGY_DCT
-                }
-            };
-            let mut cost = [0.0f32; 57];
-            let mut base = [0.0f32; 57];
-            let mut strat = [0u8; 57];
-            for (k, &(st, dx, dy, w, h)) in RETILE_PIECES.iter().enumerate() {
-                let (x, y) = (rx + dx, ry + dy);
-                let is_strip = matches!(st, STRATEGY_DCT32X8 | STRATEGY_DCT8X32);
-                if (is_strip && !strips)
-                    || dx + w > rw
-                    || dy + h > rh
-                    || (w * h > 1 && !ac_strategy.can_place_strategy(x, y, st))
-                {
-                    cost[k] = f32::INFINITY;
-                    continue;
-                }
-                let s = if w * h == 1 { single(x, y) } else { st };
-                let r = score(scratch, s, x, y, w, h);
-                cost[k] = if is_strip { BIAS_8X32 * r.cost } else { r.cost };
-                base[k] = r.base;
-                strat[k] = s;
-            }
-            let mut j_cur = 0.0f32;
-            for &(s, x, y, w, h) in &current {
-                let k = RETILE_PIECES
-                    .iter()
-                    .position(|p| p.1 == x - rx && p.2 == y - ry && p.3 == w && p.4 == h)
-                    .unwrap();
-                j_cur += if w * h == 1 && s == strat[k] || w * h == 4 && (w == 1 || h == 1) {
-                    cost[k]
-                } else {
-                    score(scratch, s, x, y, w, h).cost
-                };
-            }
-            memo.fill(f32::NAN);
-            let j_new = retile_dp(outside, &cost, &mut memo, &mut choice);
-            if j_cur - j_new / margin <= 0.0 {
-                continue;
-            }
-            let mut mask = outside;
-            let mut pieces = Vec::new();
-            while mask != 0xffff {
-                let k = choice[mask as usize] as usize;
-                let (_, dx, dy, w, h) = RETILE_PIECES[k];
-                for y in dy..dy + h {
-                    for x in dx..dx + w {
-                        mask |= 1 << (y * 4 + x);
-                    }
-                }
-                pieces.push(MergeUpgrade {
-                    bx: rx + dx,
-                    by: ry + dy,
-                    strategy: strat[k],
-                    base: base[k],
-                });
-            }
-            let same = pieces.len() == current.len()
-                && pieces.iter().all(|p| {
-                    current
-                        .iter()
-                        .any(|c| c.0 == p.strategy && c.1 == p.bx && c.2 == p.by)
-                });
-            if !same {
-                output.merge_upgrades.extend(pieces);
-            }
-        }
-        by0 += 4;
-    }
-}
-
-/// Re-tile on the aligned region grid and the three grids offset by two blocks,
-/// so pieces may also straddle 32x32 boundaries; each grid is evaluated in
-/// parallel and installed serially.
-fn rerank_retile_regions(
-    rerank: &RerankContext<'_>,
-    scratch: &mut CoderScratch,
-    ac_strategy: &mut AcStrategyImage,
-    band_scratch: &mut [AcStrategyBandScratch],
-    current_costs: &mut [f32],
-    margin: f32,
-    strips: bool,
-) {
-    let rollbacks: Vec<(usize, usize, usize, usize)> = band_scratch[..rerank.bands.len()]
-        .iter()
-        .flat_map(|band| band.fine_rollbacks.iter())
-        .map(|r| (r.bx, r.by, r.cov_x, r.cov_y))
-        .collect();
-    for offset in [(0, 0), (2, 0), (0, 2), (2, 2)] {
-        retile_grid(
-            rerank,
-            scratch,
-            ac_strategy,
-            band_scratch,
-            current_costs,
-            margin,
-            offset,
-            strips,
-            &rollbacks,
-        );
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn retile_grid(
-    rerank: &RerankContext<'_>,
-    scratch: &mut CoderScratch,
-    ac_strategy: &mut AcStrategyImage,
-    band_scratch: &mut [AcStrategyBandScratch],
-    current_costs: &mut [f32],
-    margin: f32,
-    offset: (usize, usize),
-    strips: bool,
-    rollbacks: &[(usize, usize, usize, usize)],
-) {
-    let xsize = ac_strategy.xsize();
-    let map_ref: &AcStrategyImage = ac_strategy;
-    rerank
-        .params
-        .ctx
-        .thread_pool
-        .steal_for_each_mut_with_threads(
-            scratch,
-            &mut band_scratch[..rerank.bands.len()],
-            rerank.num_threads,
-            |i, output, scratch| {
-                let mut scratch = rerank.params.price(scratch);
-                find_retiles(
-                    rerank,
-                    &mut scratch,
-                    map_ref,
-                    rerank.bands[i],
-                    output,
-                    margin,
-                    offset,
-                    strips,
-                    rollbacks,
-                );
-            },
-        );
-    for band in &band_scratch[..rerank.bands.len()] {
-        for up in &band.merge_upgrades {
-            let cx = AcStrategyImage::covered_blocks_x_of(up.strategy);
-            let cy = AcStrategyImage::covered_blocks_y_of(up.strategy);
-            for y in up.by..up.by + cy {
-                current_costs[y * xsize + up.bx..y * xsize + up.bx + cx].fill(f32::NAN);
-            }
-            current_costs[up.by * xsize + up.bx] = up.base;
-            ac_strategy.set_first(up.bx, up.by, up.strategy);
         }
     }
 }
@@ -4469,22 +4198,21 @@ mod tests {
         BIAS_4X4, BIAS_4X8, BIAS_16X16, BIAS_AFV, BIAS_RECT32, DCT8_ONLY_MAX_DISTANCE,
         FAST_RERANK_MAX_DISTANCE, FINE_ADMIT_RATE_CORRECTION_BITS, LEAF_FIRST_MAX_DISTANCE,
         MERGE_MARGIN_16, MERGE_MARGIN_32, MERGE_MARGIN_PAIR, MERGE_UPGRADE_MARGIN,
-        MERGE_UPGRADE_MIN_DISTANCE, MergeTuning, RERANK_DOWNGRADE_MARGIN,
-        RERANK_PAIR_GRADIENT_ALPHA, RERANK_PAIR_GRADIENT_FADE_IN_END,
-        RERANK_PAIR_GRADIENT_FADE_IN_START, RERANK_PAIR_GRADIENT_FADE_OUT_END,
-        RERANK_PAIR_GRADIENT_FADE_OUT_START, RERANK_PAIR_GRADIENT_MIN_DOMINANCE,
-        RERANK_PAIR_GRADIENT_PEAK_ALPHA, RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA,
-        RERANK_PAIR_GRADIENT_PEAK_COARSE_END, RERANK_PAIR_GRADIENT_PEAK_COARSE_START,
-        RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START,
-        RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START,
-        SUB8_MAX_DISTANCE, SearchScope, aggregate_qac_2x2, aggregate_quant,
-        block_boundary_error_energy, block_boundary_error_stats, cmap_factors, fill_ac_strategy,
-        fill_selection_bands, fine_mosaic_lambda, gradient_region_stats_scalar,
-        gradient_region_stats_with_chroma_scalar, merge_beats_dct8, merge_margin,
-        merge_upgrade_margin, quant_refinement_steps, rerank_pair_gradient_peak_alpha,
-        rerank_pair_gradient_scale, select_gradient_region_stats_fn,
-        select_gradient_region_stats_with_chroma_fn, strategy_cost, sub8_strategy_costs,
-        use_dct8_only, use_dct8_only_for_content,
+        MERGE_UPGRADE_MIN_DISTANCE, MergeTuning, RERANK_PAIR_GRADIENT_ALPHA,
+        RERANK_PAIR_GRADIENT_FADE_IN_END, RERANK_PAIR_GRADIENT_FADE_IN_START,
+        RERANK_PAIR_GRADIENT_FADE_OUT_END, RERANK_PAIR_GRADIENT_FADE_OUT_START,
+        RERANK_PAIR_GRADIENT_MIN_DOMINANCE, RERANK_PAIR_GRADIENT_PEAK_ALPHA,
+        RERANK_PAIR_GRADIENT_PEAK_COARSE_ALPHA, RERANK_PAIR_GRADIENT_PEAK_COARSE_END,
+        RERANK_PAIR_GRADIENT_PEAK_COARSE_START, RERANK_PAIR_GRADIENT_PEAK_FADE_IN_END,
+        RERANK_PAIR_GRADIENT_PEAK_FADE_IN_START, RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_END,
+        RERANK_PAIR_GRADIENT_PEAK_FADE_OUT_START, SUB8_MAX_DISTANCE, SearchScope,
+        aggregate_qac_2x2, aggregate_quant, block_boundary_error_energy,
+        block_boundary_error_stats, cmap_factors, fill_ac_strategy, fill_selection_bands,
+        fine_mosaic_lambda, gradient_region_stats_scalar, gradient_region_stats_with_chroma_scalar,
+        merge_beats_dct8, merge_margin, merge_upgrade_margin, quant_refinement_steps,
+        rerank_pair_gradient_peak_alpha, rerank_pair_gradient_scale,
+        select_gradient_region_stats_fn, select_gradient_region_stats_with_chroma_fn,
+        strategy_cost, sub8_strategy_costs, use_dct8_only, use_dct8_only_for_content,
     };
     use crate::coder_scratch::{AcStrategyBandScratch, CoderScratch};
     use crate::dc_group_data::{
@@ -4722,9 +4450,6 @@ mod tests {
         // High quality admits merges on much stiffer terms than mid/low.
         assert!(MERGE_MARGIN_16.at(0.3) > MERGE_MARGIN_16.at(2.0));
         assert!(BIAS_16X16.at(0.3) > BIAS_16X16.at(2.0));
-        // The rerank defends merges at mid/low quality, knife-edge at HQ.
-        assert_eq!(RERANK_DOWNGRADE_MARGIN.at(0.3), 1.0);
-        assert!(RERANK_DOWNGRADE_MARGIN.at(3.0) < 1.0);
     }
 
     #[test]
@@ -4827,6 +4552,7 @@ mod tests {
             &maps,
             &mut strategies,
             &mut fine_rollbacks,
+            &mut Vec::new(),
             &mut Vec::new(),
             1,
         );
@@ -4965,6 +4691,7 @@ mod tests {
             &maps,
             &mut strategies,
             &mut fine_rollbacks,
+            &mut Vec::new(),
             &mut Vec::new(),
             threads,
         );
@@ -5576,7 +5303,7 @@ mod tests {
         // The resolved table is exactly what the per-block path used to compute.
         assert_eq!(hq.accept_16, 1.0 - merge_margin(0.3, MERGE_MARGIN_16));
         assert_eq!(hq.bias_rect32, BIAS_RECT32.at(0.3));
-        assert_eq!(lowq.rerank_margin, RERANK_DOWNGRADE_MARGIN.at(4.0));
+        assert_eq!(lowq.rerank_margin, 1.0);
     }
 
     #[test]

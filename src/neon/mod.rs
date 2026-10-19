@@ -40,6 +40,7 @@ mod inflated_cost;
 mod lossless_grad;
 mod lz_match;
 mod modular;
+mod noise;
 mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
@@ -55,7 +56,8 @@ pub(crate) use ac_strategy::{
 pub(crate) use adaptive_quant::{chroma_hf_stats_neon, fill_quant_field};
 pub(crate) use afv::{afv0_neon, afv1_neon, afv2_neon, afv3_neon};
 pub(crate) use cfl::{
-    apply_cfl_neon, cfl_rd_cost_neon, cfl_rdo_block_neon, cfl_rdo_stats_neon, cfl_regression_neon,
+    apply_cfl_neon, cfl_rd_cost_neon, cfl_rdo_block_neon, cfl_rdo_refill_neon, cfl_rdo_stats_neon,
+    cfl_regression_neon,
 };
 pub(crate) use color::color_matrix_shaper_neon;
 pub(crate) use dc_ops::{adjust_b_dc_neon, compensate_b_dc_neon, reconstruct_dc_neon};
@@ -76,7 +78,8 @@ pub(crate) use frame::chroma_gradient_sums_neon;
 pub(crate) use haar::haar_rows_neon;
 pub(crate) use inflated_cost::{
     combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
-    recon_dist_and_rate_neon, rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
+    recon_chroma_phase_neon, recon_dist_and_rate_neon, recon_luma_phase_neon,
+    rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lz_match::{match_len_compact_neon, match_len_neon};
@@ -84,6 +87,7 @@ pub(crate) use modular::{
     tokenize_alpha_u8_first_row_neon, tokenize_alpha_u8_interior_neon,
     tokenize_alpha_u16_first_row_neon, tokenize_alpha_u16_interior_neon,
 };
+pub(crate) use noise::{noise_laplacian_stats_neon, noise_shrink_neon, noise_texture_score_neon};
 pub(crate) use quant::{
     quantize_block_ac_neon, quantize_dc_cfl_i32_neon, quantize_dc_cfl_neon, quantize_dc_i32_neon,
     quantize_dc_neon,

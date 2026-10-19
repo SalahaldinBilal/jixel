@@ -10,3 +10,6 @@ docs
 Cargo.lock
 .DS_Store
 scratchpad
+
+# built third-party decoder used for block-map dumps
+tools/jxlatte/jxlatte.jar

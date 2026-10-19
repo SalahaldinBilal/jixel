@@ -159,6 +159,8 @@ pub(crate) struct EncodingContext {
     pub(crate) sse_and_rate: inflated_cost::SseAndRateFn,
     pub(crate) sse_and_quantize: inflated_cost::SseAndQuantizeFn,
     pub(crate) recon_dist_and_rate: inflated_cost::ReconDistAndRateFn,
+    pub(crate) recon_luma_phase: inflated_cost::ReconLumaPhaseFn,
+    pub(crate) recon_chroma_phase: inflated_cost::ReconChromaPhaseFn,
     pub(crate) recon_error_kernels: inflated_cost::ReconErrorKernels,
     pub(crate) rate_log2_lut: &'static inflated_cost::RateLog2Lut,
     pub(crate) quantize_block_ac: group::QuantizeBlockAcFn,
@@ -173,8 +175,10 @@ pub(crate) struct EncodingContext {
     pub(crate) gradient_region_stats_with_chroma: ac_strategy::GradientRegionStatsFn,
     pub(crate) cfl_regression: color_correlation::CflRegressionFn,
     pub(crate) cfl_rdo_block: color_correlation::CflRdoBlockFn,
+    pub(crate) cfl_rdo_refill: color_correlation::CflRdoRefillFn,
     pub(crate) cfl_rdo_stats: color_correlation::CflRdoStatsFn,
     pub(crate) cfl_rd_cost: color_correlation::CflRdCostFn,
+    pub(crate) noise_kernels: crate::noise::NoiseKernels,
     pub(crate) chroma_gradient_sums: frame::ChromaGradientSumsFn,
     pub(crate) fill_ytob_row: color_correlation::FillYtobRowFn,
     pub(crate) accumulate_ytob_weights: color_correlation::AccumulateYtobWeightsFn,
@@ -377,12 +381,14 @@ impl EncodingContext {
     /// Resolve the non-XYB frame's tables from its coded planes.
     pub(crate) fn set_plain_matrices(&self, coded: &crate::image::Image3F) {
         self.plain_matrices.get_or_init(|| {
+            let effort = self.speed.effort();
             DequantMatrices::new_plain(
                 self.plain_distance,
-                self.speed.effort().rectangles,
+                effort.rectangles,
                 self.arbiter,
                 self.coding,
                 self.coding.plane_scale(coded),
+                effort.layout_retile && !effort.layout_loop,
             )
         });
     }
@@ -476,8 +482,9 @@ impl EncodingContext {
         let dc_from_dct = dct::selected_dc_from_dct_methods();
         let afv = afv::selected_afv_methods();
         let effort = speed.effort();
+        let retile = effort.layout_retile && !effort.layout_loop;
         let base_matrices = if effort.rectangles {
-            DequantMatrices::new(distance, arbiter)
+            DequantMatrices::new(distance, arbiter, retile)
         } else {
             DequantMatrices::new_fast(distance, arbiter)
         };
@@ -517,19 +524,23 @@ impl EncodingContext {
             point_chroma_hq_matrices: (effort.chroma_policy
                 && distance < crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE)
                 .then(|| {
-                    DequantMatrices::new(crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE, arbiter)
+                    DequantMatrices::new(
+                        crate::quant_weights::QM_FLAT_B8_MIN_DISTANCE,
+                        arbiter,
+                        retile,
+                    )
                 }),
-            sat_matrices: DequantMatrices::new_saturated(distance, arbiter),
+            sat_matrices: DequantMatrices::new_saturated(distance, arbiter, retile),
             pair_b_matrices: if effort.chroma_policy {
-                DequantMatrices::new_pair_b(distance, arbiter)
+                DequantMatrices::new_pair_b(distance, arbiter, retile)
             } else {
                 base_matrices
             },
-            sat_pair_b_matrices: DequantMatrices::new_saturated_pair_b(distance, arbiter),
+            sat_pair_b_matrices: DequantMatrices::new_saturated_pair_b(distance, arbiter, retile),
             x_heavy_matrices: if effort.chroma_policy {
                 DequantMatrices::new_x_heavy(distance, arbiter)
             } else {
-                DequantMatrices::new(0.0, arbiter)
+                DequantMatrices::new(0.0, arbiter, retile)
             },
             chroma_heavy: std::sync::atomic::AtomicBool::new(false),
             point_chroma: std::sync::atomic::AtomicBool::new(false),
@@ -553,6 +564,8 @@ impl EncodingContext {
             sse_and_rate: inflated_cost::selected_sse_and_rate_fn(),
             sse_and_quantize: inflated_cost::selected_sse_and_quantize_fn(),
             recon_dist_and_rate: inflated_cost::select_recon_dist_and_rate_fn(),
+            recon_luma_phase: inflated_cost::select_recon_luma_phase_fn(),
+            recon_chroma_phase: inflated_cost::select_recon_chroma_phase_fn(),
             recon_error_kernels: inflated_cost::ReconErrorKernels {
                 gradient_energy: inflated_cost::select_error_gradient_energy_fn(),
                 gradient_peak_energy: inflated_cost::select_error_gradient_peak_energy_fn(),
@@ -573,8 +586,10 @@ impl EncodingContext {
                 ac_strategy::select_gradient_region_stats_with_chroma_fn(),
             cfl_regression: color_correlation::selected_cfl_regression_fn(),
             cfl_rdo_block: color_correlation::selected_cfl_rdo_block_fn(),
+            cfl_rdo_refill: color_correlation::selected_cfl_rdo_refill_fn(),
             cfl_rdo_stats: color_correlation::selected_cfl_rdo_stats_fn(),
             cfl_rd_cost: color_correlation::selected_cfl_rd_cost_fn(),
+            noise_kernels: crate::noise::selected_noise_kernels(),
             chroma_gradient_sums: frame::selected_chroma_gradient_sums_fn(),
             fill_ytob_row: color_correlation::selected_fill_ytob_row_fn(),
             accumulate_ytob_weights: color_correlation::selected_accumulate_ytob_weights_fn(),
@@ -652,7 +667,7 @@ mod tests {
             let previous = ctx.matrices();
             ctx.set_point_chroma(true);
             let expected = if distance < 0.3 {
-                DequantMatrices::new(0.3, crate::Arbiter::Ssimulacra2)
+                DequantMatrices::new(0.3, crate::Arbiter::Ssimulacra2, false)
             } else {
                 previous
             };
@@ -692,12 +707,12 @@ mod tests {
         );
         assert!(std::ptr::eq(
             ctx.matrices(),
-            DequantMatrices::new(1.0, crate::Arbiter::Ssimulacra2)
+            DequantMatrices::new(1.0, crate::Arbiter::Ssimulacra2, false)
         ));
         ctx.set_chroma_heavy(true);
         assert!(std::ptr::eq(
             ctx.matrices(),
-            DequantMatrices::new_saturated(1.0, crate::Arbiter::Ssimulacra2)
+            DequantMatrices::new_saturated(1.0, crate::Arbiter::Ssimulacra2, false)
         ));
         ctx.set_x_heavy(true);
         assert!(std::ptr::eq(
@@ -707,7 +722,7 @@ mod tests {
         ctx.set_x_heavy(false);
         assert!(std::ptr::eq(
             ctx.matrices(),
-            DequantMatrices::new_saturated(1.0, crate::Arbiter::Ssimulacra2)
+            DequantMatrices::new_saturated(1.0, crate::Arbiter::Ssimulacra2, false)
         ));
     }
 

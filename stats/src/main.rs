@@ -1010,8 +1010,8 @@ fn bench_jixel(
         .with_num_threads(nthreads)
         .with_arbiter(arbiter)
         .with_speed(Speed::ExtraSlow)
-        .with_splines(false)
-        .with_dots(false)
+        .with_splines(true)
+        .with_dots(true)
         .with_vector_layers(true)
         .with_ink_layer(true)
         .with_coding_transform(CodingTransform::Xyb);

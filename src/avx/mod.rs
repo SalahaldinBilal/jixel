@@ -40,6 +40,7 @@ mod inflated_cost;
 mod lossless_grad;
 mod lz_match;
 mod modular;
+mod noise;
 mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
@@ -55,7 +56,8 @@ pub(crate) use ac_strategy::{
 pub(crate) use adaptive_quant::{chroma_hf_stats_avx2, fill_quant_field};
 pub(crate) use afv::{afv0_avx2, afv1_avx2, afv2_avx2, afv3_avx2};
 pub(crate) use cfl::{
-    apply_cfl_avx2, cfl_rd_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_stats_avx2, cfl_regression_avx2,
+    apply_cfl_avx2, cfl_rd_cost_avx2, cfl_rdo_block_avx2, cfl_rdo_refill_avx2, cfl_rdo_stats_avx2,
+    cfl_regression_avx2,
 };
 pub(crate) use color::color_matrix_shaper_avx2;
 pub(crate) use dc_ops::{adjust_b_dc_avx2, compensate_b_dc_avx2, reconstruct_dc_avx2};
@@ -76,7 +78,8 @@ pub(crate) use frame::chroma_gradient_sums_avx2;
 pub(crate) use haar::haar_rows_avx2;
 pub(crate) use inflated_cost::{
     combine_error_avx2, error_gradient_energy_avx2, error_gradient_peak_energy_avx2,
-    recon_dist_and_rate_avx2, rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
+    recon_chroma_phase_avx2, recon_dist_and_rate_avx2, recon_luma_phase_avx2,
+    rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lz_match::{match_len_avx2, match_len_compact_avx2};
@@ -84,6 +87,7 @@ pub(crate) use modular::{
     tokenize_alpha_u8_first_row_avx2, tokenize_alpha_u8_interior_avx2,
     tokenize_alpha_u16_first_row_avx2, tokenize_alpha_u16_interior_avx2,
 };
+pub(crate) use noise::{noise_laplacian_stats_avx2, noise_shrink_avx2, noise_texture_score_avx2};
 pub(crate) use quant::{
     quantize_block_ac_avx2, quantize_dc_avx2, quantize_dc_cfl_avx2, quantize_dc_cfl_i32_avx2,
     quantize_dc_i32_avx2,

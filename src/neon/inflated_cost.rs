@@ -30,8 +30,9 @@
 use super::ac_strategy::neon_log2p1_f32;
 use crate::image::{Image3F, Plane};
 use crate::inflated_cost::{
-    RateLog2Lut, ReconCost, ReconDistInput, ReconErrorKernels, ReconKernels,
-    recon_dist_and_rate_with_kernels, validate_ssim_inputs,
+    LumaPhase, RateLog2Lut, ReconCost, ReconDistInput, ReconErrorKernels, ReconKernels,
+    recon_chroma_phase_with_kernels, recon_dist_and_rate_with_kernels,
+    recon_luma_phase_with_kernels, validate_ssim_inputs,
 };
 use std::arch::aarch64::*;
 
@@ -475,6 +476,43 @@ pub(crate) fn recon_dist_and_rate_neon(
     error: &ReconErrorKernels,
 ) -> ReconCost {
     recon_dist_and_rate_neon_impl::<true>(scratch, input, error)
+}
+
+/// Luma phase of `recon_dist_and_rate_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) fn recon_luma_phase_neon(
+    scratch: &mut [[f32; 4096]; 8],
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
+) -> LumaPhase {
+    recon_luma_phase_with_kernels(scratch, input, &neon_kernels::<true>(input, error))
+}
+
+/// Chroma phase of `recon_dist_and_rate_neon`.
+#[target_feature(enable = "neon")]
+pub(crate) fn recon_chroma_phase_neon(
+    scratch: &mut [[f32; 4096]; 8],
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
+    luma: LumaPhase,
+) -> ReconCost {
+    recon_chroma_phase_with_kernels(scratch, input, &neon_kernels::<true>(input, error), luma)
+}
+
+fn neon_kernels<'a, const BIASED: bool>(
+    input: &ReconDistInput<'_>,
+    error: &'a ReconErrorKernels,
+) -> ReconKernels<'a> {
+    ReconKernels {
+        quantize: if input.quantization.compute_rate {
+            recon_quantize_neon::<BIASED, true>
+        } else {
+            recon_quantize_neon::<BIASED, false>
+        },
+        ssim: ssim_deficit_neon,
+        prepare: prepare_reconstruction_neon,
+        error,
+    }
 }
 
 #[target_feature(enable = "neon")]

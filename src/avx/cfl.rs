@@ -160,6 +160,76 @@ pub(crate) fn cfl_regression_avx2(
     reduce_transposed_4x8(ca_x, cb_x, ca_b, cb_b)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn cfl_rdo_refill_avx2(
+    m_x: &mut [f32],
+    s_x: &mut [f32],
+    m_b: &mut [f32],
+    s_b: &mut [f32],
+    y: &[f32],
+    x: &[f32],
+    b: &[f32],
+    qm_x: &[f32],
+    qm_b: &[f32],
+    params: crate::color_correlation::CflRdoRefillParams,
+) {
+    let len = m_x.len();
+    assert_eq!(s_x.len(), len);
+    assert_eq!(m_b.len(), len);
+    assert_eq!(s_b.len(), len);
+    assert_eq!(y.len(), len);
+    assert_eq!(x.len(), len);
+    assert_eq!(b.len(), len);
+    assert_eq!(qm_x.len(), len);
+    assert_eq!(qm_b.len(), len);
+    let q_block = _mm256_set1_ps(params.q_block);
+    let x_mul = _mm256_set1_ps(params.x_mul);
+    let b_mul = _mm256_set1_ps(params.b_mul);
+    let shift_x = _mm256_set1_ps(params.shift_x);
+    let shift_b = _mm256_set1_ps(params.shift_b);
+    let mut i = 0;
+    while i + 8 <= len {
+        let yv = unsafe { _mm256_loadu_ps(y.as_ptr().add(i)) };
+        let xv = unsafe { _mm256_loadu_ps(x.as_ptr().add(i)) };
+        let bv = unsafe { _mm256_loadu_ps(b.as_ptr().add(i)) };
+        let qx = unsafe { _mm256_loadu_ps(qm_x.as_ptr().add(i)) };
+        let qb = unsafe { _mm256_loadu_ps(qm_b.as_ptr().add(i)) };
+        // Keep the two quantizer multiplications in the scalar order.
+        let qx = _mm256_mul_ps(_mm256_mul_ps(qx, q_block), x_mul);
+        let qb = _mm256_mul_ps(_mm256_mul_ps(qb, q_block), b_mul);
+        let sx = _mm256_fmadd_ps(shift_x, yv, xv);
+        let sb = _mm256_fmadd_ps(shift_b, yv, bv);
+        unsafe {
+            _mm256_storeu_ps(m_x.as_mut_ptr().add(i), _mm256_mul_ps(yv, qx));
+            _mm256_storeu_ps(s_x.as_mut_ptr().add(i), _mm256_mul_ps(sx, qx));
+            _mm256_storeu_ps(m_b.as_mut_ptr().add(i), _mm256_mul_ps(yv, qb));
+            _mm256_storeu_ps(s_b.as_mut_ptr().add(i), _mm256_mul_ps(sb, qb));
+        }
+        i += 8;
+    }
+    if i < len {
+        // Only the remaining lanes may access the input or output slices.
+        let lanes = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+        let mask = _mm256_cmpgt_epi32(_mm256_set1_epi32((len - i) as i32), lanes);
+        let yv = unsafe { _mm256_maskload_ps(y.as_ptr().add(i), mask) };
+        let xv = unsafe { _mm256_maskload_ps(x.as_ptr().add(i), mask) };
+        let bv = unsafe { _mm256_maskload_ps(b.as_ptr().add(i), mask) };
+        let qx = unsafe { _mm256_maskload_ps(qm_x.as_ptr().add(i), mask) };
+        let qb = unsafe { _mm256_maskload_ps(qm_b.as_ptr().add(i), mask) };
+        let qx = _mm256_mul_ps(_mm256_mul_ps(qx, q_block), x_mul);
+        let qb = _mm256_mul_ps(_mm256_mul_ps(qb, q_block), b_mul);
+        let sx = _mm256_fmadd_ps(shift_x, yv, xv);
+        let sb = _mm256_fmadd_ps(shift_b, yv, bv);
+        unsafe {
+            _mm256_maskstore_ps(m_x.as_mut_ptr().add(i), mask, _mm256_mul_ps(yv, qx));
+            _mm256_maskstore_ps(s_x.as_mut_ptr().add(i), mask, _mm256_mul_ps(sx, qx));
+            _mm256_maskstore_ps(m_b.as_mut_ptr().add(i), mask, _mm256_mul_ps(yv, qb));
+            _mm256_maskstore_ps(s_b.as_mut_ptr().add(i), mask, _mm256_mul_ps(sb, qb));
+        }
+    }
+}
+
 #[target_feature(enable = "avx2")]
 pub(crate) fn cfl_rdo_block_avx2(
     m_x: &mut [f32; 63],

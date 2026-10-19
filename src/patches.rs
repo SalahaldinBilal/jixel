@@ -171,6 +171,20 @@ pub(crate) fn find_lossy_patches_sized(
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
 ) -> Option<LossyPatches> {
+    let groups = find_lossy_patch_groups_sized(linear, tile, near, pool, scratch)?;
+    let base = tile_patch_residual(linear, tile, &groups, pool, scratch);
+    Some(LossyPatches { base, groups })
+}
+
+/// Detect groups without allocating a full-frame residual. The caller can
+/// check coverage and pack atlases before clearing tiles in its owned image.
+pub(crate) fn find_lossy_patch_groups_sized(
+    linear: &Image3F,
+    tile: usize,
+    near: f32,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+) -> Option<Vec<Vec<(usize, usize)>>> {
     let width = linear.xsize();
     let height = linear.ysize();
     if width < tile || height < tile {
@@ -481,8 +495,20 @@ pub(crate) fn find_lossy_patches_sized(
     for g in &mut groups {
         g[1..].sort_unstable_by_key(|&(x, y)| (y, x));
     }
-    let base = tile_patch_residual(linear, tile, &groups, pool, scratch);
-    Some(LossyPatches { base, groups })
+    Some(groups)
+}
+
+/// Apply a detected plan after its atlas has been copied from the source.
+pub(crate) fn clear_patch_tiles(base: &mut Image3F, tile: usize, groups: &[Vec<(usize, usize)>]) {
+    for positions in groups {
+        for &(x, y) in positions {
+            for c in 0..3 {
+                for dy in 0..tile {
+                    base.plane_row_mut(c, y + dy)[x..x + tile].fill(0.0);
+                }
+            }
+        }
+    }
 }
 
 /// Copy only the uncovered spans into an initially zero residual. Copying the
@@ -1907,6 +1933,12 @@ mod tests {
                 find_lossy_patches_sized(&img, tile, 0.0, &parallel_pool, &mut scratch).unwrap();
             assert!(serial.groups.len() >= 20);
             assert_eq!(serial.groups, parallel.groups);
+            let groups =
+                find_lossy_patch_groups_sized(&img, tile, 0.0, &parallel_pool, &mut scratch)
+                    .unwrap();
+            assert_eq!(groups, serial.groups);
+            let mut in_place = img.clone();
+            clear_patch_tiles(&mut in_place, tile, &groups);
             let mut expected = img.clone();
             for group in &serial.groups {
                 for &(x, y) in group {
@@ -1926,6 +1958,9 @@ mod tests {
                 {
                     assert_eq!(want.to_bits(), serial.to_bits());
                     assert_eq!(want.to_bits(), parallel.to_bits());
+                }
+                for (got, want) in in_place.plane_data(c).iter().zip(serial.base.plane_data(c)) {
+                    assert_eq!(got.to_bits(), want.to_bits());
                 }
             }
         }

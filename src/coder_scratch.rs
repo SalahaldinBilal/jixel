@@ -384,6 +384,19 @@ pub(crate) struct CoderScratch {
 }
 
 impl CoderScratch {
+    /// Selection and CfL are finished before AC groups are tokenized. Release
+    /// their working sets before this worker grows its coefficient/token buffers.
+    /// Repeated AC groups keep reusing their own scratch as usual.
+    pub(crate) fn finish_strategy_search(&mut self) {
+        self.ac_strategy = AcStrategyPipelineScratch::default();
+        self.dct8_costs = Vec::new();
+        self.aq_map = AqMapScratch::default();
+        self.recon.value = None;
+        self.transform_gather.value = None;
+        self.strategy_coeffs.value = None;
+        self.cfl_rdo.value = None;
+    }
+
     fn new(reserve_lossy_buffers: bool) -> Self {
         let (aq_map, gradient, order0_entropy, threshold) = if reserve_lossy_buffers {
             (

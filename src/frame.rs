@@ -2352,7 +2352,7 @@ fn encode_frame_vardct(
         before_tiles: false,
     });
     if !patches {
-        return prepare_vardct_variant(
+        let prepared = prepare_vardct_variant(
             ctx,
             scratch,
             distance,
@@ -2365,8 +2365,10 @@ fn encode_frame_vardct(
             true,
             #[cfg(feature = "splines")]
             stage.as_ref(),
-        )?
-        .encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
+        )?;
+        #[cfg(feature = "splines")]
+        drop(spline_candidates);
+        return prepared.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
     }
 
     // Compare bounded residual samples plus the actual atlas, dictionary and
@@ -2389,12 +2391,18 @@ fn encode_frame_vardct(
     )?;
     if !best.used_tiles && lattice.is_none() {
         drop(xyb);
+        drop(glyphs);
+        #[cfg(feature = "splines")]
+        drop(spline_candidates);
         return best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer);
     }
     #[allow(unused_mut)]
     let mut best_bits = best.estimate(ctx, scratch, distance, alpha, coeff_shifts)?;
     if let Some(plan) = lattice {
         drop(xyb);
+        drop(glyphs);
+        #[cfg(feature = "splines")]
+        drop(spline_candidates);
         // A lattice arm codes what the tile leaves at the frame's own distance,
         // where an exact-tile plan repeats it at the finer atlas distance, so
         // near-equal bits buy only a coarser remainder.
@@ -2455,6 +2463,9 @@ fn encode_frame_vardct(
     } else {
         drop(no_tiles);
     }
+    drop(glyphs);
+    #[cfg(feature = "splines")]
+    drop(spline_candidates);
     best.encode(ctx, scratch, distance, alpha, coeff_shifts, writer)
 }
 
@@ -2676,7 +2687,7 @@ fn prepare_vardct_variant(
                 scratch,
             );
             let after16 = tiles16.as_ref().map_or(&base, |t| &t.base);
-            let tiles8 = crate::patches::find_lossy_patches_sized(
+            let tiles8 = crate::patches::find_lossy_patch_groups_sized(
                 after16,
                 8,
                 near_tiles,
@@ -2686,9 +2697,9 @@ fn prepare_vardct_variant(
             let covered = tiles16
                 .as_ref()
                 .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 256)
-                + tiles8
-                    .as_ref()
-                    .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 64);
+                + tiles8.as_ref().map_or(0, |groups| {
+                    groups.iter().map(|g| g.len()).sum::<usize>() * 64
+                });
             if covered as f64 >= PATCH_TILE_MIN_COVER * (base.xsize() * base.ysize()) as f64 {
                 let mut tile_refs = Vec::new();
                 let mut tile_atlas: Option<Image3F> = None;
@@ -2700,9 +2711,11 @@ fn prepare_vardct_variant(
                     tile_refs = refs;
                     next_base = Some(t.base);
                 }
-                if let Some(t) = tiles8 {
+                if let Some(groups8) = tiles8 {
+                    let residual = next_base.get_or_insert_with(|| base.clone());
+                    crate::patches::clear_patch_tiles(residual, 8, &groups8);
                     let (reused, groups8) =
-                        crate::patches::reuse_tile_quadrants(&base, &tile_refs, t.groups);
+                        crate::patches::reuse_tile_quadrants(&base, &tile_refs, groups8);
                     tile_refs.extend(reused);
                     if !groups8.is_empty() {
                         let (atlas8, mut refs8) =
@@ -2713,7 +2726,6 @@ fn prepare_vardct_variant(
                         });
                         tile_refs.extend(refs8);
                     }
-                    next_base = Some(t.base);
                 }
                 let tile_atlas = tile_atlas.expect("covered > 0");
                 let atlas_distance = distance * ATLAS_DISTANCE_SCALE;
@@ -2826,7 +2838,7 @@ fn prepare_vardct_variant(
             scratch,
         );
         let after16 = plan16.as_ref().map_or(&xyb, |p| &p.base);
-        let tiles8 = crate::patches::find_lossy_patches_sized(
+        let tiles8 = crate::patches::find_lossy_patch_groups_sized(
             after16,
             8,
             near_tiles,
@@ -2836,9 +2848,9 @@ fn prepare_vardct_variant(
         let covered = plan16
             .as_ref()
             .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 256)
-            + tiles8
-                .as_ref()
-                .map_or(0, |t| t.groups.iter().map(|g| g.len()).sum::<usize>() * 64);
+            + tiles8.as_ref().map_or(0, |groups| {
+                groups.iter().map(|g| g.len()).sum::<usize>() * 64
+            });
         (covered as f64 >= PATCH_TILE_MIN_COVER * (xyb.xsize() * xyb.ysize()) as f64).then(|| {
             let plan = plan16.unwrap_or_else(|| crate::patches::LossyPatches {
                 base: xyb.clone(),
@@ -2961,9 +2973,10 @@ fn prepare_vardct_variant(
             vardct_atlas = Some(atlas);
             references.extend(vardct_refs);
         }
-        if let Some(t) = tiles8 {
+        if let Some(groups8) = tiles8 {
+            crate::patches::clear_patch_tiles(&mut base, 8, &groups8);
             let (reused, groups8) =
-                crate::patches::reuse_tile_quadrants(&xyb, &references, t.groups);
+                crate::patches::reuse_tile_quadrants(&xyb, &references, groups8);
             references.extend(reused);
             if !groups8.is_empty() {
                 let (atlas8, mut refs8) =
@@ -2974,7 +2987,6 @@ fn prepare_vardct_variant(
                 });
                 references.extend(refs8);
             }
-            base = t.base;
         }
         if let Some(atlas) = vardct_atlas {
             encode_vardct_atlas(atlas, scratch, &mut patched_writer)?;
@@ -5215,7 +5227,6 @@ fn run_quant_field_loop(
         return None;
     }
     let reference = crate::ssimulacra2::Ssimulacra2Reference::new(opsin)?;
-    let metric = |recon: &Image3F| reference.deficit_and_map(recon);
     let blocks_per_dc = K_DC_GROUP_DIM / K_BLOCK_DIM;
 
     let group_map = LoopGroupMap::new(w, h, group_coords, ac_tasks);
@@ -5669,6 +5680,29 @@ fn run_quant_field_loop(
             if r_f - r_p < 1e-3 {
                 break;
             }
+            // Score one full-frame workspace at a time. Retain only tile
+            // summaries, then reuse the plain evaluation for the coarse arm.
+            // Each score and token reduction is identical to the independent
+            // full-frame comparisons; only their storage lifetimes change.
+            let (d_p, map_p) = if SHIFT_RDOQ {
+                (cur_d, cur_map.clone())
+            } else {
+                reference.deficit_and_map(&plain.recon)
+            };
+            let map_0 = tile_sums(&map_p);
+            drop(map_p);
+            let (d_f, fine_map) = reference.deficit_and_map(&fine.recon);
+            let map_f = tile_sums(&fine_map);
+            drop(fine_map);
+            let bits_f = tile_bits(&block_bits(&fine));
+            let bits_0 = tile_bits(&block_bits(&plain));
+            let cv_pf = loop_state
+                .as_mut()
+                .and_then(LoopArbiter::cvvdp)
+                .map(|judge| {
+                    [&plain, &fine].map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)))
+                });
+            drop(fine);
             // The coarser shift covers half the groups (slope estimate only).
             let half_tasks: Vec<usize> = (0..ac_tasks.len()).step_by(2).collect();
             let half_moves: Vec<(usize, i8)> = (0..n_tiles)
@@ -5679,7 +5713,7 @@ fn run_quant_field_loop(
                 .map(|t| (t, -1))
                 .collect();
             let (_, saved) = apply(dc_datas, &half_moves);
-            let mut coarse = plain.clone();
+            let mut coarse = plain;
             evaluate(
                 ctx,
                 scratch,
@@ -5702,19 +5736,7 @@ fn run_quant_field_loop(
             );
             restore(dc_datas, saved);
             let r_c = rate_term(frame_bits(&coarse));
-            // Bound simultaneous whole-frame workspaces to two. This does not
-            // change any score or its reduction order; the coarse map is unused.
-            let recons = [&plain.recon, &fine.recon, &coarse.recon];
-            let mut scored = ctx
-                .thread_pool
-                .steal_map(scratch, 2, |i, _| metric(recons[i]));
-            let d_c = reference.deficit(recons[2]);
-            let (d_f, fine_map) = scored.pop().expect("fine score");
-            let (d_p, map_p) = if SHIFT_RDOQ {
-                (cur_d, cur_map.clone())
-            } else {
-                scored.pop().expect("plain score")
-            };
+            let d_c = reference.deficit(&coarse.recon);
             let s_fine = (d_p - d_f) / (r_f - r_p);
             let s_coarse = if r_p - r_c > 1e-3 {
                 (d_c - d_p) / (r_p - r_c)
@@ -5726,9 +5748,12 @@ fn run_quant_field_loop(
                 break;
             }
             let mut cv_flat = false;
-            if let Some(judge) = loop_state.as_mut().and_then(LoopArbiter::cvvdp) {
-                let [cv_p, cv_f, cv_c] = [&plain, &fine, &coarse]
-                    .map(|e| judge.deficit_of(&e.recon, &decoded_dc(e, distp)));
+            if let Some([cv_p, cv_f]) = cv_pf {
+                let judge = loop_state
+                    .as_mut()
+                    .and_then(LoopArbiter::cvvdp)
+                    .expect("CV judge");
+                let cv_c = judge.deficit_of(&coarse.recon, &decoded_dc(&coarse, distp));
                 let s_fine = (cv_p - cv_f) / (r_f - r_p);
                 let s_coarse = if r_p - r_c > 1e-3 {
                     (cv_c - cv_p) / (r_p - r_c)
@@ -5738,6 +5763,7 @@ fn run_quant_field_loop(
                 cv_slope = SLOPE_SCALE * 0.5 * (s_fine + s_coarse);
                 cv_flat = !(cv_slope.is_finite() && cv_slope > 0.0);
             }
+            drop(coarse);
             // Near transparency ColorVideoVDP no longer separates the shifts;
             // SSIMULACRA2 arbitrates the frame instead of the loop stopping.
             if cv_flat {
@@ -5746,10 +5772,6 @@ fn run_quant_field_loop(
                 cur_d = state.deficit();
                 loop_state = Some(state);
             }
-            let map_f = tile_sums(&fine_map);
-            let bits_f = tile_bits(&block_bits(&fine));
-            let map_0 = tile_sums(&map_p);
-            let bits_0 = tile_bits(&block_bits(&plain));
             // Per tile: deficit gain (frame units) minus slope times rate cost (%).
             // Only finer moves: coarsening smooth tiles is a blind spot of mean
             // MS-SSIM that SSIMULACRA2 punishes, and edge-difference terms did not
@@ -6809,7 +6831,16 @@ fn run_quant_field_loop(
     if race_slope > 0.0 && ctx.coding.is_xyb() {
         let slope = race_slope;
         let b_start = ctx.b_qm_scale();
-        let mut judge = loop_state.as_mut().and_then(LoopArbiter::cvvdp);
+        // No more regional updates: full-frame comparisons do not read the
+        // incremental pyramid, or any accepted evaluation's reconstruction.
+        let mut judge = match loop_state.take() {
+            Some(LoopArbiter::Cvvdp(mut judge)) => {
+                judge.finish_updates();
+                Some(judge)
+            }
+            _ => None,
+        };
+        cur.recon = Image3F::new(0, 0);
         let mut score = |e: &Eval| -> f32 {
             match judge.as_deref_mut() {
                 Some(judge) => judge.deficit_of(&e.recon, &decoded_dc(e, distp)),
@@ -6871,12 +6902,13 @@ fn run_quant_field_loop(
                     if tried.contains(&(x, b)) {
                         break;
                     }
-                    let (e, bits) = arm_eval(x, b, scratch);
+                    let (mut e, bits) = arm_eval(x, b, scratch);
                     let d = score(&e);
                     let j = -d - slope * rate_term(bits);
                     tried.push((x, b));
                     if j > best.0 + 1e-6 {
                         best = (j, x, b);
+                        e.recon = Image3F::new(0, 0);
                         best_eval = Some(e);
                     } else {
                         break;
@@ -7264,6 +7296,7 @@ fn process_ac_group(
     capture_recon: bool,
     block_memo: Option<&mut Option<crate::group::AcBlockCache>>,
 ) -> ProcessedAcGroup {
+    scratch.finish_strategy_search();
     let image_gx = dc_gx * (K_DC_GROUP_DIM / K_GROUP_DIM) + gx;
     let image_gy = dc_gy * (K_DC_GROUP_DIM / K_GROUP_DIM) + gy;
     let group_x0 = image_gx * K_GROUP_DIM;

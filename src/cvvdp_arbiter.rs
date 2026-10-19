@@ -169,6 +169,14 @@ impl CvvdpArbiter {
             .distortion as f32
     }
 
+    /// Full-frame trials only need the reference and comparison workspace.
+    /// Release the accepted frame's incremental pyramid and RGB staging once
+    /// the last regional update has finished.
+    pub(crate) fn finish_updates(&mut self) {
+        self.state = None;
+        self.linear = Default::default();
+    }
+
     /// Make `recon` with `decoded_dc` the accepted frame that updates follow.
     pub(crate) fn reset(&mut self, recon: &Image3F, decoded_dc: &Image3F) {
         let mut linear = std::mem::take(&mut self.linear);
@@ -230,5 +238,37 @@ impl CvvdpArbiter {
             }
         }
         self.state.as_mut().expect("reset").rollback(&cp.state);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_frame_scores_survive_releasing_incremental_storage() {
+        let mut source = Image3F::new(65, 49);
+        for c in 0..3 {
+            for y in 0..source.ysize() {
+                for x in 0..source.xsize() {
+                    source.plane_row_mut(c, y)[x] = if c == 1 { 0.4 } else { 0.0 }
+                        + ((x * 173 + y * 311 + c * 71) % 997) as f32 / 20000.0;
+                }
+            }
+        }
+        let mut judge = CvvdpArbiter::new(&source).unwrap();
+        let dc = judge.source_dc.clone();
+        judge.reset(&source, &dc);
+        let mut recon = source.clone();
+        for v in recon.plane_mut(1).as_mut_slice() {
+            *v += 0.01;
+        }
+        let before = judge.deficit_of(&recon, &dc);
+        judge.finish_updates();
+        let after = judge.deficit_of(&recon, &dc);
+        assert!(before.is_finite());
+        assert_eq!(after.to_bits(), before.to_bits());
+        assert!(judge.state.is_none());
+        assert!(judge.linear.iter().all(|plane| plane.capacity() == 0));
     }
 }

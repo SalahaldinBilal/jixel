@@ -40,6 +40,7 @@ mod lossless_grad;
 #[cfg(target_arch = "x86_64")]
 mod lz_match;
 mod modular;
+mod noise;
 mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
@@ -67,6 +68,9 @@ pub(crate) use lz_match::{match_len_compact_sse2, match_len_sse2};
 pub(crate) use modular::{
     tokenize_alpha_u8_first_row_sse41, tokenize_alpha_u8_interior_sse41,
     tokenize_alpha_u16_first_row_sse41, tokenize_alpha_u16_interior_sse41,
+};
+pub(crate) use noise::{
+    noise_laplacian_stats_sse41, noise_shrink_sse41, noise_texture_score_sse41,
 };
 pub(crate) use quant::{
     quantize_block_ac_sse41, quantize_dc_cfl_i32_sse41, quantize_dc_cfl_sse41,

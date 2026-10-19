@@ -38,6 +38,7 @@ mod haar;
 mod inflated_cost;
 mod lossless_grad;
 mod lz_match;
+mod noise;
 mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
@@ -66,6 +67,7 @@ pub(crate) use inflated_cost::{
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lz_match::{match_len_compact_wasm, match_len_wasm};
+pub(crate) use noise::{noise_laplacian_stats_wasm, noise_shrink_wasm, noise_texture_score_wasm};
 pub(crate) use quant::{
     quantize_block_ac_wasm, quantize_dc_cfl_i32_wasm, quantize_dc_cfl_wasm, quantize_dc_i32_wasm,
     quantize_dc_wasm,

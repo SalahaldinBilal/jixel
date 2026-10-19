@@ -40,6 +40,7 @@ mod inflated_cost;
 mod lossless_grad;
 mod lz_match;
 mod modular;
+mod noise;
 mod quant;
 mod quantize_xyb;
 #[cfg(feature = "splines")]
@@ -86,6 +87,7 @@ pub(crate) use modular::{
     tokenize_alpha_u8_first_row_avx2, tokenize_alpha_u8_interior_avx2,
     tokenize_alpha_u16_first_row_avx2, tokenize_alpha_u16_interior_avx2,
 };
+pub(crate) use noise::{noise_laplacian_stats_avx2, noise_shrink_avx2, noise_texture_score_avx2};
 pub(crate) use quant::{
     quantize_block_ac_avx2, quantize_dc_avx2, quantize_dc_cfl_avx2, quantize_dc_cfl_i32_avx2,
     quantize_dc_i32_avx2,

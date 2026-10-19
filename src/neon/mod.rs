@@ -76,7 +76,8 @@ pub(crate) use frame::chroma_gradient_sums_neon;
 pub(crate) use haar::haar_rows_neon;
 pub(crate) use inflated_cost::{
     combine_error_neon, error_gradient_energy_neon, error_gradient_peak_energy_neon,
-    recon_dist_and_rate_neon, rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
+    recon_chroma_phase_neon, recon_dist_and_rate_neon, recon_luma_phase_neon,
+    rgb_hue_chroma_edge_loss_neon, ssim_deficit_neon,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lz_match::{match_len_compact_neon, match_len_neon};

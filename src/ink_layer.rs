@@ -74,6 +74,8 @@ const MIN_SECONDARY_GAIN_PER_PIXEL: f64 = 0.004;
 /// Band pixels per stroke pixel above which the strokes are thin text
 /// (0.9-1.3; cel art and doodles sit at 0.15-0.5).
 const MAX_TEXT_BAND_RATIO: f32 = 0.7;
+/// Mean stroke component size (pixels) up to which the strokes are glyphs.
+const MAX_GLYPH_COMPONENT: usize = 256;
 #[cfg(test)]
 const DIFFUSION_ITERS: usize = 60;
 
@@ -85,9 +87,9 @@ pub(crate) struct InkLayers {
     pub(crate) ink: Vec<u8>,
     /// Coverage of the ink, 255 on the strokes and partial on the band.
     pub(crate) coverage: Vec<u8>,
-    /// The strokes are mostly band: thin text, which repeated-glyph patches
-    /// may code better.
-    pub(crate) thin_text: bool,
+    /// The strokes are mostly band or small components: text, which
+    /// repeated-glyph patches may code better.
+    pub(crate) glyph_text: bool,
 }
 
 const UNGROWN: u8 = 1;
@@ -311,6 +313,7 @@ fn joint_split(
     }
     const VISITED: u8 = 0x80;
     let mut counts = vec![0usize; plans.len()];
+    let mut components = vec![0usize; plans.len()];
     // Squared error of drawing the strokes in the flat ink color.
     let mut squares = vec![0u64; plans.len()];
     let mut seed = 0;
@@ -350,6 +353,7 @@ fn joint_split(
             }
         } else {
             counts[k] += queue.len();
+            components[k] += 1;
             squares[k] += square;
         }
         seed += 1;
@@ -640,11 +644,11 @@ fn joint_split(
         }
     }
     let band: usize = band.iter().sum();
-    let core: usize = (0..plans.len())
-        .filter(|&k| slots[k] != usize::MAX)
-        .map(|k| counts[k])
-        .sum();
-    let thin_text = (band as f32) >= MAX_TEXT_BAND_RATIO * core as f32;
+    let kept = || (0..plans.len()).filter(|&k| slots[k] != usize::MAX);
+    let core: usize = kept().map(|k| counts[k]).sum();
+    let components: usize = kept().map(|k| components[k]).sum();
+    let glyph_text = (band as f32) >= MAX_TEXT_BAND_RATIO * core as f32
+        || core <= MAX_GLYPH_COMPONENT * components;
     fill_dont_care_with_iters(&mut base, thin, width, height, queue, 8);
     for &i in &fringe {
         base[i] = rgb[i].map(f32::from);
@@ -658,7 +662,7 @@ fn joint_split(
         inks,
         ink,
         coverage,
-        thin_text,
+        glyph_text,
     })
 }
 
@@ -944,7 +948,7 @@ mod tests {
         let rgb: Vec<_> = (0..height)
             .flat_map(|y| {
                 (0..width).flat_map(move |x| {
-                    if (8..88).contains(&y) && (x < 2 || x >= 158) {
+                    if (8..88).contains(&y) && !(2..158).contains(&x) {
                         inks[0]
                     } else if (8..88).contains(&y) && (77..79).contains(&x) {
                         inks[1]

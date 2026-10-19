@@ -57,8 +57,8 @@ pub(crate) use rate_prices::RatePrices;
 use rate_prices::RatePricesScope;
 
 pub(crate) use selection::{
-    Chosen32Cost, FineMosaicScratch, LeafChoice, Recon64Scratch, SavedChild, aggregate_quant,
-    fill_ac_strategy,
+    Chosen32Cost, FineMosaicScratch, LayoutDpScratch, LeafChoice, Recon64Scratch, SavedChild,
+    aggregate_quant, fill_ac_strategy,
 };
 
 const DCT8_ONLY_MAX_DISTANCE: f32 = 0.056_713_393;
@@ -120,7 +120,6 @@ pub(crate) const RD_LAMBDA: f32 = 0.080_867_17;
 const MERGE_PRESCREEN_BITS: f32 = 600.0;
 
 const RERANK_META_R: f32 = 2.6465739748323758;
-const RERANK_DOWNGRADE_MARGIN: Banded = Banded::new(1.0, 0.891_814_53);
 
 const RERANK_LAMBDA_LO: f32 = 0.25;
 const RERANK_LAMBDA_HI: f32 = 10.0;
@@ -207,7 +206,9 @@ pub(crate) struct MergeTuning {
     pub(crate) accept_16: f32,
     pub(crate) accept_32_rect: f32,
     pub(crate) accept_32: f32,
-    /// See [`RERANK_DOWNGRADE_MARGIN`].
+    /// Fraction of a merge's reconstruction cost a subdivision must beat to
+    /// replace it in the rerank: 1 (any better subdivision wins), or 0 for
+    /// arbiters whose reranks never downgrade.
     pub(crate) rerank_margin: f32,
     /// Heterogeneity merge-risk gate strength (see [`MERGE_RISK_K`]).
     pub(crate) risk_k: f32,
@@ -226,7 +227,6 @@ const VLQ_MARGIN_32: f32 = 0.029_25;
 const VLQ_BIAS_16X16: f32 = 0.880;
 const VLQ_BIAS_32X32: f32 = 0.867;
 const VLQ_BIAS_RECT32: f32 = 1.180;
-const VLQ_RERANK_MARGIN: f32 = 0.7384;
 const VLQ_ACCEPT_64: f32 = 0.973;
 const VLQ_ACCEPT_64_RECT: f32 = 0.736;
 
@@ -242,7 +242,7 @@ impl MergeTuning {
             accept_16: accept(MERGE_MARGIN_16),
             accept_32_rect: accept(MERGE_MARGIN_32_RECT),
             accept_32: accept(MERGE_MARGIN_32),
-            rerank_margin: RERANK_DOWNGRADE_MARGIN.at(distance),
+            rerank_margin: 1.0,
             risk_k: if crate::adaptive_quant::aq_dampen(distance) > 0.0 {
                 MERGE_RISK_K
             } else {
@@ -262,7 +262,6 @@ impl MergeTuning {
             tuning.accept_16 = lerp(tuning.accept_16, 1.0 - VLQ_MARGIN_16);
             tuning.accept_32_rect = lerp(tuning.accept_32_rect, 1.0 - VLQ_MARGIN_32_RECT);
             tuning.accept_32 = lerp(tuning.accept_32, 1.0 - VLQ_MARGIN_32);
-            tuning.rerank_margin = lerp(tuning.rerank_margin, VLQ_RERANK_MARGIN);
             tuning.accept_64 = lerp(tuning.accept_64, VLQ_ACCEPT_64);
             tuning.accept_64_rect = lerp(tuning.accept_64_rect, VLQ_ACCEPT_64_RECT);
         }
@@ -697,6 +696,45 @@ fn reconstruction_strategy_cost_and_base(
     gradient_peak_alpha: f32,
     spatial_errors: Option<[&mut [f32]; 3]>,
 ) -> ReconStrategyCost {
+    reconstruction_strategy_cost_bounded(
+        ctx,
+        scratch,
+        strategy,
+        opsin,
+        px,
+        py,
+        qac,
+        qm_mult_x,
+        meta_r,
+        distance,
+        cmap_factor,
+        gradient_alpha,
+        gradient_peak_alpha,
+        spatial_errors,
+        f32::INFINITY,
+    )
+}
+
+/// `reconstruction_strategy_cost_and_base` that gives up, with an infinite
+/// cost, once the luma channel alone proves the cost exceeds `limit`.
+#[allow(clippy::too_many_arguments)]
+fn reconstruction_strategy_cost_bounded(
+    ctx: &EncodingContext,
+    scratch: &mut CoderScratch,
+    strategy: u8,
+    opsin: &Image3F,
+    px: usize,
+    py: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    meta_r: f32,
+    distance: f32,
+    cmap_factor: [f32; 3],
+    gradient_alpha: f32,
+    gradient_peak_alpha: f32,
+    spatial_errors: Option<[&mut [f32]; 3]>,
+    limit: f32,
+) -> ReconStrategyCost {
     let CoderScratch {
         strategy_coeffs: coeffs,
         transform_gather,
@@ -705,40 +743,164 @@ fn reconstruction_strategy_cost_and_base(
         ..
     } = scratch;
     let prices = rate_prices.as_deref();
-    let (cx, cy, _) = prepare_strategy_coeffs(
-        ctx,
-        coeffs,
-        transform_gather,
-        strategy,
-        opsin,
-        px,
-        py,
-        cmap_factor,
-    );
     let keep_spatial_errors = spatial_errors.is_some();
+    let infinite = |distortion: f32, rate: f32| ReconStrategyCost {
+        cost: f32::INFINITY,
+        base: f32::NAN,
+        distortion,
+        rate,
+        hue_distortion: 0.0,
+    };
+    let (cx, cy, cost) = if !limit.is_finite() {
+        let (cx, cy, _) = prepare_strategy_coeffs(
+            ctx,
+            coeffs,
+            transform_gather,
+            strategy,
+            opsin,
+            px,
+            py,
+            cmap_factor,
+        );
+        let cost = reconstruction_dist_and_rate(
+            ctx,
+            recon,
+            coeffs,
+            strategy,
+            opsin,
+            px,
+            py,
+            qac,
+            qm_mult_x,
+            distance,
+            cmap_factor,
+            cx,
+            cy,
+            gradient_alpha,
+            gradient_peak_alpha,
+            keep_spatial_errors,
+            prices,
+        );
+        (cx, cy, cost)
+    } else {
+        // Luma first: its rate and distortion bound the complete cost from
+        // below (every term is nonnegative and summed in the same order), so
+        // a candidate can be dropped before any chroma work. The learned
+        // rate of the chroma channels needs no reconstruction and tightens
+        // the bound once more before the chroma phase.
+        let table = prices.filter(|prices| prices.has_table(strategy));
+        let lambda = reconstruction_lambda(distance);
+        let coeffs: &mut [[f32; 4096]; 3] = coeffs;
+        let transform_gather: &mut [f32] = &mut transform_gather[..];
+        let (cx, cy) = forward_transform(
+            ctx,
+            transform_gather,
+            strategy,
+            opsin.plane(1),
+            px,
+            py,
+            &mut coeffs[1],
+        );
+        let size = cx * cy * 64;
+        let y_bits = table.map(|prices| {
+            learned_channel_bits(
+                ctx, prices, strategy, &coeffs[1], 1, qac, qm_mult_x, distance, cx, cy,
+            )
+        });
+        let luma = {
+            let input = recon_input(
+                ctx,
+                coeffs,
+                strategy,
+                opsin,
+                px,
+                py,
+                qac,
+                qm_mult_x,
+                distance,
+                cmap_factor,
+                cx,
+                cy,
+                gradient_alpha,
+                gradient_peak_alpha,
+                keep_spatial_errors,
+                table.is_none(),
+            );
+            (ctx.recon_luma_phase)(recon, &input, &ctx.recon_error_kernels)
+        };
+        let luma_distortion = luma.distortion(gradient_alpha, gradient_peak_alpha);
+        let y_rate = match (table, y_bits) {
+            (Some(prices), Some(bits)) => prices.scaled_rate(strategy, distance, bits),
+            _ => luma.rate,
+        };
+        if fmla(lambda, y_rate + meta_r, luma_distortion) > limit {
+            return infinite(luma_distortion, y_rate);
+        }
+        for c in [0, 2] {
+            forward_transform(
+                ctx,
+                transform_gather,
+                strategy,
+                opsin.plane(c),
+                px,
+                py,
+                &mut coeffs[c],
+            );
+        }
+        {
+            let [x, y, b] = coeffs;
+            apply_cfl(ctx, CflXyb { x, y, b }, size, cmap_factor);
+        }
+        let bits = table.map(|prices| {
+            // Summed in channel order.
+            let mut bits = 0f32;
+            bits += learned_channel_bits(
+                ctx, prices, strategy, &coeffs[0], 0, qac, qm_mult_x, distance, cx, cy,
+            );
+            bits += y_bits.expect("priced luma");
+            bits += learned_channel_bits(
+                ctx, prices, strategy, &coeffs[2], 2, qac, qm_mult_x, distance, cx, cy,
+            );
+            bits
+        });
+        let rate = match (table, bits) {
+            (Some(prices), Some(bits)) => Some(prices.scaled_rate(strategy, distance, bits)),
+            _ => None,
+        };
+        if let Some(rate) = rate
+            && fmla(lambda, rate + meta_r, luma_distortion) > limit
+        {
+            return infinite(luma_distortion, rate);
+        }
+        let input = recon_input(
+            ctx,
+            coeffs,
+            strategy,
+            opsin,
+            px,
+            py,
+            qac,
+            qm_mult_x,
+            distance,
+            cmap_factor,
+            cx,
+            cy,
+            gradient_alpha,
+            gradient_peak_alpha,
+            keep_spatial_errors,
+            table.is_none(),
+        );
+        let mut cost = (ctx.recon_chroma_phase)(recon, &input, &ctx.recon_error_kernels, luma);
+        if let Some(rate) = rate {
+            cost.rate = rate;
+        }
+        (cx, cy, cost)
+    };
     let ReconCost {
         distortion,
         rate,
         hue_distortion,
-    } = reconstruction_dist_and_rate(
-        ctx,
-        recon,
-        coeffs,
-        strategy,
-        opsin,
-        px,
-        py,
-        qac,
-        qm_mult_x,
-        distance,
-        cmap_factor,
-        cx,
-        cy,
-        gradient_alpha,
-        gradient_peak_alpha,
-        keep_spatial_errors,
-        prices,
-    );
+    } = cost;
     if let Some(output) = spatial_errors {
         let n = cx * cy * 64;
         for (c, plane) in output.into_iter().enumerate() {
@@ -996,6 +1158,85 @@ fn prepare_strategy_coeffs(
     (cx, cy, size)
 }
 
+/// The reconstruction kernel's input for one candidate.
+#[allow(clippy::too_many_arguments)]
+fn recon_input<'a>(
+    ctx: &'a EncodingContext,
+    coeffs: &'a [[f32; 4096]; 3],
+    strategy: u8,
+    opsin: &'a Image3F,
+    px: usize,
+    py: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    distance: f32,
+    cmap_factor: [f32; 3],
+    cx: usize,
+    cy: usize,
+    gradient_alpha: f32,
+    gradient_peak_alpha: f32,
+    keep_spatial_errors: bool,
+    compute_rate: bool,
+) -> ReconDistInput<'a> {
+    ReconDistInput {
+        idct: ctx.idct,
+        quantization: ReconQuantization {
+            compute_rate,
+            rate_log2_lut: ctx.rate_log2_lut,
+            coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
+            inverse_matrices: [
+                inverse_matrix_for(ctx, strategy, 0),
+                inverse_matrix_for(ctx, strategy, 1),
+                inverse_matrix_for(ctx, strategy, 2),
+            ],
+            qac,
+            qm_mult_x,
+            qm_mult_b: ctx.b_qm_mul(),
+            distance,
+            dequant_bias: std::array::from_fn(|c| ctx.dequant_bias(c)),
+        },
+        transform: ReconTransform {
+            blocks_x: cx,
+            blocks_y: cy,
+            strategy,
+        },
+        source: ReconSource {
+            opsin,
+            x: px,
+            y: py,
+        },
+        scoring: ReconScoring {
+            factor_x: cmap_factor[0],
+            factor_b: cmap_factor[2],
+            channel_weights: ctx.channel_weights(),
+            xyb_matrix: ctx.xyb,
+            rgb_hue_alpha: rerank_rgb_hue_alpha(ctx, distance),
+            gradient_alpha,
+            gradient_peak_alpha,
+            keep_spatial_errors,
+        },
+    }
+}
+
+/// Raw learned bits of one channel's coefficients.
+#[allow(clippy::too_many_arguments)]
+fn learned_channel_bits(
+    ctx: &EncodingContext,
+    prices: &RatePrices,
+    strategy: u8,
+    coeffs: &[f32],
+    c: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    distance: f32,
+    cx: usize,
+    cy: usize,
+) -> f32 {
+    prices
+        .channel_rate_bits(ctx, strategy, coeffs, c, qac, qm_mult_x, distance, cx, cy)
+        .expect("priced table")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruction_dist_and_rate(
     ctx: &EncodingContext,
@@ -1016,57 +1257,38 @@ fn reconstruction_dist_and_rate(
     keep_spatial_errors: bool,
     prices: Option<&RatePrices>,
 ) -> ReconCost {
-    let mut cost = (ctx.recon_dist_and_rate)(
-        recon,
-        &ReconDistInput {
-            idct: ctx.idct,
-            quantization: ReconQuantization {
-                compute_rate: !prices.is_some_and(|prices| prices.has_table(strategy)),
-                rate_log2_lut: ctx.rate_log2_lut,
-                coeffs: [&coeffs[0], &coeffs[1], &coeffs[2]],
-                inverse_matrices: [
-                    inverse_matrix_for(ctx, strategy, 0),
-                    inverse_matrix_for(ctx, strategy, 1),
-                    inverse_matrix_for(ctx, strategy, 2),
-                ],
-                qac,
-                qm_mult_x,
-                qm_mult_b: ctx.b_qm_mul(),
-                distance,
-                dequant_bias: std::array::from_fn(|c| ctx.dequant_bias(c)),
-            },
-            transform: ReconTransform {
-                blocks_x: cx,
-                blocks_y: cy,
-                strategy,
-            },
-            source: ReconSource {
-                opsin,
-                x: px,
-                y: py,
-            },
-            scoring: ReconScoring {
-                factor_x: cmap_factor[0],
-                factor_b: cmap_factor[2],
-                channel_weights: ctx.channel_weights(),
-                xyb_matrix: ctx.xyb,
-                rgb_hue_alpha: rerank_rgb_hue_alpha(ctx, distance),
-                gradient_alpha,
-                gradient_peak_alpha,
-                keep_spatial_errors,
-            },
-        },
-        &ctx.recon_error_kernels,
+    let table = prices.filter(|prices| prices.has_table(strategy));
+    let input = recon_input(
+        ctx,
+        coeffs,
+        strategy,
+        opsin,
+        px,
+        py,
+        qac,
+        qm_mult_x,
+        distance,
+        cmap_factor,
+        cx,
+        cy,
+        gradient_alpha,
+        gradient_peak_alpha,
+        keep_spatial_errors,
+        table.is_none(),
     );
+    let mut cost = (ctx.recon_dist_and_rate)(recon, &input, &ctx.recon_error_kernels);
     // The reconstruction kernel quantizes chroma against the reconstructed
     // luma, so its counts say nothing about the residual priced here.
-    cost.rate = prices
-        .and_then(|prices| {
-            prices.rate(
-                ctx, strategy, coeffs, [false; 3], qac, qm_mult_x, distance, cx, cy,
-            )
-        })
-        .unwrap_or(cost.rate);
+    if let Some(prices) = table {
+        // Summed in channel order.
+        let mut bits = 0f32;
+        for (c, coeffs) in coeffs.iter().enumerate() {
+            bits += learned_channel_bits(
+                ctx, prices, strategy, coeffs, c, qac, qm_mult_x, distance, cx, cy,
+            );
+        }
+        cost.rate = prices.scaled_rate(strategy, distance, bits);
+    }
     cost
 }
 

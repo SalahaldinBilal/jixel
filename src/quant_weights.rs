@@ -115,6 +115,9 @@ pub(crate) const PAIR_B_FINE_MAX_DISTANCE: f32 = QM_SS2_MIN_DISTANCE;
 const QM_SS2_SCALE16: f32 = 0.78;
 const QM_SS2_SCALE32: f32 = 0.89;
 const QM_SS2_SCALE16X32: f32 = 1.20;
+/// The 16x32 scale under the exact layout re-tiling (`layout_retile`), whose
+/// competition needs the coarser table.
+const QM_SS2_SCALE16X32_RETILE: f32 = 0.85;
 const QM_DCT8_Y_HF_SCALE: f32 = 1.25;
 
 static DCT8_BANDS: [[f32; 6]; 3] = [
@@ -2066,20 +2069,31 @@ fn dct16_override(use_ss2: bool, tilt: Option<Arbiter>) -> Option<BandOverride> 
 }
 
 /// `tilt` selects the arbiter's coarse-band 16x16 luma shape (SS2 tables only).
-fn large_tables(use_ss2: bool, tilt: Option<Arbiter>) -> &'static LargeTables {
+fn rect32_scale(retile: bool) -> f32 {
+    if retile {
+        QM_SS2_SCALE16X32_RETILE
+    } else {
+        QM_SS2_SCALE16X32
+    }
+}
+
+fn large_tables(use_ss2: bool, tilt: Option<Arbiter>, retile: bool) -> &'static LargeTables {
     static DEFAULT: std::sync::OnceLock<LargeTables> = std::sync::OnceLock::new();
-    static SS2: std::sync::OnceLock<LargeTables> = std::sync::OnceLock::new();
-    static TILTED: [std::sync::OnceLock<LargeTables>; 2] =
+    static SS2: [std::sync::OnceLock<LargeTables>; 2] =
         [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    static TILTED: [[std::sync::OnceLock<LargeTables>; 2]; 2] = [
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+    ];
     let cache = match tilt {
-        Some(a) => &TILTED[a as usize],
-        None if use_ss2 => &SS2,
+        Some(a) => &TILTED[a as usize][usize::from(retile)],
+        None if use_ss2 => &SS2[usize::from(retile)],
         None => &DEFAULT,
     };
     cache.get_or_init(|| {
         let o16 = dct16_override(use_ss2, tilt);
         let o32 = use_ss2.then(|| scaled_override(&DCT32X32_BANDS, QM_SS2_SCALE32));
-        let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, QM_SS2_SCALE16X32));
+        let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, rect32_scale(retile)));
         let matrix_32x16 = compute_dct32x16_matrix(o32x16.as_ref());
         let mut inv_matrix_32x16 = HeapMatrix::new(0.);
         for c in 0..3 {
@@ -2155,9 +2169,9 @@ impl DequantMatrices {
         let ss2_from = arbiter.tuning().qm_ss2_distance;
         static HUE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if (HUE_B8_MIN_DISTANCE..ss2_from).contains(&distance) {
-            HUE.get_or_init(|| Self::compute(false, false, Some(&HUE_B8_BANDS), false, true))
+            HUE.get_or_init(|| Self::compute(false, false, Some(&HUE_B8_BANDS), false, true, false))
         } else {
-            Self::new(0.0, arbiter)
+            Self::new(0.0, arbiter, false)
         }
     }
 
@@ -2168,36 +2182,56 @@ impl DequantMatrices {
             .then_some(arbiter)
     }
 
-    pub(crate) fn new(distance: f32, arbiter: Arbiter) -> &'static Self {
-        static COARSE_TILTED: [std::sync::OnceLock<DequantMatrices>; 2] =
-            [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    /// `retile`: the frame runs the exact layout re-tiling (see
+    /// `QM_SS2_SCALE16X32_RETILE`).
+    pub(crate) fn new(distance: f32, arbiter: Arbiter, retile: bool) -> &'static Self {
+        static COARSE_TILTED: [[std::sync::OnceLock<DequantMatrices>; 2]; 2] = [
+            [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+            [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+        ];
         match Self::dct16_tilt(distance, arbiter) {
-            Some(a) => COARSE_TILTED[a as usize].get_or_init(|| {
-                Self::compute_tilted(true, true, Some(&FLAT_B8_BANDS_MID), false, false, Some(a))
+            Some(a) => COARSE_TILTED[a as usize][usize::from(retile)].get_or_init(|| {
+                Self::compute_tilted(
+                    true,
+                    true,
+                    Some(&FLAT_B8_BANDS_MID),
+                    false,
+                    false,
+                    Some(a),
+                    retile,
+                )
             }),
-            None => Self::new_untilted(distance, arbiter),
+            None => Self::new_untilted(distance, arbiter, retile),
         }
     }
 
-    fn new_untilted(distance: f32, arbiter: Arbiter) -> &'static Self {
+    fn new_untilted(distance: f32, arbiter: Arbiter, retile: bool) -> &'static Self {
         let ss2_from = arbiter.tuning().qm_ss2_distance;
         static HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static DEFAULT_HQ: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static DEFAULT_MID: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
-        static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
-        static COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
+        static SS2: [std::sync::OnceLock<DequantMatrices>; 2] =
+            [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+        static COARSE: [std::sync::OnceLock<DequantMatrices>; 2] =
+            [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
         if distance >= QM_DCT8_MIN_DISTANCE {
-            COARSE.get_or_init(|| Self::compute(true, true, Some(&FLAT_B8_BANDS_MID), false, false))
+            COARSE[usize::from(retile)].get_or_init(|| {
+                Self::compute(true, true, Some(&FLAT_B8_BANDS_MID), false, false, retile)
+            })
         } else if distance >= ss2_from {
-            SS2.get_or_init(|| Self::compute(true, false, Some(&FLAT_B8_BANDS_MID), false, false))
+            SS2[usize::from(retile)].get_or_init(|| {
+                Self::compute(true, false, Some(&FLAT_B8_BANDS_MID), false, false, retile)
+            })
         } else if distance >= QM_FLAT_B8_MID_MIN_DISTANCE {
-            DEFAULT_MID
-                .get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), false, false))
+            DEFAULT_MID.get_or_init(|| {
+                Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), false, false, false)
+            })
         } else if distance >= QM_FLAT_B8_MIN_DISTANCE {
-            DEFAULT_HQ
-                .get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false, false))
+            DEFAULT_HQ.get_or_init(|| {
+                Self::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false, false, false)
+            })
         } else {
-            HQ.get_or_init(|| Self::compute(false, false, None, false, false))
+            HQ.get_or_init(|| Self::compute(false, false, None, false, false, false))
         }
     }
 
@@ -2211,7 +2245,7 @@ impl DequantMatrices {
         static SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         static COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if distance < QM_FLAT_B8_MIN_DISTANCE {
-            return Self::new(distance, arbiter);
+            return Self::new(distance, arbiter, false);
         }
         if distance >= ss2_from {
             let coarse = distance >= ORIGINAL_COARSE_DCT8_DISTANCE;
@@ -2225,6 +2259,7 @@ impl DequantMatrices {
                     false,
                     false,
                     None,
+                    false,
                 )
             });
         }
@@ -2234,51 +2269,82 @@ impl DequantMatrices {
             (&HQ, &FLAT_B8_BANDS_HQ)
         };
         cache.get_or_init(|| {
-            Self::compute_with_ordinary_fit(false, false, Some(bands), false, false, false, None)
+            Self::compute_with_ordinary_fit(
+                false,
+                false,
+                Some(bands),
+                false,
+                false,
+                false,
+                None,
+                false,
+            )
         })
     }
 
     /// Tier set with the finer pair-B row; outside its distance band this is
     /// exactly [`Self::new`], so the gate is inert there by construction.
-    pub(crate) fn new_pair_b(distance: f32, arbiter: Arbiter) -> &'static Self {
+    pub(crate) fn new_pair_b(distance: f32, arbiter: Arbiter, retile: bool) -> &'static Self {
         static PAIR_MID: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if (PAIR_B_FINE_MIN_DISTANCE..PAIR_B_FINE_MAX_DISTANCE).contains(&distance) {
-            PAIR_MID
-                .get_or_init(|| Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), true, false))
+            PAIR_MID.get_or_init(|| {
+                Self::compute(false, false, Some(&FLAT_B8_BANDS_MID), true, false, false)
+            })
         } else {
-            Self::new(distance, arbiter)
+            Self::new(distance, arbiter, retile)
         }
     }
 
-    pub(crate) fn new_saturated_pair_b(distance: f32, arbiter: Arbiter) -> &'static Self {
+    pub(crate) fn new_saturated_pair_b(
+        distance: f32,
+        arbiter: Arbiter,
+        retile: bool,
+    ) -> &'static Self {
         static SAT_PAIR: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
         if (PAIR_B_FINE_MIN_DISTANCE..PAIR_B_FINE_MAX_DISTANCE).contains(&distance) {
-            SAT_PAIR.get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), true, true))
+            SAT_PAIR
+                .get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), true, true, false))
         } else {
-            Self::new_saturated(distance, arbiter)
+            Self::new_saturated(distance, arbiter, retile)
         }
     }
 
-    pub(crate) fn new_saturated(distance: f32, arbiter: Arbiter) -> &'static Self {
+    pub(crate) fn new_saturated(distance: f32, arbiter: Arbiter, retile: bool) -> &'static Self {
         let ss2_from = arbiter.tuning().qm_ss2_distance;
         static SAT_DEFAULT: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
-        static SAT_SS2: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
-        static SAT_COARSE: std::sync::OnceLock<DequantMatrices> = std::sync::OnceLock::new();
-        static SAT_COARSE_TILTED: [std::sync::OnceLock<DequantMatrices>; 2] =
+        static SAT_SS2: [std::sync::OnceLock<DequantMatrices>; 2] =
             [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+        static SAT_COARSE: [std::sync::OnceLock<DequantMatrices>; 2] =
+            [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+        static SAT_COARSE_TILTED: [[std::sync::OnceLock<DequantMatrices>; 2]; 2] = [
+            [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+            [std::sync::OnceLock::new(), std::sync::OnceLock::new()],
+        ];
         if let Some(a) = Self::dct16_tilt(distance, arbiter) {
-            SAT_COARSE_TILTED[a as usize].get_or_init(|| {
-                Self::compute_tilted(true, true, Some(&SAT_B8_BANDS), false, true, Some(a))
+            SAT_COARSE_TILTED[a as usize][usize::from(retile)].get_or_init(|| {
+                Self::compute_tilted(
+                    true,
+                    true,
+                    Some(&SAT_B8_BANDS),
+                    false,
+                    true,
+                    Some(a),
+                    retile,
+                )
             })
         } else if distance >= QM_DCT8_MIN_DISTANCE {
-            SAT_COARSE.get_or_init(|| Self::compute(true, true, Some(&SAT_B8_BANDS), false, true))
+            SAT_COARSE[usize::from(retile)]
+                .get_or_init(|| Self::compute(true, true, Some(&SAT_B8_BANDS), false, true, retile))
         } else if distance >= ss2_from {
-            SAT_SS2.get_or_init(|| Self::compute(true, false, Some(&SAT_B8_BANDS), false, true))
+            SAT_SS2[usize::from(retile)].get_or_init(|| {
+                Self::compute(true, false, Some(&SAT_B8_BANDS), false, true, retile)
+            })
         } else if distance >= QM_FLAT_B8_MIN_DISTANCE {
-            SAT_DEFAULT
-                .get_or_init(|| Self::compute(false, false, Some(&SAT_B8_BANDS), false, true))
+            SAT_DEFAULT.get_or_init(|| {
+                Self::compute(false, false, Some(&SAT_B8_BANDS), false, true, false)
+            })
         } else {
-            Self::new(distance, arbiter)
+            Self::new(distance, arbiter, retile)
         }
     }
 
@@ -2288,10 +2354,20 @@ impl DequantMatrices {
         flat_b8: Option<&[f32; 6]>,
         pair_b: bool,
         chromatic: bool,
+        retile: bool,
     ) -> Self {
-        Self::compute_tilted(use_ss2, use_coarse_dct8, flat_b8, pair_b, chromatic, None)
+        Self::compute_tilted(
+            use_ss2,
+            use_coarse_dct8,
+            flat_b8,
+            pair_b,
+            chromatic,
+            None,
+            retile,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn compute_tilted(
         use_ss2: bool,
         use_coarse_dct8: bool,
@@ -2299,6 +2375,7 @@ impl DequantMatrices {
         pair_b: bool,
         chromatic: bool,
         tilt: Option<Arbiter>,
+        retile: bool,
     ) -> Self {
         Self::compute_with_ordinary_fit(
             use_ss2,
@@ -2308,9 +2385,13 @@ impl DequantMatrices {
             chromatic,
             true,
             tilt,
+            retile,
         )
     }
 
+    /// `retile`: the frame runs the exact layout re-tiling, which gets the
+    /// coarser 16x32 table.
+    #[allow(clippy::too_many_arguments)]
     fn compute_with_ordinary_fit(
         use_ss2: bool,
         use_coarse_dct8: bool,
@@ -2319,6 +2400,7 @@ impl DequantMatrices {
         chromatic: bool,
         ordinary_fit: bool,
         tilt: Option<Arbiter>,
+        retile: bool,
     ) -> Self {
         let identity_weights = chromatic.then(|| scaled_identity_weights(IDENTITY_CHROMA_FINE));
         let (matrix_identity, inv_matrix_identity) = match identity_weights.as_ref() {
@@ -2374,8 +2456,8 @@ impl DequantMatrices {
                 (m, inv)
             }
         };
-        let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, QM_SS2_SCALE16X32));
-        let large = large_tables(use_ss2, tilt);
+        let o32x16 = use_ss2.then(|| scaled_override(&DCT16X32_BANDS, rect32_scale(retile)));
+        let large = large_tables(use_ss2, tilt, retile);
 
         let (matrix, inv_matrix) = if let Some(o8) = o8.as_ref() {
             let matrix = compute_dct8x8_matrix(o8);
@@ -2441,12 +2523,13 @@ impl DequantMatrices {
         arbiter: Arbiter,
         coding: crate::coding::CodingTransform,
         plane_scale: [f32; 3],
+        retile: bool,
     ) -> &'static Self {
         type Key = (u32, bool, u8, [u32; 3]);
         type Cache = std::sync::Mutex<Vec<(Key, &'static DequantMatrices)>>;
         static CACHE: Cache = std::sync::Mutex::new(Vec::new());
         let template = if rectangles {
-            Self::new_untilted(distance, arbiter)
+            Self::new_untilted(distance, arbiter, retile)
         } else {
             Self::new_fast(distance, arbiter)
         };
@@ -2800,7 +2883,7 @@ mod tests {
 
     #[test]
     fn dct8x32_table_sits_at_parity_with_the_pair_table() {
-        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2);
+        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2, false);
         // Weights (1/step) at matched physical frequency, 8x32 vs 16x8 x sqrt2.
         for c in 0..3 {
             for (y, x16) in [(0usize, 1usize), (0, 4), (2, 3), (4, 8), (7, 15)] {
@@ -2834,11 +2917,11 @@ mod tests {
     #[test]
     fn chromatic_sets_scale_the_dct8_base_weights() {
         for d in [1.0, 1.5, 2.0] {
-            let base = DequantMatrices::new(d, Arbiter::Ssimulacra2).custom_tables[0]
+            let base = DequantMatrices::new(d, Arbiter::Ssimulacra2, false).custom_tables[0]
                 .expect("flat DCT8 table");
             for set in [
-                DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2),
-                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2),
+                DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2, false),
                 DequantMatrices::new_x_heavy(d, Arbiter::Ssimulacra2),
             ] {
                 let t = set.custom_tables[0].expect("chromatic DCT8 table");
@@ -2865,11 +2948,11 @@ mod tests {
                 );
             }
             assert!(std::ptr::eq(
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2).custom_tables[0]
+                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false).custom_tables[0]
                     .as_ref()
                     .map(|o| &o.bands[1][0])
                     .unwrap(),
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2).custom_tables[0]
+                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false).custom_tables[0]
                     .as_ref()
                     .map(|o| &o.bands[1][0])
                     .unwrap()
@@ -2881,18 +2964,18 @@ mod tests {
     fn identity_rows_are_signalled_only_on_chromatic_sets() {
         for d in [1.0, 1.5, 2.0] {
             assert!(
-                DequantMatrices::new(d, Arbiter::Ssimulacra2)
+                DequantMatrices::new(d, Arbiter::Ssimulacra2, false)
                     .identity_weights
                     .is_none()
             );
             assert!(
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2)
+                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false)
                     .identity_weights
                     .is_none()
             );
             for set in [
-                DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2),
-                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2),
+                DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2, false),
                 DequantMatrices::new_x_heavy(d, Arbiter::Ssimulacra2),
             ] {
                 let id = set.identity_weights.expect("chromatic identity table");
@@ -2923,7 +3006,7 @@ mod tests {
 
     #[test]
     fn x_heavy_b_table_matches_its_signaled_bands() {
-        let spec = DequantMatrices::new(0.0, Arbiter::Ssimulacra2);
+        let spec = DequantMatrices::new(0.0, Arbiter::Ssimulacra2, false);
         for d in [0.0, 0.5, 0.749, QM_SS2_MIN_DISTANCE, 3.0, 4.0] {
             assert!(std::ptr::eq(
                 DequantMatrices::new_x_heavy(d, Arbiter::Ssimulacra2),
@@ -2969,13 +3052,13 @@ mod tests {
         // Ordinary and opsin-proxy tables remain independently selected.
         assert!(!std::ptr::eq(
             hue,
-            DequantMatrices::new(1.0, Arbiter::Ssimulacra2)
+            DequantMatrices::new(1.0, Arbiter::Ssimulacra2, false)
         ));
     }
 
     #[test]
     fn identity_and_dct2_tables_match_the_jpeg_xl_library() {
-        let m = DequantMatrices::new(0.0, Arbiter::Ssimulacra2);
+        let m = DequantMatrices::new(0.0, Arbiter::Ssimulacra2, false);
         let identity = m.inv_matrix_identity(0);
         assert_eq!(identity[0], 0.0);
         assert_eq!(identity[1], 3160.0);
@@ -3013,8 +3096,14 @@ mod tests {
             .name("small-stack-dequant-test".into())
             .stack_size(64 * 1024)
             .spawn(|| {
-                let _matrices =
-                    DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_MID), false, false);
+                let _matrices = DequantMatrices::compute(
+                    false,
+                    false,
+                    Some(&FLAT_B8_BANDS_MID),
+                    false,
+                    false,
+                    false,
+                );
             })
             .unwrap()
             .join()
@@ -3026,17 +3115,20 @@ mod tests {
         // The DCT8 table is signaled (flat B bands) at every tier above the
         // flat-B quality gate.
         assert!(
-            DequantMatrices::new(QM_DCT8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2).custom_tables
+            DequantMatrices::new(QM_DCT8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2, false)
+                .custom_tables[0]
+                .is_some()
+        );
+        assert!(
+            DequantMatrices::new(QM_DCT8_MIN_DISTANCE, Arbiter::Ssimulacra2, false).custom_tables
                 [0]
             .is_some()
         );
-        assert!(
-            DequantMatrices::new(QM_DCT8_MIN_DISTANCE, Arbiter::Ssimulacra2).custom_tables[0]
-                .is_some()
-        );
 
-        let normal = DequantMatrices::compute(true, false, Some(&FLAT_B8_BANDS_MID), false, false);
-        let coarse = DequantMatrices::compute(true, true, Some(&FLAT_B8_BANDS_MID), false, false);
+        let normal =
+            DequantMatrices::compute(true, false, Some(&FLAT_B8_BANDS_MID), false, false, false);
+        let coarse =
+            DequantMatrices::compute(true, true, Some(&FLAT_B8_BANDS_MID), false, false, false);
 
         let hf_ratio = coarse.inv_matrix(1)[63] / normal.inv_matrix(1)[63];
         assert!((hf_ratio - QM_DCT8_Y_HF_SCALE).abs() < 0.01, "{hf_ratio}");
@@ -3049,13 +3141,17 @@ mod tests {
         // Near-lossless tier ignores the content gate entirely (the tail pays
         // for any finer B coding, saturated or not).
         assert!(std::ptr::eq(
-            DequantMatrices::new_saturated(QM_FLAT_B8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2),
-            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2),
+            DequantMatrices::new_saturated(
+                QM_FLAT_B8_MIN_DISTANCE - 0.01,
+                Arbiter::Ssimulacra2,
+                false
+            ),
+            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2, false),
         ));
         // Every flat-B tier gets a distinct table set with the saturated B row.
         for d in [0.5, 1.5, 2.5, 4.0] {
-            let sat = DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2);
-            let base = DequantMatrices::new(d, Arbiter::Ssimulacra2);
+            let sat = DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2, false);
+            let base = DequantMatrices::new(d, Arbiter::Ssimulacra2, false);
             assert!(!std::ptr::eq(sat, base), "d={d}");
             let table = sat.custom_tables[0].expect("saturated flat table");
             assert_eq!(
@@ -3071,12 +3167,13 @@ mod tests {
         // Near-lossless tier keeps the spec DCT8 table (nothing signaled);
         // the flat-B override kicks in at the gate.
         assert!(
-            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2)
+            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2, false)
                 .custom_tables[0]
                 .is_none()
         );
         assert!(
-            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE, Arbiter::Ssimulacra2).custom_tables[0]
+            DequantMatrices::new(QM_FLAT_B8_MIN_DISTANCE, Arbiter::Ssimulacra2, false)
+                .custom_tables[0]
                 .is_some()
         );
     }
@@ -3084,10 +3181,14 @@ mod tests {
     #[test]
     fn flat_b8_shape_splits_at_mid_distance() {
         // HQ knee below the split, Optuna mid shape at and above it.
-        let below = DequantMatrices::new(QM_FLAT_B8_MID_MIN_DISTANCE - 0.01, Arbiter::Ssimulacra2)
-            .custom_tables[0]
+        let below = DequantMatrices::new(
+            QM_FLAT_B8_MID_MIN_DISTANCE - 0.01,
+            Arbiter::Ssimulacra2,
+            false,
+        )
+        .custom_tables[0]
             .expect("hq flat table");
-        let at = DequantMatrices::new(QM_FLAT_B8_MID_MIN_DISTANCE, Arbiter::Ssimulacra2)
+        let at = DequantMatrices::new(QM_FLAT_B8_MID_MIN_DISTANCE, Arbiter::Ssimulacra2, false)
             .custom_tables[0]
             .expect("mid flat table");
         assert_eq!(
@@ -3106,7 +3207,8 @@ mod tests {
 
     #[test]
     fn default_dct8_preserves_flat_blue_shape_with_fitted_rate() {
-        let m = DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false, false);
+        let m =
+            DequantMatrices::compute(false, false, Some(&FLAT_B8_BANDS_HQ), false, false, false);
         // X and Y stay at the spec table within F16 signaling round-off.
         for c in [0usize, 1] {
             for k in 1..64 {
@@ -3135,8 +3237,8 @@ mod tests {
     fn ordinary_dct8_fit_matches_wire_weights_and_existing_gates() {
         for d in [0.3, 0.75, 1.0, 1.25, 2.0, 2.249] {
             for m in [
-                DequantMatrices::new(d, Arbiter::Ssimulacra2),
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2),
+                DequantMatrices::new(d, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false),
             ] {
                 let table = m.custom_tables[0].expect("existing flat DCT8 table");
                 assert_eq!(table.num_bands, 6);
@@ -3150,10 +3252,12 @@ mod tests {
                 }
             }
         }
-        assert!(DequantMatrices::new(0.299, Arbiter::Ssimulacra2).custom_tables[0].is_none());
+        assert!(
+            DequantMatrices::new(0.299, Arbiter::Ssimulacra2, false).custom_tables[0].is_none()
+        );
         for d in [2.25, 3.0, 3.5, 5.0] {
             assert_eq!(
-                DequantMatrices::new(d, Arbiter::Ssimulacra2).custom_tables[0]
+                DequantMatrices::new(d, Arbiter::Ssimulacra2, false).custom_tables[0]
                     .unwrap()
                     .bands[2][0],
                 317.5 // F16(512 * 0.62 / 64) * 64
@@ -3228,19 +3332,21 @@ mod tests {
     fn pair_b_tier_exists_only_inside_its_band() {
         for d in [0.5, 1.0, 1.24, PAIR_B_FINE_MAX_DISTANCE, 3.0] {
             assert!(std::ptr::eq(
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2),
-                DequantMatrices::new(d, Arbiter::Ssimulacra2)
+                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new(d, Arbiter::Ssimulacra2, false)
             ));
             assert!(std::ptr::eq(
-                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2),
-                DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2)
+                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_saturated(d, Arbiter::Ssimulacra2, false)
             ));
         }
         for d in [PAIR_B_FINE_MIN_DISTANCE, 1.5, 2.0] {
-            assert!(DequantMatrices::new(d, Arbiter::Ssimulacra2).custom_tables[3].is_none());
+            assert!(
+                DequantMatrices::new(d, Arbiter::Ssimulacra2, false).custom_tables[3].is_none()
+            );
             for m in [
-                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2),
-                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2),
+                DequantMatrices::new_pair_b(d, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_saturated_pair_b(d, Arbiter::Ssimulacra2, false),
             ] {
                 let t = m.custom_tables[3].expect("finer pair-B table");
                 assert_eq!(t.num_bands, 7);
@@ -3262,7 +3368,7 @@ mod tests {
                 // outside the 2x1 LLF block.
                 assert!(
                     m.matrix_16x8(2)[2]
-                        < DequantMatrices::new(d, Arbiter::Ssimulacra2).matrix_16x8(2)[2]
+                        < DequantMatrices::new(d, Arbiter::Ssimulacra2, false).matrix_16x8(2)[2]
                 );
             }
         }
@@ -3295,7 +3401,7 @@ mod tests {
 
     #[test]
     fn rect_tables_default_to_the_library_values() {
-        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2);
+        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2, false);
         for (c, k) in (0..3).flat_map(|c| (0..128).map(move |k| (c, k))) {
             let expected = DEQUANT_MATRIX_16X8[c][k];
             let got = m.matrix_16x8(c)[k];
@@ -3325,7 +3431,7 @@ mod tests {
 
     #[test]
     fn afv_matrix_fixed_positions_match_library_weights() {
-        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2);
+        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2, false);
         for c in 0..3 {
             let mc = m.matrix_afv(c);
             // Sub-part DC tendencies and the fixed 3-pixel-corner weights are
@@ -3355,7 +3461,7 @@ mod tests {
 
     #[test]
     fn dct16x16_matrix_dc_matches_libjxl_polynomial() {
-        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2);
+        let m = DequantMatrices::new(1.0, Arbiter::Ssimulacra2, false);
         // bands[0] = 8996.87 for X → 1/bands[0] ≈ 1.112e-4 at radial position 0
         let x_dc = m.matrix_16x16(0)[0];
         assert!(
@@ -3414,14 +3520,14 @@ mod shared_storage_tests {
         let shared = shared_tables();
         for distance in [0.0, 0.1, 0.3, 0.75, 1.0, 1.5, 2.0, 2.25, 3.0, 4.0, 8.0] {
             for set in [
-                DequantMatrices::new(distance, Arbiter::Ssimulacra2),
+                DequantMatrices::new(distance, Arbiter::Ssimulacra2, false),
                 DequantMatrices::new_fast(distance, Arbiter::Ssimulacra2),
                 DequantMatrices::new_x_heavy(distance, Arbiter::Ssimulacra2),
-                DequantMatrices::new_pair_b(distance, Arbiter::Ssimulacra2),
-                DequantMatrices::new_saturated(distance, Arbiter::Ssimulacra2),
-                DequantMatrices::new_saturated_pair_b(distance, Arbiter::Ssimulacra2),
+                DequantMatrices::new_pair_b(distance, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_saturated(distance, Arbiter::Ssimulacra2, false),
+                DequantMatrices::new_saturated_pair_b(distance, Arbiter::Ssimulacra2, false),
             ] {
-                let large = large_tables(set.custom_tables[1].is_some(), None);
+                let large = large_tables(set.custom_tables[1].is_some(), None, false);
                 assert!(std::ptr::eq(set.matrix_16x16, &*large.matrix_16x16));
                 assert!(std::ptr::eq(set.inv_matrix_16x16, &*large.inv_matrix_16x16));
                 assert!(std::ptr::eq(set.matrix_32x32, &*large.matrix_32x32));

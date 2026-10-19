@@ -199,9 +199,8 @@ impl AcStrategyImage {
         }
         // A multi-block transform must also stay within a single 8-block
         // (64 px) tile, since `write_ac_group` processes one tile-tall stripe
-        // at a time. For 1×/2×-block transforms this is implied by the 2-block
-        // alignment of selection; for the 4×4 DCT32X32 it is the binding
-        // constraint.
+        // at a time. The layout DP may place even pair transforms at an
+        // 8-pixel origin, so this bound applies to every multi-block shape.
         const TILE: usize = 8;
         if is_128_strategy(strategy) {
             // 128px transforms span several 64px tiles; the AC group writer
@@ -287,6 +286,17 @@ impl AcStrategyImage {
     }
 }
 
+/// A re-tiling proposal: the pieces (strategy, dx, dy) tiling one closed
+/// rectangle of blocks that the proposal lays out differently.
+#[derive(Clone, Debug)]
+pub(crate) struct DpRegion {
+    pub(crate) bx: usize,
+    pub(crate) by: usize,
+    pub(crate) w: usize,
+    pub(crate) h: usize,
+    pub(crate) pieces: Vec<(u8, usize, usize)>,
+}
+
 pub(crate) struct DcGroupData {
     pub(crate) quant_dc: Image3S,
     /// Unrounded B DC from the first coefficient pass, retained only until
@@ -308,6 +318,9 @@ pub(crate) struct DcGroupData {
     /// `fill_ac_strategy`, used by the frame-level activation gate. 0 until
     /// selection runs.
     pub(crate) sub8_benefit: f32,
+    /// Closed regions whose layout the exact re-tiling would change, for
+    /// the ExtraSlow layout loop to arbitrate (DC-group block coordinates).
+    pub(crate) dp_regions: Vec<DpRegion>,
 }
 
 const TILE_DIM_IN_BLOCKS: usize = 8;
@@ -327,6 +340,7 @@ impl DcGroupData {
             ytox_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,
             ytob_map: ImageSB::try_new_fill(xtiles, ytiles, 0)?,
             sub8_benefit: 0.0,
+            dp_regions: Vec::new(),
         })
     }
 }

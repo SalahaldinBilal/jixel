@@ -76,7 +76,8 @@ pub(crate) use frame::chroma_gradient_sums_avx2;
 pub(crate) use haar::haar_rows_avx2;
 pub(crate) use inflated_cost::{
     combine_error_avx2, error_gradient_energy_avx2, error_gradient_peak_energy_avx2,
-    recon_dist_and_rate_avx2, rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
+    recon_chroma_phase_avx2, recon_dist_and_rate_avx2, recon_luma_phase_avx2,
+    rgb_hue_chroma_edge_loss_avx2, ssim_deficit_avx2,
 };
 pub(crate) use lossless_grad::grad_pack_interior;
 pub(crate) use lz_match::{match_len_avx2, match_len_compact_avx2};

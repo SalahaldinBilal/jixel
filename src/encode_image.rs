@@ -1239,6 +1239,21 @@ pub fn encode_image(
                 .with_num_threads(config.num_threads),
         );
     }
+    // The ink plan serves both layer paths: the ink stack codes it, and the
+    // vector race reads its glyph-text flag.
+    let layers = config.coding_transform == CodingTransform::Xyb && !config.progressive_dc;
+    let ink_candidates = (layers && (config.ink_layer || (config.vector_layers && config.patches)))
+        .then(|| crate::ink_layer::InkCandidates::new_fast(input, None, width, height))
+        .flatten();
+    let ink_plan = ink_candidates.and_then(|candidates| candidates.select(config.distance));
+    let plain_encode = || {
+        let mut plain_config = config.clone();
+        plain_config.ink_layer = false;
+        plain_config.vector_layers = false;
+        encode_image(input, width, height, &plain_config)
+    };
+    let mut plain = None;
+    let mut vector = None;
     // Vector layers are near-lossless and cost the same at every distance:
     // they replace the lossy frame only where its own size would be close.
     // The vector encode does not depend on the distance; it stands wherever
@@ -1252,46 +1267,75 @@ pub fn encode_image(
         if let Some(split) = crate::vector_layers::split(input, width, height, steps) {
             // The model sizes the VarDCT encode within 0.78..1.39 of its
             // measure; the layers, far above VarDCT in quality, are kept up
-            // to that margin.
-            let budget = crate::vector_layers::vardct_bytes(input, width, height, config.distance)
-                * crate::vector_layers::VARDCT_BYTES_MARGIN;
-            let vector = encode_vector_layers(split, width, height, config)?;
-            if vector.bytes.len() as f64 <= budget {
-                return Ok(vector.bytes);
+            // to that margin. Repeated-glyph patches code thin text far
+            // below the model, which does not see them: there the plain
+            // encode sets the budget and the vector encode is one candidate
+            // among the layer stacks.
+            let glyph_text =
+                config.patches && ink_plan.as_ref().is_some_and(|plan| plan.glyph_text);
+            if glyph_text {
+                plain = Some(plain_encode()?);
             }
-            if (vector.base as f64) < budget {
-                let room = ((budget - vector.base as f64) / vector.band.max(1) as f64
+            let budget = match &plain {
+                Some(plain) => plain.len() as f64,
+                None => {
+                    crate::vector_layers::vardct_bytes(input, width, height, config.distance)
+                        * crate::vector_layers::VARDCT_BYTES_MARGIN
+                }
+            };
+            let encoded = encode_vector_layers(split, width, height, config)?;
+            let mut fitted = None;
+            if encoded.bytes.len() as f64 <= budget {
+                fitted = Some(encoded.bytes);
+            } else if (encoded.base as f64) < budget {
+                let room = ((budget - encoded.base as f64) / encoded.band.max(1) as f64
                     * crate::vector_layers::band_bytes_ratio(steps))
                 .max(0.0);
                 let fit = 2f64.powf(5.0 * room - 1.0).floor().clamp(1.0, steps as f64) as u32;
                 if fit < steps
                     && let Some(split) = crate::vector_layers::split(input, width, height, fit)
                 {
-                    return Ok(encode_vector_layers(split, width, height, config)?.bytes);
+                    fitted = Some(encode_vector_layers(split, width, height, config)?.bytes);
                 }
+            }
+            match (fitted, &plain) {
+                (Some(bytes), None) => return Ok(bytes),
+                (Some(bytes), Some(_)) => vector = Some(bytes),
+                (None, _) => {}
             }
         }
     }
-    if config.ink_layer
-        && config.coding_transform == CodingTransform::Xyb
-        && !config.progressive_dc
-        && let Some(candidates) =
-            crate::ink_layer::InkCandidates::new_fast(input, None, width, height)
-    {
-        return select_ink_layered(
-            candidates.select(config.distance),
+    // On a tie the vector encode stands: exact where the others are lossy.
+    let smaller = |vector: Vec<u8>, other: Vec<u8>| {
+        if vector.len() <= other.len() {
+            vector
+        } else {
+            other
+        }
+    };
+    if config.ink_layer && ink_plan.is_some() {
+        let inked = select_ink_layered(
+            ink_plan,
             width,
             height,
             config,
             None,
             crate::vector_layers::vardct_bytes(input, width, height, config.distance),
-            || {
-                let mut plain_config = config.clone();
-                plain_config.ink_layer = false;
-                plain_config.vector_layers = false;
-                encode_image(input, width, height, &plain_config)
+            || match plain {
+                Some(plain) => Ok(plain),
+                None => plain_encode(),
             },
-        );
+        )?;
+        return Ok(match vector {
+            Some(vector) => smaller(vector, inked),
+            None => inked,
+        });
+    }
+    match (vector, plain) {
+        (Some(vector), Some(plain)) => return Ok(smaller(vector, plain)),
+        (Some(vector), None) => return Ok(vector),
+        (None, Some(plain)) => return Ok(plain),
+        (None, None) => {}
     }
     let distance = config.distance.max(MIN_DISTANCE);
     let transform = ColorTransform::for_integer(
@@ -1345,7 +1389,7 @@ fn select_ink_layered(
     // Repeated-glyph patches may code thin text better than the ink frame,
     // and the model does not see them: the plain encode decides, and the
     // stack has no quality edge over patched text to pay for.
-    let glyph_text = plan.thin_text && config.patches;
+    let glyph_text = plan.glyph_text && config.patches;
     let stack = InkStack::new(plan, width, height, config, alpha, budget)?;
     if !glyph_text && stack.bytes.len() as f64 <= budget {
         return Ok(stack.bytes);
@@ -4359,12 +4403,9 @@ mod encode_smoke_tests {
         }
     }
 
-    #[test]
-    fn fast_lossy_glyph_patches_shrink_repeated_text() {
-        // Sixty dark 5x7 glyphs on white, set as lines of text off the block
-        // grid. Their atlas is too large to pay off unless it is coded with
-        // a learned tree and palette, which Fast now uses too.
-        const SIZE: usize = 256;
+    /// Sixty dark 5x7 glyphs on white, set as lines of text off the block
+    /// grid.
+    fn glyph_text_pixels(size: usize) -> Vec<u8> {
         let mut state = 0x2545_f491u32;
         let mut next = || {
             state ^= state << 13;
@@ -4375,20 +4416,29 @@ mod encode_smoke_tests {
         let glyphs: Vec<[[bool; 5]; 7]> = (0..60)
             .map(|_| std::array::from_fn(|_| std::array::from_fn(|_| next() % 3 < 2)))
             .collect();
-        let mut pixels = vec![255u8; SIZE * SIZE * 3];
-        for line in 0..SIZE / 11 {
-            for column in 0..SIZE / 7 - 1 {
+        let mut pixels = vec![255u8; size * size * 3];
+        for line in 0..size / 11 {
+            for column in 0..size / 7 - 1 {
                 let glyph = &glyphs[next() % glyphs.len()];
                 let (x0, y0) = (3 + column * 7 + line % 3, 2 + line * 11);
                 for (dy, row) in glyph.iter().enumerate() {
                     for (dx, &ink) in row.iter().enumerate() {
                         if ink {
-                            pixels[((y0 + dy) * SIZE + x0 + dx) * 3..][..3].fill(20);
+                            pixels[((y0 + dy) * size + x0 + dx) * 3..][..3].fill(20);
                         }
                     }
                 }
             }
         }
+        pixels
+    }
+
+    #[test]
+    fn fast_lossy_glyph_patches_shrink_repeated_text() {
+        // The glyph atlas is too large to pay off unless it is coded with
+        // a learned tree and palette, which Fast now uses too.
+        const SIZE: usize = 256;
+        let pixels = glyph_text_pixels(SIZE);
         let plain = EncodeConfig::default().with_distance(1.0);
         let patched = plain.clone().with_patches(true);
         let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
@@ -4397,6 +4447,48 @@ mod encode_smoke_tests {
             patched.len() * 5 < plain.len(),
             "{} vs {}",
             patched.len(),
+            plain.len()
+        );
+    }
+
+    #[test]
+    fn vector_layers_race_the_patched_text_encode() {
+        // Text on white passes the vector split, and the edge-cost model
+        // that admits the vector encode does not see the glyph patches
+        // coding the text at a fraction of its size: the patched encode has
+        // to decide.
+        const SIZE: usize = 256;
+        let pixels = glyph_text_pixels(SIZE);
+        let layered = EncodeConfig::default()
+            .with_distance(1.0)
+            .with_speed(Speed::Slow)
+            .with_patches(true)
+            .with_ink_layer(true)
+            .with_vector_layers(true);
+        let unvectored = layered.clone().with_vector_layers(false);
+        let plain = unvectored.clone().with_ink_layer(false);
+        let unpatched = layered.clone().with_patches(false);
+        let layered = encode_image(&pixels, SIZE, SIZE, &layered).unwrap();
+        let unvectored = encode_image(&pixels, SIZE, SIZE, &unvectored).unwrap();
+        let plain = encode_image(&pixels, SIZE, SIZE, &plain).unwrap();
+        let unpatched = encode_image(&pixels, SIZE, SIZE, &unpatched).unwrap();
+        // The vector encode fits the model where the patches are off.
+        assert!(
+            unpatched.len() * 2 > plain.len() * 3,
+            "{} vs {}",
+            unpatched.len(),
+            plain.len()
+        );
+        assert!(
+            layered.len() <= plain.len(),
+            "{} vs {}",
+            layered.len(),
+            plain.len()
+        );
+        assert!(
+            unvectored.len() <= plain.len(),
+            "{} vs {}",
+            unvectored.len(),
             plain.len()
         );
     }
@@ -5200,7 +5292,9 @@ mod lossy_alpha_tests {
     #[test]
     fn gray_and_deep_alpha_go_lossy_too() {
         let gray: Vec<u8> = rgba(soft)
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|px| [px[0], px[3]])
             .collect();
         let gray_lossy = encode_image_gray_alpha(&gray, W, H, &fast()).unwrap();

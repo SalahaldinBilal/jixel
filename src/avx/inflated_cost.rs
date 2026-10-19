@@ -30,8 +30,9 @@
 use crate::avx::ac_strategy::{avx2_log2p1_f32, hmax_u32, hsum256};
 use crate::image::{Image3F, Plane};
 use crate::inflated_cost::{
-    RateLog2Lut, ReconCost, ReconDistInput, ReconErrorKernels, ReconKernels,
-    recon_dist_and_rate_with_kernels, validate_ssim_inputs,
+    LumaPhase, RateLog2Lut, ReconCost, ReconDistInput, ReconErrorKernels, ReconKernels,
+    recon_chroma_phase_with_kernels, recon_dist_and_rate_with_kernels,
+    recon_luma_phase_with_kernels, validate_ssim_inputs,
 };
 use std::arch::x86_64::*;
 
@@ -494,6 +495,43 @@ pub(crate) fn recon_dist_and_rate_avx2(
     error: &ReconErrorKernels,
 ) -> ReconCost {
     recon_dist_and_rate_avx2_impl::<true>(scratch, input, error)
+}
+
+/// Luma phase of `recon_dist_and_rate_avx2`.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn recon_luma_phase_avx2(
+    scratch: &mut [[f32; 4096]; 8],
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
+) -> LumaPhase {
+    recon_luma_phase_with_kernels(scratch, input, &avx2_kernels::<true>(input, error))
+}
+
+/// Chroma phase of `recon_dist_and_rate_avx2`.
+#[target_feature(enable = "avx2,fma")]
+pub(crate) fn recon_chroma_phase_avx2(
+    scratch: &mut [[f32; 4096]; 8],
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
+    luma: LumaPhase,
+) -> ReconCost {
+    recon_chroma_phase_with_kernels(scratch, input, &avx2_kernels::<true>(input, error), luma)
+}
+
+fn avx2_kernels<'a, const BIASED: bool>(
+    input: &ReconDistInput<'_>,
+    error: &'a ReconErrorKernels,
+) -> ReconKernels<'a> {
+    ReconKernels {
+        quantize: if input.quantization.compute_rate {
+            recon_quantize_avx2::<BIASED, true>
+        } else {
+            recon_quantize_avx2::<BIASED, false>
+        },
+        ssim: ssim_deficit_avx2,
+        prepare: prepare_reconstruction_avx2,
+        error,
+    }
 }
 
 #[target_feature(enable = "avx2,fma")]

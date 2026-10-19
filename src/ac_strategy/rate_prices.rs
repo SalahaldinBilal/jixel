@@ -584,16 +584,14 @@ impl RatePrices {
         bits
     }
 
-    /// Rate of a candidate whose coefficients are in `coeffs`, or `None`
-    /// for a transform without learned prices. A channel the caller's rate
-    /// kernel found without nonzero coefficients is `empty`.
+    /// Raw learned bits of one channel, before `norm` and the calibration.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn rate(
+    pub(crate) fn channel_rate_bits(
         &self,
         ctx: &EncodingContext,
         strategy: u8,
-        coeffs: &[[f32; 4096]; 3],
-        empty: [bool; 3],
+        coeffs: &[f32],
+        c: usize,
         qac: f32,
         qm_mult_x: f32,
         distance: f32,
@@ -603,33 +601,29 @@ impl RatePrices {
         let table = self.tables[strategy as usize].as_ref()?;
         let size = cx * cy * 64;
         let qf_hi = (qac * self.inv_scale).round() as u32 > self.qf_threshold;
-        let bits = LEVELS.with_borrow_mut(|levels| {
+        Some(LEVELS.with_borrow_mut(|levels| {
             if levels.len() < size {
                 levels.resize(4096, 0);
             }
-            let mut bits = 0f32;
-            for (c, coeffs) in coeffs.iter().enumerate() {
-                if empty[c] {
-                    bits += table.empty[c][usize::from(qf_hi)];
-                    continue;
-                }
-                quantize_channel(
-                    ctx,
-                    strategy,
-                    c,
-                    &coeffs[..size],
-                    qac,
-                    qm_mult_x,
-                    distance,
-                    cx,
-                    cy,
-                    &mut levels[..size],
-                );
-                bits += Self::channel_bits(table, strategy, c, &levels[..size], cx, cy, qf_hi);
-            }
-            bits
-        });
-        Some(bits * self.norm * learned_calibration(strategy, distance))
+            quantize_channel(
+                ctx,
+                strategy,
+                c,
+                &coeffs[..size],
+                qac,
+                qm_mult_x,
+                distance,
+                cx,
+                cy,
+                &mut levels[..size],
+            );
+            Self::channel_bits(table, strategy, c, &levels[..size], cx, cy, qf_hi)
+        }))
+    }
+
+    /// The rate `rate` returns for a block whose channels cost `bits` raw bits.
+    pub(crate) fn scaled_rate(&self, strategy: u8, distance: f32, bits: f32) -> f32 {
+        bits * self.norm * learned_calibration(strategy, distance)
     }
 
     /// Lower bound on a transform's rate without transforming any pixels.

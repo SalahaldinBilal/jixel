@@ -156,7 +156,7 @@ fn axis_correlation(xyb: &Image3F, horizontal: bool) -> Vec<f32> {
         // Accumulate adjacent lags together: each lane keeps the original
         // summation order, while the contiguous tail samples can use SIMD.
         let (groups, remainder) = sums.split_at_mut(grouped_lags);
-        for (k, group) in (0..).step_by(LANES).zip(groups.chunks_exact_mut(LANES)) {
+        for (k, group) in (0..).step_by(LANES).zip(groups.as_chunks_mut::<LANES>().0) {
             let common_len = len - (k + LANES - 1);
             let mut d = [0.0f32; LANES];
             let mut ts = [0.0f32; LANES];

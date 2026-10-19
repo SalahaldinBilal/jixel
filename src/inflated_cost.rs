@@ -955,6 +955,30 @@ pub(crate) struct ReconDistInput<'a> {
     pub(crate) scoring: ReconScoring,
 }
 
+/// The luma half of a reconstruction score: the fixed-model rate so far and
+/// the channel's three weighted distortion terms. Every term is nonnegative,
+/// so the luma part is a lower bound on the complete cost.
+#[derive(Clone, Copy)]
+pub(crate) struct LumaPhase {
+    pub(crate) rate: f32,
+    pub(crate) terms: [f32; 3],
+}
+
+impl LumaPhase {
+    /// The luma distortion as the complete score would accumulate it.
+    pub(crate) fn distortion(&self, gradient_alpha: f32, gradient_peak_alpha: f32) -> f32 {
+        let mut distortion = 0.0f32;
+        distortion += self.terms[0];
+        if gradient_alpha > 0.0 {
+            distortion += self.terms[1];
+        }
+        if gradient_peak_alpha > 0.0 {
+            distortion += self.terms[2];
+        }
+        distortion
+    }
+}
+
 pub(crate) struct ReconErrorKernels {
     pub(crate) gradient_energy: ErrorGradientEnergyFn,
     pub(crate) gradient_peak_energy: ErrorGradientPeakEnergyFn,
@@ -1113,6 +1137,85 @@ pub(crate) fn select_recon_dist_and_rate_fn() -> ReconDistAndRateFn {
     }
     #[allow(unreachable_code)]
     recon_dist_and_rate_default
+}
+
+pub(crate) type ReconLumaPhaseFn = for<'a, 'input, 'kernels> fn(
+    &'a mut [[f32; 4096]; 8],
+    &'input ReconDistInput<'input>,
+    &'kernels ReconErrorKernels,
+) -> LumaPhase;
+pub(crate) type ReconChromaPhaseFn = for<'a, 'input, 'kernels> fn(
+    &'a mut [[f32; 4096]; 8],
+    &'input ReconDistInput<'input>,
+    &'kernels ReconErrorKernels,
+    LumaPhase,
+) -> ReconCost;
+
+pub(crate) fn select_recon_luma_phase_fn() -> ReconLumaPhaseFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return |scratch, input, error_kernels| unsafe {
+            crate::avx::recon_luma_phase_avx2(scratch, input, error_kernels)
+        };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        return |scratch, input, error_kernels| unsafe {
+            crate::neon::recon_luma_phase_neon(scratch, input, error_kernels)
+        };
+    }
+    #[allow(unreachable_code)]
+    recon_luma_phase_default
+}
+
+pub(crate) fn select_recon_chroma_phase_fn() -> ReconChromaPhaseFn {
+    #[cfg(all(target_arch = "x86_64", feature = "avx"))]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return |scratch, input, error_kernels, luma| unsafe {
+            crate::avx::recon_chroma_phase_avx2(scratch, input, error_kernels, luma)
+        };
+    }
+    #[cfg(all(target_arch = "aarch64", feature = "neon"))]
+    {
+        return |scratch, input, error_kernels, luma| unsafe {
+            crate::neon::recon_chroma_phase_neon(scratch, input, error_kernels, luma)
+        };
+    }
+    #[allow(unreachable_code)]
+    recon_chroma_phase_default
+}
+
+fn default_kernels<'a>(
+    input: &ReconDistInput<'_>,
+    error: &'a ReconErrorKernels,
+) -> ReconKernels<'a> {
+    ReconKernels {
+        quantize: if input.quantization.compute_rate {
+            recon_quantize_scalar::<true, true>
+        } else {
+            recon_quantize_scalar::<true, false>
+        },
+        ssim: ssim_deficit_dispatch_kernel,
+        prepare: prepare_reconstruction_scalar,
+        error,
+    }
+}
+
+fn recon_luma_phase_default(
+    scratch: &mut [[f32; 4096]; 8],
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
+) -> LumaPhase {
+    recon_luma_phase_with_kernels(scratch, input, &default_kernels(input, error))
+}
+
+fn recon_chroma_phase_default(
+    scratch: &mut [[f32; 4096]; 8],
+    input: &ReconDistInput<'_>,
+    error: &ReconErrorKernels,
+    luma: LumaPhase,
+) -> ReconCost {
+    recon_chroma_phase_with_kernels(scratch, input, &default_kernels(input, error), luma)
 }
 
 fn recon_dist_and_rate_default(
@@ -1275,6 +1378,206 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     input: &ReconDistInput<'_>,
     kernels: &ReconKernels<'_>,
 ) -> ReconCost {
+    let luma = recon_luma_phase_with_kernels(scratch, input, kernels);
+    recon_chroma_phase_with_kernels(scratch, input, kernels, luma)
+}
+
+/// Quantizes and reconstructs the luma channel alone. The chroma phase must
+/// follow on the same scratch before anything else uses it.
+pub(crate) fn recon_luma_phase_with_kernels(
+    scratch: &mut [[f32; 4096]; 8],
+    input: &ReconDistInput<'_>,
+    kernels: &ReconKernels<'_>,
+) -> LumaPhase {
+    let quantization = &input.quantization;
+    let transform = &input.transform;
+    let source = &input.source;
+    let scoring = &input.scoring;
+    let rate_log2_lut = quantization.rate_log2_lut;
+    let coeffs = quantization.coeffs;
+    let inverse_matrices = &quantization.inverse_matrices;
+    let qac = quantization.qac;
+    let qm_mult_x = quantization.qm_mult_x;
+    let distance = quantization.distance;
+    let cx = transform.blocks_x;
+    let cy = transform.blocks_y;
+    let strategy = transform.strategy;
+    let opsin = source.opsin;
+    let px = source.x;
+    let py = source.y;
+    let gradient_alpha = scoring.gradient_alpha;
+    let gradient_peak_alpha = scoring.gradient_peak_alpha;
+    let gradient_peak_floor = if gradient_peak_alpha > 0.0 {
+        gradient_peak_floor(distance)
+    } else {
+        0.0
+    };
+    let quantize = kernels.quantize;
+    let ssim = kernels.ssim;
+    let prepare_reconstruction = kernels.prepare;
+    let error_gradient_energy = kernels.error.gradient_energy;
+    let error_gradient_peak_energy = kernels.error.gradient_peak_energy;
+    let n = strategy_pixel_count(strategy);
+    let width = cx.checked_mul(8).expect("coefficient width overflow");
+    let height = cy.checked_mul(8).expect("coefficient height overflow");
+    assert_eq!(
+        width
+            .checked_mul(height)
+            .expect("coefficient size overflow"),
+        n,
+        "strategy and coefficient dimensions disagree"
+    );
+    assert!(inverse_matrices.iter().all(|matrix| matrix.len() >= n));
+    assert!(qac.is_finite() && qac > 0.0);
+    assert!(qm_mult_x.is_finite() && qm_mult_x > 0.0);
+    assert!((0..3).all(|c| opsin.plane(c).xsize() != 0 && opsin.plane(c).ysize() != 0));
+
+    let half = width / 2;
+    let (pixel_width, pixel_height) = strategy_pixel_dims(strategy);
+    let thresholds = [
+        crate::group::quantize_ac_thresholds_scaled(0, cx, cy, distance, qm_mult_x),
+        crate::group::quantize_ac_thresholds(1, cx, cy, distance),
+        crate::group::quantize_ac_thresholds_scaled(2, cx, cy, distance, quantization.qm_mult_b),
+    ];
+    let quant_scales = [qac * qm_mult_x, qac, qac * quantization.qm_mult_b];
+
+    let (coeff_error, rest) = scratch.split_at_mut(3);
+    let [_, y_error, _, reconstructed, original] = rest else {
+        unreachable!()
+    };
+    let scan_pos = if quantization.compute_rate {
+        crate::coeff_order::scan_pos_lut(width, height)
+    } else {
+        &[]
+    };
+    let footprint = Footprint::new(
+        opsin.xsize(),
+        opsin.ysize(),
+        px,
+        py,
+        pixel_width,
+        pixel_height,
+    );
+    let (visible_width, visible_height) = (footprint.visible_width, footprint.visible_height);
+    // The three distortion terms of one channel: its SSIM deficit and the
+    // two gradient penalties, each already weighted.
+    let channel_terms =
+        |c: usize, error: &[f32], original: &[f32], reconstructed: &[f32]| -> [f32; 3] {
+            let weight = input.scoring.channel_weights[c];
+            let mut terms = [0.0f32; 3];
+            if footprint.is_full() {
+                terms[0] = weight
+                    * unsafe {
+                        ssim(
+                            &original[..n],
+                            &reconstructed[..n],
+                            pixel_width,
+                            pixel_height,
+                        )
+                    };
+                if gradient_alpha > 0.0 {
+                    terms[1] = weight
+                        * gradient_alpha
+                        * error_gradient_energy(&error[..n], pixel_width, pixel_height);
+                }
+                if gradient_peak_alpha > 0.0 {
+                    terms[2] = weight
+                        * gradient_peak_alpha
+                        * error_gradient_peak_energy(
+                            &error[..n],
+                            &original[..n],
+                            pixel_width,
+                            pixel_height,
+                            gradient_peak_floor,
+                        );
+                }
+            } else {
+                // Edge footprints: score only the pixels the decoder keeps,
+                // reading the footprint-strided buffers in place.
+                terms[0] = weight
+                    * ssim_deficit_visible(
+                        &original[..n],
+                        &reconstructed[..n],
+                        pixel_width,
+                        visible_width,
+                        visible_height,
+                    );
+                if gradient_alpha > 0.0 {
+                    terms[1] = weight
+                        * gradient_alpha
+                        * error_gradient_energy_strided(
+                            &error[..n],
+                            pixel_width,
+                            visible_width,
+                            visible_height,
+                        );
+                }
+                if gradient_peak_alpha > 0.0 {
+                    terms[2] = weight
+                        * gradient_peak_alpha
+                        * error_gradient_peak_energy_strided(
+                            &error[..n],
+                            &original[..n],
+                            pixel_width,
+                            visible_width,
+                            visible_height,
+                            gradient_peak_floor,
+                        );
+                }
+            }
+            terms
+        };
+    let mut rate = 0.0f32;
+    rate += unsafe {
+        quantize(
+            &coeffs[1][..n],
+            &inverse_matrices[1][..n],
+            quant_scales[1],
+            quantization.dequant_bias[1],
+            &thresholds[1],
+            width,
+            height,
+            half,
+            cx,
+            cy,
+            &mut coeff_error[1][..n],
+            rate_log2_lut,
+            scan_pos,
+        )
+    };
+    reconstruct_error(
+        input.idct,
+        strategy,
+        &coeff_error[1][..n],
+        &mut y_error[..n],
+    );
+    {
+        unsafe {
+            prepare_reconstruction(
+                opsin.plane(1),
+                px,
+                py,
+                pixel_width,
+                pixel_height,
+                &y_error[..n],
+                &mut original[..n],
+                &mut reconstructed[..n],
+            );
+        }
+        let terms = channel_terms(1, &y_error[..n], &original[..n], &reconstructed[..n]);
+        LumaPhase { rate, terms }
+    }
+}
+
+/// Completes a score whose luma phase is `luma`: quantizes the chroma
+/// channels against the reconstructed luma and sums every channel's terms
+/// in channel order.
+pub(crate) fn recon_chroma_phase_with_kernels(
+    scratch: &mut [[f32; 4096]; 8],
+    input: &ReconDistInput<'_>,
+    kernels: &ReconKernels<'_>,
+    luma: LumaPhase,
+) -> ReconCost {
     let quantization = &input.quantization;
     let transform = &input.transform;
     let source = &input.source;
@@ -1333,7 +1636,14 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     let quant_scales = [qac * qm_mult_x, qac, qac * quantization.qm_mult_b];
 
     let (coeff_error, rest) = scratch.split_at_mut(3);
-    let [spatial_error, _, combined_error, reconstructed, original] = rest else {
+    let [
+        spatial_error,
+        y_error,
+        combined_error,
+        reconstructed,
+        original,
+    ] = rest
+    else {
         unreachable!()
     };
     let scan_pos = if quantization.compute_rate {
@@ -1341,24 +1651,84 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
     } else {
         &[]
     };
-    let mut rate = 0.0f32;
-    rate += unsafe {
-        quantize(
-            &coeffs[1][..n],
-            &inverse_matrices[1][..n],
-            quant_scales[1],
-            quantization.dequant_bias[1],
-            &thresholds[1],
-            width,
-            height,
-            half,
-            cx,
-            cy,
-            &mut coeff_error[1][..n],
-            rate_log2_lut,
-            scan_pos,
-        )
-    };
+    let footprint = Footprint::new(
+        opsin.xsize(),
+        opsin.ysize(),
+        px,
+        py,
+        pixel_width,
+        pixel_height,
+    );
+    let (visible_width, visible_height) = (footprint.visible_width, footprint.visible_height);
+    // The three distortion terms of one channel: its SSIM deficit and the
+    // two gradient penalties, each already weighted.
+    let channel_terms =
+        |c: usize, error: &[f32], original: &[f32], reconstructed: &[f32]| -> [f32; 3] {
+            let weight = input.scoring.channel_weights[c];
+            let mut terms = [0.0f32; 3];
+            if footprint.is_full() {
+                terms[0] = weight
+                    * unsafe {
+                        ssim(
+                            &original[..n],
+                            &reconstructed[..n],
+                            pixel_width,
+                            pixel_height,
+                        )
+                    };
+                if gradient_alpha > 0.0 {
+                    terms[1] = weight
+                        * gradient_alpha
+                        * error_gradient_energy(&error[..n], pixel_width, pixel_height);
+                }
+                if gradient_peak_alpha > 0.0 {
+                    terms[2] = weight
+                        * gradient_peak_alpha
+                        * error_gradient_peak_energy(
+                            &error[..n],
+                            &original[..n],
+                            pixel_width,
+                            pixel_height,
+                            gradient_peak_floor,
+                        );
+                }
+            } else {
+                // Edge footprints: score only the pixels the decoder keeps,
+                // reading the footprint-strided buffers in place.
+                terms[0] = weight
+                    * ssim_deficit_visible(
+                        &original[..n],
+                        &reconstructed[..n],
+                        pixel_width,
+                        visible_width,
+                        visible_height,
+                    );
+                if gradient_alpha > 0.0 {
+                    terms[1] = weight
+                        * gradient_alpha
+                        * error_gradient_energy_strided(
+                            &error[..n],
+                            pixel_width,
+                            visible_width,
+                            visible_height,
+                        );
+                }
+                if gradient_peak_alpha > 0.0 {
+                    terms[2] = weight
+                        * gradient_peak_alpha
+                        * error_gradient_peak_energy_strided(
+                            &error[..n],
+                            &original[..n],
+                            pixel_width,
+                            visible_width,
+                            visible_height,
+                            gradient_peak_floor,
+                        );
+                }
+            }
+            terms
+        };
+    let mut rate = luma.rate;
     for c in [0usize, 2] {
         let factor = if c == 0 { factor_x } else { factor_b };
         combine_error(
@@ -1386,97 +1756,41 @@ pub(crate) fn recon_dist_and_rate_with_kernels(
         };
     }
 
-    let footprint = Footprint::new(
-        opsin.xsize(),
-        opsin.ysize(),
-        px,
-        py,
-        pixel_width,
-        pixel_height,
-    );
-    let (visible_width, visible_height) = (footprint.visible_width, footprint.visible_height);
     let mut distortion = 0.0f32;
     for c in 0..3 {
-        reconstruct_error(
-            input.idct,
-            strategy,
-            &coeff_error[c][..n],
-            &mut spatial_error[..n],
-        );
-        let error: &[f32] = &spatial_error[..n];
-        let plane = opsin.plane(c);
-        unsafe {
-            prepare_reconstruction(
-                plane,
-                px,
-                py,
-                pixel_width,
-                pixel_height,
-                error,
-                &mut original[..n],
-                &mut reconstructed[..n],
-            );
-        }
-        let weight = input.scoring.channel_weights[c];
-        if footprint.is_full() {
-            distortion += weight
-                * unsafe {
-                    ssim(
-                        &original[..n],
-                        &reconstructed[..n],
-                        pixel_width,
-                        pixel_height,
-                    )
-                };
-            if gradient_alpha > 0.0 {
-                distortion += weight
-                    * gradient_alpha
-                    * error_gradient_energy(&error[..n], pixel_width, pixel_height);
-            }
-            if gradient_peak_alpha > 0.0 {
-                distortion += weight
-                    * gradient_peak_alpha
-                    * error_gradient_peak_energy(
-                        &error[..n],
-                        &original[..n],
-                        pixel_width,
-                        pixel_height,
-                        gradient_peak_floor,
-                    );
-            }
-        } else {
-            // Edge footprints: score only the pixels the decoder keeps,
-            // reading the footprint-strided buffers in place.
-            distortion += weight
-                * ssim_deficit_visible(
-                    &original[..n],
-                    &reconstructed[..n],
-                    pixel_width,
-                    visible_width,
-                    visible_height,
+        let (error, terms): (&[f32], [f32; 3]) = match c {
+            1 => (&y_error[..n], luma.terms),
+            _ => {
+                reconstruct_error(
+                    input.idct,
+                    strategy,
+                    &coeff_error[c][..n],
+                    &mut spatial_error[..n],
                 );
-            if gradient_alpha > 0.0 {
-                distortion += weight
-                    * gradient_alpha
-                    * error_gradient_energy_strided(
-                        &error[..n],
+                let plane = opsin.plane(c);
+                unsafe {
+                    prepare_reconstruction(
+                        plane,
+                        px,
+                        py,
                         pixel_width,
-                        visible_width,
-                        visible_height,
+                        pixel_height,
+                        &spatial_error[..n],
+                        &mut original[..n],
+                        &mut reconstructed[..n],
                     );
+                }
+                let terms =
+                    channel_terms(c, &spatial_error[..n], &original[..n], &reconstructed[..n]);
+                (&spatial_error[..n], terms)
             }
-            if gradient_peak_alpha > 0.0 {
-                distortion += weight
-                    * gradient_peak_alpha
-                    * error_gradient_peak_energy_strided(
-                        &error[..n],
-                        &original[..n],
-                        pixel_width,
-                        visible_width,
-                        visible_height,
-                        gradient_peak_floor,
-                    );
-            }
+        };
+        distortion += terms[0];
+        if gradient_alpha > 0.0 {
+            distortion += terms[1];
+        }
+        if gradient_peak_alpha > 0.0 {
+            distortion += terms[2];
         }
         if rgb_hue_alpha > 0.0 || scoring.keep_spatial_errors {
             coeff_error[c][..n].copy_from_slice(error);

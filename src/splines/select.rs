@@ -134,7 +134,7 @@ pub(super) struct BlockModel<'a> {
 impl<'a> BlockModel<'a> {
     pub(super) fn new(ctx: &'a EncodingContext, distance: f32) -> Self {
         let matrices = ctx.point_chroma_hq_matrices().unwrap_or_else(|| {
-            crate::quant_weights::DequantMatrices::new(distance, crate::Arbiter::Ssimulacra2)
+            crate::quant_weights::DequantMatrices::new(distance, crate::Arbiter::Ssimulacra2, false)
         });
         BlockModel {
             ctx,

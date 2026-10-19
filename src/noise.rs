@@ -102,7 +102,7 @@ pub(crate) static NOISE_AC_MASK: [u32; 64] = {
 
 #[allow(dead_code)]
 pub(crate) fn noise_shrink_scalar(coeffs: &mut [f32; 64], t2: f32) {
-    if !(t2 > 0.0) {
+    if t2 <= 0.0 || t2.is_nan() {
         return;
     }
     for (coeff, &mask) in coeffs.iter_mut().zip(&NOISE_AC_MASK) {

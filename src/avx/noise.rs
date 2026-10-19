@@ -73,7 +73,7 @@ pub(crate) fn noise_laplacian_stats_avx2(patch: &[f32; 64]) -> [f32; 2] {
 
 #[target_feature(enable = "avx2")]
 pub(crate) fn noise_shrink_avx2(coeffs: &mut [f32; 64], t2: f32) {
-    if !(t2 > 0.0) {
+    if t2 <= 0.0 || t2.is_nan() {
         return;
     }
     let threshold = _mm256_set1_ps(t2);

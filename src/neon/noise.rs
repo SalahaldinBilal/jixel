@@ -72,7 +72,7 @@ pub(crate) fn noise_laplacian_stats_neon(patch: &[f32; 64]) -> [f32; 2] {
 
 #[target_feature(enable = "neon")]
 pub(crate) fn noise_shrink_neon(coeffs: &mut [f32; 64], t2: f32) {
-    if !(t2 > 0.0) {
+    if t2 <= 0.0 || t2.is_nan() {
         return;
     }
     let threshold = vdupq_n_f32(t2);

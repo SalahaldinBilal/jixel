@@ -2403,7 +2403,7 @@ mod tests {
     fn assert_refill_matches(name: &str, channel: usize, actual: &[f32], expected: &[f32]) {
         assert_eq!(actual.len(), expected.len());
         for (i, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
-            if channel % 2 == 0 {
+            if channel.is_multiple_of(2) {
                 // Multiplication order must be identical even on FMA CPUs.
                 assert_eq!(actual, expected, "{name} channel {channel} coeff {i}");
             } else {

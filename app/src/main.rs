@@ -1,13 +1,10 @@
 #![forbid(unsafe_code)]
 
 // use image::imageops::FilterType;
-use jixel::{
-    CodingTransform, ColorEncoding, DecodingSpeed, EncodeConfig, Grain, GroupOrder, Speed,
-};
+use jixel::{CodingTransform, ColorEncoding, DecodingSpeed, EncodeConfig, Speed};
 use std::num::NonZero;
 use std::path::Path;
 use std::thread::available_parallelism;
-use std::time::Instant;
 
 fn main() {
     let output = "encoded_lossy_b.jxl";
@@ -18,31 +15,6 @@ fn main() {
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
     let distance = 1.0;
-    for _ in 0..0 {
-        let instant = Instant::now();
-        let _d_bytes = jixel::encode_image(
-            &rgb_img,
-            image.width() as usize,
-            image.height() as usize,
-            // ColorSpace::Rgb,
-            // false,
-            // &FlMeta::srgb(),
-            &EncodeConfig::default()
-                .with_lossless(false)
-                .with_distance(distance)
-                .with_progressive(false)
-                .with_patches(false)
-                .with_speed(Speed::Medium)
-                .with_num_threads(
-                    available_parallelism()
-                        .unwrap_or(NonZero::new(1).unwrap())
-                        .get(),
-                ),
-            // .with_icc_profile(display_p3.to_vec()),
-        )
-        .unwrap();
-        println!("Encoded in {}ms", instant.elapsed().as_millis());
-    }
     let width = image.width() as usize;
     let height = image.height() as usize;
     let cfg = EncodeConfig::default()

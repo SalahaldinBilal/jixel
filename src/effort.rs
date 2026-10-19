@@ -138,6 +138,9 @@ effort_gates! {
     ink_layer_default,
     /// `EncodeConfig::vector_layers` is on by default at this speed.
     vector_layers_default,
+    /// Saturated pixels take a free target beyond the clip limit before the
+    /// forward transform.
+    clip_continuation,
     /// Lossy tile patches also match near-duplicate tiles, not only exact ones.
     near_patch_tiles,
     /// Any config strictly cheaper than the default hybrid-uint wins (else a 0.5% bar).
@@ -228,6 +231,7 @@ const FAST: Effort = Effort {
 
 const MEDIUM: Effort = Effort {
     vector_layers_default: false,
+    clip_continuation: false,
     full_rerank: false,
     layout_retile: false,
     learned_rate: false,

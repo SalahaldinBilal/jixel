@@ -102,7 +102,7 @@ pub(crate) static NOISE_AC_MASK: [u32; 64] = {
 
 #[allow(dead_code)]
 pub(crate) fn noise_shrink_scalar(coeffs: &mut [f32; 64], t2: f32) {
-    if !(t2 > 0.0) {
+    if t2 <= 0.0 || t2.is_nan() {
         return;
     }
     for (coeff, &mask) in coeffs.iter_mut().zip(&NOISE_AC_MASK) {
@@ -137,9 +137,9 @@ pub enum Grain {
     /// Film-grain synthesis in AV1's manner: the fine noise the source
     /// carries at each intensity is measured on its flat areas, removed from
     /// the coded image, and re-synthesized by the decoder at this multiple of
-    /// the measured level. `1.0` gives back the source's own grain, so the
-    /// decoded picture keeps its texture where quantization would have
-    /// smoothed it, and fewer bits go to noise; larger values stylize.
+    /// the measured level. `1.0` targets the source's fine-noise level while
+    /// spending fewer bits on noise; larger values stylize. The decoder's
+    /// fixed high-pass grain does not preserve the source's noise spectrum.
     /// Sources with no flat areas to measure on get none.
     Measured(f32),
     /// Explicit strength LUT, one value in `0..1` per intensity point
@@ -395,10 +395,20 @@ struct NoiseSample {
 
 const BLOCK: usize = 8;
 
+// Several measurement bins per decoder LUT segment keep genuinely different
+// noise levels from competing for the same flat-patch cutoff or noise floor.
+const INTENSITY_BINS: usize = (NUM_POINTS - 1) * 4;
+
+fn intensity_bin(intensity: f32) -> usize {
+    ((intensity.max(0.0) * ((NUM_POINTS - 2) * 4) as f32) as usize).min(INTENSITY_BINS - 1)
+}
+
 /// Flat-patch detection and per-patch noise level, after libjxl's
 /// `GetNoiseParameter`: the texture score of a patch is the mean of the
 /// smallest half of its 3x4 sub-patch SADs against the center sub-patch;
-/// the histogram mode of the scores is taken as the flat-patch level.
+/// the histogram mode of the scores is taken as the flat-patch level within
+/// each intensity bin. A global cutoff would reject noisy shadows whenever
+/// quieter highlights dominate the image (or vice versa).
 fn noise_samples(opsin: &Image3F, kernels: NoiseKernels) -> Vec<NoiseSample> {
     let xsize = opsin.xsize();
     let ysize = opsin.ysize();
@@ -408,37 +418,50 @@ fn noise_samples(opsin: &Image3F, kernels: NoiseKernels) -> Vec<NoiseSample> {
     let bx = xsize / BLOCK;
     let by = ysize / BLOCK;
     let mut scores = Vec::with_capacity(bx * by);
-    let mut hist = [0u32; 256];
+    let mut histograms = [[0u32; 256]; INTENSITY_BINS];
     for gy in 0..by {
         for gx in 0..bx {
             let patch = intensity_patch(opsin, gx * BLOCK, gy * BLOCK);
             let score = (kernels.texture_score)(&patch);
-            scores.push(score);
-            hist[((score * 256.0) as usize).min(255)] += 1;
+            let intensity = patch.iter().sum::<f32>() / (BLOCK * BLOCK) as f32;
+            let bin = intensity_bin(intensity);
+            scores.push((score, bin));
+            histograms[bin][((score * 256.0) as usize).min(255)] += 1;
         }
     }
-    let mode = hist
-        .iter()
-        .enumerate()
-        .max_by_key(|&(_, &n)| n)
-        .map_or(0, |(i, _)| i);
-    let threshold = mode as f32 / 256.0;
-    // A strong regular pattern dominates the histogram; nothing flat to
-    // measure on.
-    if threshold > 0.15 || threshold <= 0.0 {
-        return Vec::new();
-    }
+    let thresholds = histograms.map(|hist| {
+        let mode = hist
+            .iter()
+            .enumerate()
+            .max_by_key(|&(i, &n)| (n, std::cmp::Reverse(i)))
+            .map_or(0, |(i, _)| i);
+        // A strong regular pattern dominates this intensity range; nothing
+        // flat to measure on. Use the upper edge of the modal bin so faint
+        // grain in bin zero is retained too.
+        (mode as f32 / 256.0 <= 0.15).then_some((mode + 1) as f32 / 256.0)
+    });
 
     let mut samples = Vec::new();
     for gy in 0..by {
         for gx in 0..bx {
-            if scores[gy * bx + gx] > threshold {
+            let (score, bin) = scores[gy * bx + gx];
+            let Some(threshold) = thresholds[bin] else {
+                continue;
+            };
+            if score >= threshold {
                 continue;
             }
             let x0 = gx * BLOCK;
             let y0 = gy * BLOCK;
             let patch = intensity_patch(opsin, x0, y0);
             let [intensity, level] = (kernels.laplacian_stats)(&patch);
+            // Periodic texture can match the center sub-patch almost exactly
+            // despite a large high-frequency response. White noise's mean
+            // Laplacian is smaller than its 12-pixel SAD; leave ample margin
+            // and allow rounding error on constant patches.
+            if level > 2.0 * score + 1e-6 {
+                continue;
+            }
             samples.push(NoiseSample { intensity, level });
         }
     }
@@ -572,11 +595,12 @@ fn fit_lut(samples: &[NoiseSample]) -> [f32; NUM_POINTS] {
         (pos, (pos.floor() as usize).min(NUM_POINTS - 2))
     };
     // Noise is the floor of the patch levels: texture only adds to it. Per
-    // LUT segment keep the lower half of the levels, which drops the flat
-    // patches that still carry some structure.
-    let mut floors = vec![Vec::new(); NUM_POINTS - 1];
+    // intensity bin keep the lower half of the levels, which drops the flat
+    // patches that still carry some structure without discarding noisier
+    // shadows that share a decoder LUT segment with quieter midtones.
+    let mut floors = vec![Vec::new(); INTENSITY_BINS];
     for s in samples {
-        floors[segment(s).1].push(s.level);
+        floors[intensity_bin(s.intensity)].push(s.level);
     }
     let cutoffs: Vec<f32> = floors
         .iter_mut()
@@ -593,7 +617,7 @@ fn fit_lut(samples: &[NoiseSample]) -> [f32; NUM_POINTS] {
     let mut b = [0f64; NUM_POINTS];
     for s in samples {
         let (pos, i) = segment(s);
-        if s.level > cutoffs[i] {
+        if s.level > cutoffs[intensity_bin(s.intensity)] {
             continue;
         }
         let f = (pos - i as f32) as f64;
@@ -1153,6 +1177,95 @@ mod tests {
             }
         }
         assert!(!measured_grain(&img).has_any());
+    }
+
+    fn noisy_gray_bands(bands: &[(f32, f32, usize)]) -> Image3F {
+        let w = bands.iter().map(|&(_, _, width)| width).sum();
+        let mut img = Image3F::new(w, 256);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut x0 = 0;
+        for &(mean, sigma, width) in bands {
+            for y in 0..img.ysize() {
+                for x in x0..x0 + width {
+                    let mut n = -6.0;
+                    for _ in 0..12 {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        n += (state >> 40) as f32 / (1u64 << 24) as f32;
+                    }
+                    img.plane_row_mut(1, y)[x] = mean + sigma * n;
+                    img.plane_row_mut(2, y)[x] = mean + sigma * n;
+                }
+            }
+            x0 += width;
+        }
+        img
+    }
+
+    #[test]
+    fn faint_noise_is_not_discarded_by_the_score_histogram() {
+        let img = noisy_gray_bands(&[(0.5, 0.0006, 256)]);
+        let measured = measured_grain(&img);
+        assert!(measured.has_any(), "lut {:?}", measured.lut);
+    }
+
+    #[test]
+    fn repeated_texture_is_not_measured_as_faint_noise() {
+        for sigma in [0.0, 0.0006] {
+            for pattern in [0, 1, 2] {
+                let mut img = noisy_gray_bands(&[(0.5, sigma, 256)]);
+                for y in 0..img.ysize() {
+                    for x in 0..img.xsize() {
+                        let phase = match pattern {
+                            0 => x + y,
+                            1 => x,
+                            _ => y,
+                        };
+                        let texture = if phase % 2 == 0 { -0.05 } else { 0.05 };
+                        img.plane_row_mut(1, y)[x] += texture;
+                        img.plane_row_mut(2, y)[x] += texture;
+                    }
+                }
+                let measured = measured_grain(&img);
+                assert!(
+                    !measured.has_any(),
+                    "sigma {sigma}, pattern {pattern}, lut {:?}",
+                    measured.lut
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn measured_noise_preserves_shadow_highlight_strengths() {
+        // A large, quiet highlight must not set the flat-patch cutoff for
+        // noisier shadows. Exercise both noise profiles and area ratios.
+        for widths in [[256, 256], [64, 448], [448, 64]] {
+            for (means, sigmas) in [
+                ([0.1, 0.7], [0.02, 0.002]),
+                ([0.1, 0.7], [0.002, 0.02]),
+                // Both intensities share one decoder LUT segment.
+                ([0.1, 0.26], [0.02, 0.01]),
+                ([0.1, 0.26], [0.01, 0.02]),
+            ] {
+                let img = noisy_gray_bands(&[
+                    (means[0], sigmas[0], widths[0]),
+                    (means[1], sigmas[1], widths[1]),
+                ]);
+                let measured = measured_grain(&img);
+                for (mean, sigma) in means.into_iter().zip(sigmas) {
+                    let level = (2.0 / std::f32::consts::PI).sqrt() * 29.25f32.sqrt() * sigma * 0.5;
+                    let want = level / LAPLACIAN_LEVEL_PER_UNIT;
+                    let got = measured.strength_at(mean * 0.5);
+                    assert!(
+                        got > want * 0.6 && got < want * 1.3,
+                        "widths {widths:?}, sigmas {sigmas:?}, mean {mean}: {got} vs {want}, lut {:?}",
+                        measured.lut
+                    );
+                }
+            }
+        }
     }
 
     /// White noise of a known standard deviation on a flat field comes back

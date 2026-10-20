@@ -193,6 +193,12 @@ impl<T: Copy + Default> Image3<T> {
     }
 
     #[inline]
+    pub(crate) fn all_planes_mut(&mut self) -> [&mut Plane<T>; 3] {
+        let [a, b, c] = &mut self.planes;
+        [a, b, c]
+    }
+
+    #[inline]
     pub(crate) fn plane_row(&self, c: usize, y: usize) -> &[T] {
         self.planes[c].row(y)
     }

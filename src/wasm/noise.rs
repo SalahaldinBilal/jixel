@@ -77,7 +77,7 @@ pub(crate) fn noise_laplacian_stats_wasm(patch: &[f32; 64]) -> [f32; 2] {
 
 #[target_feature(enable = "simd128")]
 pub(crate) fn noise_shrink_wasm(coeffs: &mut [f32; 64], t2: f32) {
-    if !(t2 > 0.0) {
+    if t2 <= 0.0 || t2.is_nan() {
         return;
     }
     let threshold = f32x4_splat(t2);

@@ -23,7 +23,7 @@ use std::time::Instant;
 fn usage() -> ! {
     eprintln!(
         "usage: jixel-tuner <input-image> <output.jxl> --distance <d> [--threads <n>]\n\
-         [--speed extraslow|slow|medium|fast|fastest|ultrafast] [--lossless]\n\
+         [--speed extraslow|slow|mediumslow|medium|fast|fastest|ultrafast] [--lossless]\n\
          [--decoding-speed slow|fast|fastest] (lossless only)"
     );
     eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
@@ -83,6 +83,7 @@ fn main() -> ExitCode {
                     "extraslow" => jixel::Speed::ExtraSlow,
                     "slow" => jixel::Speed::Slow,
                     "medium" => jixel::Speed::Medium,
+                    "mediumslow" => jixel::Speed::MediumSlow,
                     "fast" => jixel::Speed::Fast,
                     "fastest" => jixel::Speed::Fastest,
                     "ultrafast" => jixel::Speed::UltraFast,

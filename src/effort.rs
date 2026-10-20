@@ -111,6 +111,9 @@ effort_gates! {
     /// pairs and 16x16 at any 8-pixel origin; superseded by `layout_retile`.
     layout_dp_coefficient,
     cfl_rdo,
+    /// Frame-constant EPF strength and pass count fitted on the final
+    /// reconstruction by the luma proxy.
+    epf_fit,
     yellow_opsin,
     coeff_orders,
     /// Race frequency-derived coefficient orders against natural scans using
@@ -234,24 +237,22 @@ const FAST: Effort = Effort {
 };
 
 const MEDIUM: Effort = Effort {
-    vector_layers_default: false,
-    clip_continuation: false,
     full_rerank: false,
     layout_retile: false,
     learned_rate: false,
-    coeff_orders: false,
+    tree_full_sampling: false,
+    ..MEDIUM_SLOW
+};
+
+const MEDIUM_SLOW: Effort = Effort {
+    vector_layers_default: false,
+    clip_continuation: false,
+    epf_fit: false,
     ac_ctx_plan: false,
-    ma_dc_tree: false,
-    chroma_dc_squeeze: false,
-    dc_rdoq: false,
-    dc_x_cfl: false,
-    ans_refine: false,
     lossy_modular_auto: false,
     splines: false,
     rct_every_row: false,
-    tree_rank_deep: false,
     tree_dense_sampling: false,
-    tree_full_sampling: false,
     tree_dual_layout: false,
     tree_ctx_v1: false,
     tree_deep_final: false,
@@ -271,6 +272,7 @@ const SLOW: Effort = Effort {
     ans_exhaustive: false,
     lz_exhaustive_entropy: false,
     lz_priced_search: false,
+    tree_rank_deep: false,
     tree_wide_side_preds: false,
     ..Effort::ALL
 };
@@ -284,6 +286,7 @@ impl Speed {
             Speed::Fastest => &FASTEST,
             Speed::Fast => &FAST,
             Speed::Medium => &MEDIUM,
+            Speed::MediumSlow => &MEDIUM_SLOW,
             Speed::Slow => &SLOW,
             Speed::ExtraSlow => &EXTRASLOW,
         }
@@ -301,6 +304,7 @@ mod tests {
             Speed::Fastest,
             Speed::Fast,
             Speed::Medium,
+            Speed::MediumSlow,
             Speed::Slow,
             Speed::ExtraSlow,
         ];

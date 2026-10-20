@@ -253,10 +253,18 @@ pub enum Speed {
     /// Square transforms only; lossless uses no learned context trees.
     #[default]
     Fast,
-    /// The full transform search and color tools of `Slow` without its
-    /// costliest coding refinements; lossless learns its context tree from a
-    /// smaller sample and skips the predictor-preset ranking.
+    /// The full transform search, color tools, custom coefficient orders and
+    /// DC coding tools of `Slow`, with a coefficient-model layout search in
+    /// place of its reconstruction rerank and exact layout search; lossless
+    /// learns its context tree from a smaller sample and skips the
+    /// predictor-preset ranking.
     Medium,
+    /// `Medium` plus `Slow`'s reconstruction rerank, exact layout search and
+    /// learned rate prices; no EPF strength fit, saturated-pixel targets or
+    /// content layers (patches, splines, vector layers, region frames) by
+    /// default. Lossless learns its context tree from `Slow`'s full sample
+    /// but keeps `Medium`'s single group layout, so it decodes as fast.
+    MediumSlow,
     /// Every coding tool with the standard search budget.
     Slow,
     /// All `Slow` tools with stronger final ANS entropy search for lossy and
@@ -1260,8 +1268,9 @@ pub fn encode_image(
     // it is no larger than the VarDCT encode the distance asks for, taken
     // from the edge-cost model instead of a second encode.
     // The vector encode spends what VarDCT would at this distance: its
-    // band precision follows the distance, then drops until the modeled
-    // VarDCT size covers it, and the bare palette base stands last.
+    // band precision follows the distance, then drops until the budget
+    // covers it, but never below the precision of twice the distance; the
+    // bare palette base only stands where that floor reaches it.
     if config.vector_layers {
         let steps = crate::vector_layers::coverage_steps(config.distance);
         if let Some(split) = crate::vector_layers::split(input, width, height, steps) {
@@ -1291,8 +1300,9 @@ pub fn encode_image(
                 let room = ((budget - encoded.base as f64) / encoded.band.max(1) as f64
                     * crate::vector_layers::band_bytes_ratio(steps))
                 .max(0.0);
-                let fit = 2f64.powf(5.0 * room - 1.0).floor().clamp(1.0, steps as f64) as u32;
-                if fit < steps
+                let fit = (5.0 * room - 1.0).exp2().floor().clamp(1.0, steps as f64) as u32;
+                let floor = crate::vector_layers::coverage_steps(2.0 * config.distance);
+                if (floor..steps).contains(&fit)
                     && let Some(split) = crate::vector_layers::split(input, width, height, fit)
                 {
                     fitted = Some(encode_vector_layers(split, width, height, config)?.bytes);

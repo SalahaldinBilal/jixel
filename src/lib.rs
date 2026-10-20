@@ -60,6 +60,8 @@ mod effort;
 mod encode_image;
 mod encoding_context;
 mod entropy;
+mod epf_filter;
+mod epf_proxy;
 mod fast_loseless;
 mod frame;
 mod gaborish;

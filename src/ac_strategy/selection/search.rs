@@ -38,18 +38,17 @@ pub(super) struct CandidateSearch {
 
 impl CandidateSearch {
     pub(super) fn for_speed(speed: crate::Speed, arbiter: crate::Arbiter) -> Self {
-        match speed {
-            crate::Speed::Medium => Self {
-                fine_runner_up: true,
-                medium_upgrades: true,
-                ..Self::default()
-            },
-            crate::Speed::Slow => Self {
-                // This search improves CVVDP, with a small SSIMULACRA2 tradeoff.
-                merge32_upgrades: arbiter == crate::Arbiter::Cvvdp,
-                ..Self::default()
-            },
-            _ => Self::default(),
+        let effort = speed.effort();
+        // Without the full reconstruction rerank, the rectangle search keeps
+        // a fine runner-up and verifies a few merge upgrades instead.
+        let substitute = effort.rectangles && !effort.full_rerank;
+        Self {
+            fine_runner_up: substitute,
+            medium_upgrades: substitute,
+            // This search improves CVVDP, with a small SSIMULACRA2 tradeoff.
+            merge32_upgrades: effort.full_rerank
+                && !effort.layout_loop
+                && arbiter == crate::Arbiter::Cvvdp,
         }
     }
 }

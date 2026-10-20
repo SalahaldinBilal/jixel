@@ -62,7 +62,7 @@ use loop_group_map::LoopGroupMap;
 
 const K_BLOCK_DIM: usize = 8;
 const K_TILE_DIM: usize = 64;
-const K_GROUP_DIM: usize = 256;
+pub(crate) const K_GROUP_DIM: usize = 256;
 pub(crate) const K_DC_GROUP_DIM: usize = 2048;
 const K_GROUP_DIM_IN_BLOCKS: usize = 32; // = K_GROUP_DIM / K_BLOCK_DIM
 const K_TILE_DIM_IN_BLOCKS: usize = 8; // = K_TILE_DIM / K_BLOCK_DIM
@@ -119,6 +119,7 @@ pub(crate) struct DistanceParams {
     x_qm_scale: u32,
     epf_iters: u32,
     epf_pass0_scale: Option<f32>,
+    epf_quant_mul: Option<f32>,
     gab_enabled: bool,
     /// Multipliers of the default DC steps of X, Y and B.
     dc_step: [f32; 3],
@@ -213,6 +214,7 @@ fn compute_distance_params(distance: f32) -> DistanceParams {
         x_qm_scale,
         epf_iters,
         epf_pass0_scale,
+        epf_quant_mul: None,
         gab_enabled,
         dc_step: chroma_dc_steps(qdc),
     }
@@ -980,6 +982,7 @@ fn write_frame_header_kind(
     b_qm_scale: u32,
     epf_iters: u32,
     epf_pass0_scale: Option<f32>,
+    epf_quant_mul: Option<f32>,
     gab_enabled: bool,
     has_alpha: bool,
     coeff_shifts: &[u32],
@@ -999,6 +1002,7 @@ fn write_frame_header_kind(
             b_qm_scale,
             epf_iters,
             epf_pass0_scale,
+            epf_quant_mul,
             gab_enabled,
             has_alpha,
             coeff_shifts,
@@ -1017,6 +1021,7 @@ fn write_frame_header_kind(
             b_qm_scale,
             epf_iters,
             epf_pass0_scale,
+            epf_quant_mul,
             gab_enabled,
             has_alpha,
             coeff_shifts,
@@ -1049,7 +1054,14 @@ fn write_frame_header_kind(
             w.write(2, PATCH_REF_ID as u64);
             w.write(1, 1); // save_before_color_transform
             w.write(2, 0); // empty name
-            write_loop_filter(epf_iters, epf_pass0_scale, gab_enabled, None, w);
+            write_loop_filter(
+                epf_iters,
+                epf_pass0_scale,
+                epf_quant_mul,
+                gab_enabled,
+                None,
+                w,
+            );
             w.write(2, 0); // no frame-header extensions
         }
     }
@@ -1058,11 +1070,12 @@ fn write_frame_header_kind(
 fn write_loop_filter(
     epf_iters: u32,
     epf_pass0_scale: Option<f32>,
+    epf_quant_mul: Option<f32>,
     gab_enabled: bool,
     epf_channel_scale: Option<[f32; 3]>,
     w: &mut BitWriter,
 ) {
-    if epf_iters == 2 && gab_enabled && epf_channel_scale.is_none() {
+    if epf_iters == 2 && gab_enabled && epf_channel_scale.is_none() && epf_quant_mul.is_none() {
         w.write(1, 1); // default loop filter (gab=1, epf=2)
     } else {
         w.write(1, 0); // not default
@@ -1086,10 +1099,10 @@ fn write_loop_filter(
                 }
             }
             // epf_sigma_custom: [quant_mul, pass0_scale, pass2_scale,
-            // border_sad_mul], spec defaults 0.46, 0.9, 6.5, 2/3. Only the
-            // pass-0 scale is scheduled; the rest stay at spec.
-            if let Some(s) = epf_pass0_scale {
-                let c = [0.46, s, 6.5, 2.0 / 3.0];
+            // border_sad_mul], spec defaults 0.46, 0.9, 6.5, 2/3. The fitter
+            // varies quant_mul and pass0; the other two stay at spec.
+            if let Some(s) = epf_pass0_scale.or(epf_quant_mul.map(|_| 0.9)) {
+                let c = [epf_quant_mul.unwrap_or(0.46), s, 6.5, 2.0 / 3.0];
                 w.write(1, 1); // custom epf sigma
                 for x in c {
                     w.write(16, crate::util::f32_to_f16_bits(x) as u64);
@@ -1107,6 +1120,7 @@ fn write_frame_header(
     b_qm_scale: u32,
     epf_iters: u32,
     epf_pass0_scale: Option<f32>,
+    epf_quant_mul: Option<f32>,
     gab_enabled: bool,
     has_alpha: bool,
     coeff_shifts: &[u32],
@@ -1232,6 +1246,7 @@ fn write_frame_header(
     write_loop_filter(
         epf_iters,
         epf_pass0_scale,
+        epf_quant_mul,
         gab_enabled,
         epf_channel_scale,
         w,
@@ -3793,6 +3808,21 @@ fn encode_frame_core(
         dc.block_quant_field = None;
     }
 
+    // Layer residuals and progressive/DC frames retain the EPF schedule.
+    let fit_epf = ctx.speed.effort().epf_fit
+        && ctx.coding.is_xyb()
+        && matches!(frame_kind, VarDctFrameKind::Regular)
+        && ctx.frame_role == FrameRole::Last
+        && noise.is_none()
+        && !use_dc_frame
+        && num_passes == 1
+        && (0.5..=24.0).contains(&distance)
+        && dim.xsize >= 16
+        && dim.ysize >= 16;
+    #[cfg(feature = "splines")]
+    let fit_epf = fit_epf && splines.is_none();
+    let mut epf_recon = fit_epf.then(|| Image3F::new(dim.xsize, dim.ysize));
+
     // Per-image quant-field threshold for the fine AC block-context layout.
     // The median splits the field into halves with genuinely different
     // coefficient statistics; whether any split is *kept* is decided later
@@ -3850,7 +3880,7 @@ fn encode_frame_core(
         .steal_map(scratch, ac_tasks.len(), |t, scratch| {
             let (dc_idx, gx, gy) = ac_tasks[t];
             let (dc_gx, dc_gy) = group_coords[dc_idx];
-            let (p, local, source_b, stats, _) = process_ac_group(
+            let (p, local, source_b, stats, capture) = process_ac_group(
                 ctx,
                 scratch,
                 opsin,
@@ -3867,19 +3897,26 @@ fn encode_frame_core(
                 None,
                 &natural_orders,
                 &[],
-                want_order_stats || use_dc_frame,
+                want_order_stats || use_dc_frame || fit_epf,
                 qf_threshold,
-                false,
+                // Without custom orders this pass is the final quantization.
+                fit_epf && !want_order_stats,
                 None,
             );
-            (dc_idx, gx, gy, p, local, source_b, stats)
+            (
+                (dc_idx, gx, gy, p, local, source_b, stats),
+                capture.map(|(image, _)| image),
+            )
         });
 
     let mut all_pending: Vec<PendingAcGroup> = Vec::with_capacity(results.len());
     // Adopt the first group's buffers instead of allocating an empty tally.
     // Fast and progressive frames never allocate aggregate order statistics.
     let mut order_stats: Option<crate::coeff_order::OrderStats> = None;
-    for (dc_idx, gx, gy, p, local, source, stats) in results {
+    for ((dc_idx, gx, gy, p, local, source, stats), capture) in results {
+        if let (Some(target), Some(image)) = (epf_recon.as_mut(), capture) {
+            paste_group(target, &dim, p.group_idx, &image);
+        }
         merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
         if let Some(source) = source {
             let dc = &mut dc_datas[dc_idx];
@@ -3904,6 +3941,19 @@ fn encode_frame_core(
             } else {
                 order_stats = Some(s);
             }
+        }
+    }
+
+    // The EPF fit adds the decoded-minus-source DC to its reconstruction.
+    // Other DC tools key on the source planes, so only a copy outlives the
+    // first pass when nothing else asked for them.
+    let mut epf_source_dc = None;
+    if fit_epf && !want_order_stats && !use_dc_frame {
+        epf_source_dc = Some(assemble_source_dc(&dc_datas, &group_coords, &dim));
+        for dc in &mut dc_datas {
+            dc.source_dc_b = None;
+            dc.source_dc_y = None;
+            dc.source_dc_x = None;
         }
     }
 
@@ -3980,6 +4030,9 @@ fn encode_frame_core(
             );
         }
         if !ctx.speed.effort().chroma_dc_squeeze && !use_dc_frame {
+            if fit_epf && epf_source_dc.is_none() {
+                epf_source_dc = Some(assemble_source_dc(&dc_datas, &group_coords, &dim));
+            }
             for dc in &mut dc_datas {
                 dc.source_dc_b = None;
                 dc.source_dc_y = None;
@@ -4071,14 +4124,16 @@ fn encode_frame_core(
             groups
         });
         let refined = if let Some(groups) = loop_groups {
-            groups
+            // The closed loop's groups carry no reconstruction capture.
+            epf_recon = None;
+            groups.into_iter().map(|g| (g, None)).collect::<Vec<_>>()
         } else {
             let dc_ref = &dc_datas;
             ctx.thread_pool
                 .steal_map(scratch, ac_tasks.len(), |t, scratch| {
                     let (dc_idx, gx, gy) = ac_tasks[t];
                     let (dc_gx, dc_gy) = group_coords[dc_idx];
-                    let (p, local, _, _, _) = process_ac_group(
+                    let (p, local, _, _, capture) = process_ac_group(
                         ctx,
                         scratch,
                         opsin,
@@ -4097,13 +4152,16 @@ fn encode_frame_core(
                         &order_alternatives,
                         false,
                         qf_threshold,
-                        false,
+                        fit_epf,
                         None,
                     );
-                    (dc_idx, gx, gy, p, local)
+                    ((dc_idx, gx, gy, p, local), capture.map(|(image, _)| image))
                 })
         };
-        for (dc_idx, gx, gy, p, local) in refined {
+        for ((dc_idx, gx, gy, p, local), capture) in refined {
+            if let (Some(target), Some(image)) = (epf_recon.as_mut(), capture) {
+                paste_group(target, &dim, p.group_idx, &image);
+            }
             merge_quant_dc(&mut dc_datas[dc_idx], gx, gy, &local);
             all_pending.push(p);
         }
@@ -4194,7 +4252,62 @@ fn encode_frame_core(
             dc_cfl,
             ctx.dc_rows.reconstruct,
         )?;
-    let epf_sharpness = epf_sharpness_id(distance, ctx.screen_content());
+    let mut epf_sharpness = epf_sharpness_id(distance, ctx.screen_content());
+    if let Some(mut recon) = epf_recon {
+        let decoded_dc = dc_smoothing::decoded_dc(
+            &dim,
+            &dc_datas,
+            &group_coords,
+            &distp,
+            ytob_dc,
+            dc_cfl,
+            ctx.dc_rows.reconstruct,
+            skip_dc_smoothing,
+        )?;
+        let source_dc =
+            epf_source_dc.unwrap_or_else(|| assemble_source_dc(&dc_datas, &group_coords, &dim));
+        crate::epf_filter::add_dc_error(
+            ctx,
+            scratch,
+            &mut recon,
+            &decoded_dc,
+            &source_dc,
+            &dc_datas,
+            &group_coords,
+        );
+        let source = distp
+            .gab_enabled
+            .then(|| crate::epf_filter::gaborish(opsin));
+        let source = source.as_ref().unwrap_or(opsin);
+        if distp.gab_enabled {
+            crate::epf_filter::gaborish_in_place(&mut recon);
+        }
+        let blocks = crate::epf_filter::FrameBlocks::new(
+            &dc_datas,
+            &group_coords,
+            dim.xsize_blocks,
+            dim.ysize_blocks,
+            distp.global_scale,
+        );
+        let chosen = crate::epf_filter::fit(
+            ctx,
+            scratch,
+            source,
+            &recon,
+            &blocks,
+            distance,
+            crate::epf_filter::Choice {
+                iters: distp.epf_iters,
+                quant_mul: distp.epf_quant_mul,
+                pass0: distp.epf_pass0_scale,
+                sharpness: epf_sharpness,
+            },
+        );
+        distp.epf_iters = chosen.iters;
+        distp.epf_pass0_scale = chosen.pass0;
+        distp.epf_quant_mul = chosen.quant_mul;
+        epf_sharpness = chosen.sharpness;
+    }
     // Pixel-domain decisions are finished; entropy coding only reads DC data
     // and tokens. Release the full-resolution planes before its working sets.
     drop(opsin_image);
@@ -4821,6 +4934,7 @@ fn encode_frame_core(
         ctx.b_qm_scale(),
         distp.epf_iters,
         distp.epf_pass0_scale,
+        distp.epf_quant_mul,
         distp.gab_enabled,
         alpha.is_some(),
         coeff_shifts,
@@ -4853,6 +4967,18 @@ fn encode_frame_core(
         writer,
     );
     Ok(payload_bits)
+}
+
+/// Copies one AC group's reconstruction capture into the frame image.
+fn paste_group(target: &mut Image3F, dim: &ImageDim, group_idx: usize, image: &Image3F) {
+    let x0 = (group_idx % dim.xsize_groups) * K_GROUP_DIM;
+    let y0 = (group_idx / dim.xsize_groups) * K_GROUP_DIM;
+    for c in 0..3 {
+        for y in 0..image.ysize() {
+            target.plane_row_mut(c, y0 + y)[x0..x0 + image.xsize()]
+                .copy_from_slice(image.plane_row(c, y));
+        }
+    }
 }
 
 /// The frame's unrounded per-block XYB DC (the DC frame's input), stitched

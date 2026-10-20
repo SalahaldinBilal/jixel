@@ -904,7 +904,12 @@ pub(crate) struct QuantizeDcMethods {
 /// The DC values of one channel's coefficient block, one per covered 8x8
 /// block in `iy * cov_x + ix` order. Single-block transforms carry their DC in
 /// `coeffs[0]`; larger ones derive it from the lowest frequencies.
-fn dc_from_coefficients(ctx: &EncodingContext, raw_strategy: u8, coeffs: &[f32], dc: &mut [f32]) {
+pub(crate) fn dc_from_coefficients(
+    ctx: &EncodingContext,
+    raw_strategy: u8,
+    coeffs: &[f32],
+    dc: &mut [f32],
+) {
     match raw_strategy {
         STRATEGY_DCT
         | STRATEGY_IDENTITY

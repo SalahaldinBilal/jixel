@@ -181,6 +181,53 @@ fn dequantized_dc(
     Ok(recon)
 }
 
+/// The DC that the final decoder sends to the low-frequency transforms.
+pub(super) fn decoded_dc(
+    dim: &ImageDim,
+    dc_datas: &[DcGroupData],
+    group_coords: &[(usize, usize)],
+    distp: &DistanceParams,
+    ytob_dc: i32,
+    cfl: crate::color_correlation::CflFrame,
+    reconstruct_row: ReconstructDcFn,
+    skip_smoothing: bool,
+) -> Result<Image3F, EncodeError> {
+    let recon = dequantized_dc(
+        dim,
+        dc_datas,
+        group_coords,
+        distp,
+        ytob_dc,
+        cfl,
+        reconstruct_row,
+    )?;
+    if skip_smoothing || recon.xsize() <= 2 || recon.ysize() <= 2 {
+        return Ok(recon);
+    }
+    let mut out = recon.clone();
+    let steps = dc_value_steps(distp);
+    for y in 1..recon.ysize() - 1 {
+        for x in 1..recon.xsize() - 1 {
+            let smoothed: [f32; 3] = std::array::from_fn(|c| {
+                let rows: [&[f32; 3]; 3] = std::array::from_fn(|dy| {
+                    recon.plane_row(c, y + dy - 1)[x - 1..x + 2]
+                        .try_into()
+                        .unwrap()
+                });
+                smooth(rows[0], rows[1], rows[2])
+            });
+            let gap = (0..3).fold(0.5f32, |v, c| {
+                v.max((recon.plane_row(c, y)[x] - smoothed[c]).abs() / steps[c])
+            });
+            for c in 0..3 {
+                let v = recon.plane_row(c, y)[x];
+                out.plane_row_mut(c, y)[x] = v + (smoothed[c] - v) * (3.0 - 4.0 * gap).max(0.0);
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[inline]
 fn smooth(up: &[f32; 3], mid: &[f32; 3], down: &[f32; 3]) -> f32 {
     const W1: f32 = 0.203_451_4;

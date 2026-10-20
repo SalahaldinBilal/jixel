@@ -1609,6 +1609,7 @@ mod tests {
         assert!(!gate(crate::Speed::UltraFast));
         assert!(gate(crate::Speed::Fast));
         assert!(gate(crate::Speed::Medium));
+        assert!(!gate(crate::Speed::MediumSlow));
         assert!(!gate(crate::Speed::Slow));
         assert!(!gate(crate::Speed::ExtraSlow));
     }
@@ -1618,6 +1619,7 @@ mod tests {
             let effort = speed.effort();
             effort.layout_retile && !effort.layout_loop
         };
+        assert!(gate(crate::Speed::MediumSlow));
         assert!(gate(crate::Speed::Slow));
         for speed in [
             crate::Speed::UltraFast,

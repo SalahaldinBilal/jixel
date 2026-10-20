@@ -3598,9 +3598,11 @@ mod tests {
             }
             let medium = super::CandidateSearch::for_speed(crate::Speed::Medium, arbiter);
             assert!(medium.fine_runner_up && medium.medium_upgrades && !medium.merge32_upgrades);
-            let slow = super::CandidateSearch::for_speed(crate::Speed::Slow, arbiter);
-            assert!(!slow.fine_runner_up && !slow.medium_upgrades);
-            assert_eq!(slow.merge32_upgrades, arbiter == crate::Arbiter::Cvvdp);
+            for speed in [crate::Speed::MediumSlow, crate::Speed::Slow] {
+                let slow = super::CandidateSearch::for_speed(speed, arbiter);
+                assert!(!slow.fine_runner_up && !slow.medium_upgrades);
+                assert_eq!(slow.merge32_upgrades, arbiter == crate::Arbiter::Cvvdp);
+            }
         }
     }
 

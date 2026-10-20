@@ -102,6 +102,7 @@ pub(super) fn encode_frame_lossless_core(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    near_lossless: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
@@ -116,6 +117,7 @@ pub(super) fn encode_frame_lossless_core(
         num_color,
         speed,
         decoding_speed,
+        near_lossless,
         pool,
         scratch,
         frame_kind,
@@ -134,6 +136,7 @@ pub(super) fn encode_frame_lossless_core_impl(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    near_lossless: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
@@ -141,7 +144,11 @@ pub(super) fn encode_frame_lossless_core_impl(
     local_trees: bool,
     writer: &mut BitWriter,
 ) -> bool {
-    let use_wp = decoding_speed.use_weighted_predictor();
+    let effort = speed.effort();
+    // Near-lossless samples share a `2k+1` grid. The Weighted predictor's
+    // averaging leaves it, so the tiers without a learned tree keep their
+    // fixed predictor on the grid with Gradient instead.
+    let use_wp = decoding_speed.use_weighted_predictor() && (effort.learned_tree || !near_lossless);
     // The hybrid-uint token of a modular residual can reach ~4*B+11 for B-bit
     // input. For B<=13 this stays below 64, so keep the tight default; for higher
     // bit depths raise LZ77_MIN_SYMBOL above the max literal token so the decoder
@@ -198,6 +205,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                     num_color,
                     speed,
                     decoding_speed,
+                    near_lossless,
                     pool,
                     scratch,
                     frame_kind,
@@ -248,6 +256,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                     num_color,
                     speed,
                     decoding_speed,
+                    near_lossless,
                     pool,
                     scratch,
                     frame_kind,
@@ -318,27 +327,30 @@ pub(super) fn encode_frame_lossless_core_impl(
     // Fast uses fixed Weighted prediction and skips all adaptive analysis. Slow
     // searches the supported Slow predictor set per channel by estimated cost
     // (one global choice, used for the tree and every group).
-    let effort = speed.effort();
 
     // RCT re-selection (Slow, regular RGB frames): estimated over the same
     // fixed-context gradient cost libjxl uses. When a non-YCoCg transform
     // wins, the color planes are rebuilt and the frame headers signal it.
-    // A single gray plane has no RCT.
+    // A single gray plane has no RCT. Near-lossless planes rank at every
+    // tier: their values share a `2k+1` grid that only the subtract-type
+    // transforms preserve, and YCoCg's shifts would scatter it.
     let mut rct_type = if num_color == 3 { 6u32 } else { 0 };
     let mut rct_planes: Option<Image3Si> = None;
-    let rct_ranked: Vec<(u32, f32)> =
-        if frame_kind.allows_learned_tree() && effort.rct_search && num_color == 3 {
-            let row_step = if effort.rct_every_row {
-                1
-            } else if effort.rct_dense_rows {
-                RCT_DENSE_ROW_STEP
-            } else {
-                RCT_SPARSE_ROW_STEP
-            };
-            rank_rcts(linear, xsize, ysize, row_step, pool, scratch)
+    let rct_ranked: Vec<(u32, f32)> = if frame_kind.allows_learned_tree()
+        && (effort.rct_search || near_lossless)
+        && num_color == 3
+    {
+        let row_step = if effort.rct_every_row {
+            1
+        } else if effort.rct_dense_rows {
+            RCT_DENSE_ROW_STEP
         } else {
-            Vec::new()
+            RCT_SPARSE_ROW_STEP
         };
+        rank_rcts(linear, xsize, ysize, row_step, pool, scratch)
+    } else {
+        Vec::new()
+    };
     if let Some(&(t, _)) = rct_ranked.first()
         && t != 6
     {

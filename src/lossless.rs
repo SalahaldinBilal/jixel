@@ -33,6 +33,7 @@
 //! candidates. The `ma_*` modules handle learned-tree sources, sampling,
 //! learning, and encoding. Palette, predictor, LZ77, and Squeeze implementations
 //! live in their own module trees; `header` and `tree` serialize shared syntax.
+//! `near_lossless` is the bounded-error pre-pass applied before the exact coder.
 
 #[cfg(test)]
 #[path = "lossless/tests/constant_channel_tests.rs"]
@@ -61,6 +62,8 @@ mod ma_sampling;
 mod ma_sampling_tests;
 mod ma_source;
 mod ma_streams;
+mod near_lossless;
+pub(crate) use near_lossless::quantize_planes;
 mod palette;
 mod predictor;
 #[cfg(test)]

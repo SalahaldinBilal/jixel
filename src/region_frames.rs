@@ -496,6 +496,7 @@ mod tests {
                 3,
                 crate::Speed::Slow,
                 crate::DecodingSpeed::Slow,
+                false,
                 threads,
                 &mut w,
             );

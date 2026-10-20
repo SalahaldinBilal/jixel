@@ -329,6 +329,7 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
         3,
         speed,
         decoding_speed,
+        false,
         pool,
         scratch,
         ModularFrameKind::XybBlend { last: true },
@@ -357,6 +358,7 @@ pub(crate) fn encode_frame_lossless_layer(
         3,
         speed,
         decoding_speed,
+        false,
         pool,
         scratch,
         kind,
@@ -428,6 +430,7 @@ pub(crate) fn encode_modular_xyb_atlas_tree_slot(
         3,
         speed,
         crate::DecodingSpeed::Slow,
+        false,
         pool,
         scratch,
         ModularFrameKind::XybReferenceOnly {

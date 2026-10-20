@@ -24,7 +24,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: jixel-tuner <input-image> <output.jxl> --distance <d> [--threads <n>]\n\
          [--speed extraslow|slow|mediumslow|medium|fast|fastest|ultrafast] [--lossless]\n\
-         [--decoding-speed slow|fast|fastest] (lossless only)"
+         [--decoding-speed slow|fast|fastest] [--near-lossless <k>] (lossless only)"
     );
     eprintln!("         [--splines] (experimental spline coding; requires --speed slow)");
     eprintln!("         [--dots] (experimental dot coding; requires --speed slow)");
@@ -48,6 +48,7 @@ fn main() -> ExitCode {
     let mut threads: usize = 1;
     let mut speed = jixel::Speed::Fast;
     let mut lossless = false;
+    let mut near_lossless: u16 = 0;
     let mut splines = false;
     let mut dots = false;
     let mut patches = None;
@@ -135,6 +136,14 @@ fn main() -> ExitCode {
                 lossless = true;
                 i += 1;
             }
+            "--near-lossless" => {
+                let v = args.get(i + 1).unwrap_or_else(|| usage());
+                near_lossless = v.parse().unwrap_or_else(|_| {
+                    eprintln!("invalid --near-lossless: {v}");
+                    std::process::exit(2)
+                });
+                i += 2;
+            }
             "--progressive-dc" => {
                 progressive_dc = true;
                 i += 1;
@@ -217,6 +226,7 @@ fn main() -> ExitCode {
         .with_speed(speed)
         .with_arbiter(arbiter)
         .with_decoding_speed(decoding_speed)
+        .with_near_lossless(near_lossless)
         .with_splines(splines)
         .with_dots(dots)
         .with_progressive_dc(progressive_dc);

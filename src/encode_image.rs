@@ -410,6 +410,10 @@ pub struct EncodeConfig {
     /// Decode-speed/density tradeoff for lossless encoding (see
     /// [`DecodingSpeed`]). Ignored for lossy.
     pub decoding_speed: DecodingSpeed,
+    /// Near-lossless bound for `lossless` encodes: the maximum absolute error
+    /// per channel, in input code values. `0` (default) keeps every sample
+    /// exact. Alpha always stays exact. Ignored for lossy.
+    pub near_lossless: u16,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
     /// Experimental: lift line/text colors into one palette frame with
@@ -544,6 +548,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) speed: Speed,
     /// Decode-speed/density tradeoff for lossless (see `EncodeConfig::decoding_speed`).
     pub(crate) decoding_speed: DecodingSpeed,
+    /// Near-lossless error bound (see `EncodeConfig::near_lossless`).
+    pub(crate) near_lossless: u16,
     /// Pre-encoded `jhgm` gain map bundle (see `EncodeConfig::gain_map`).
     pub(crate) gain_map: Option<EncodedGainMap>,
     /// Decoder-side grain synthesis (see `EncodeConfig::grain`).
@@ -581,6 +587,7 @@ impl Default for EncodeConfig {
             speed: Speed::Fast,
             arbiter: Arbiter::Ssimulacra2,
             decoding_speed: DecodingSpeed::Slow,
+            near_lossless: 0,
             lossy_modular: LossyModular::Off,
             ink_layer: false,
             vector_layers: false,
@@ -628,6 +635,7 @@ impl Default for EncodeConfigImpl {
                 .get(),
             speed: Speed::Fast,
             decoding_speed: DecodingSpeed::Slow,
+            near_lossless: 0,
             gain_map: None,
             grain: Grain::Off,
         }
@@ -763,6 +771,11 @@ impl EncodeConfigImpl {
 
     pub(crate) fn with_decoding_speed(mut self, decoding_speed: DecodingSpeed) -> Self {
         self.decoding_speed = decoding_speed;
+        self
+    }
+
+    pub(crate) fn with_near_lossless(mut self, max_error: u16) -> Self {
+        self.near_lossless = max_error;
         self
     }
 
@@ -1000,6 +1013,13 @@ impl EncodeConfig {
     /// Select the lossless decode-speed/density tradeoff (see [`DecodingSpeed`]).
     pub fn with_decoding_speed(mut self, decoding_speed: DecodingSpeed) -> Self {
         self.decoding_speed = decoding_speed;
+        self
+    }
+
+    /// Bound the per-channel error of a lossless encode (see
+    /// [`EncodeConfig::near_lossless`]).
+    pub fn with_near_lossless(mut self, max_error: u16) -> Self {
+        self.near_lossless = max_error;
         self
     }
 
@@ -1244,6 +1264,7 @@ pub fn encode_image(
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
+                .with_near_lossless(config.near_lossless)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1854,6 +1875,7 @@ pub fn encode_image_with_alpha(
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
+                .with_near_lossless(config.near_lossless)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -2044,6 +2066,7 @@ fn encode_gray_impl(
         for (out, &value) in image.plane_mut(0).as_mut_slice().iter_mut().zip(luma) {
             *out = value.to_signed_int(8);
         }
+        crate::lossless::quantize_planes(&mut image, 255, i32::from(config.near_lossless));
         let alpha_plane = alpha.map(AlphaPlane::U8);
         return encode_lossless_planes(
             &image,
@@ -2063,6 +2086,7 @@ fn encode_gray_impl(
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
+                .with_near_lossless(config.near_lossless)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -2289,6 +2313,7 @@ fn encode_gray_high_depth_impl(
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
+                .with_near_lossless(config.near_lossless)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -2378,6 +2403,7 @@ fn encode_high_depth_rgba(
                 .with_intensity_target(config.intensity_target)
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
+                .with_near_lossless(config.near_lossless)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -3033,14 +3059,9 @@ pub(crate) fn encode_with_config_loseless<T: AsSignedInt + Copy>(
                     .zip(row.as_chunks::<4>().0.iter())
                     .zip(alpha_row.iter_mut())
                 {
-                    let ycocg = forward_ycocg(
-                        src[0].to_signed_int(max_bp),
-                        src[1].to_signed_int(max_bp),
-                        src[2].to_signed_int(max_bp),
-                    );
-                    *r = ycocg.0;
-                    *g = ycocg.1;
-                    *b = ycocg.2;
+                    *r = src[0].to_signed_int(max_bp);
+                    *g = src[1].to_signed_int(max_bp);
+                    *b = src[2].to_signed_int(max_bp);
                     *alpha = src[3].to_signed_int(max_bp) as u16;
                 }
             }
@@ -3064,14 +3085,9 @@ pub(crate) fn encode_with_config_loseless<T: AsSignedInt + Copy>(
                     .zip(row.as_chunks::<4>().0.iter())
                     .zip(alpha_row.iter_mut())
                 {
-                    let ycocg = forward_ycocg(
-                        src[0].to_signed_int(max_bp),
-                        src[1].to_signed_int(max_bp),
-                        src[2].to_signed_int(max_bp),
-                    );
-                    *r = ycocg.0;
-                    *g = ycocg.1;
-                    *b = ycocg.2;
+                    *r = src[0].to_signed_int(max_bp);
+                    *g = src[1].to_signed_int(max_bp);
+                    *b = src[2].to_signed_int(max_bp);
                     *alpha = src[3].to_signed_int(max_bp) as u8;
                 }
             }
@@ -3086,15 +3102,21 @@ pub(crate) fn encode_with_config_loseless<T: AsSignedInt + Copy>(
                 .zip(b_row.iter_mut())
                 .zip(row.as_chunks::<3>().0.iter())
             {
-                let ycocg = forward_ycocg(
-                    src[0].to_signed_int(max_bp),
-                    src[1].to_signed_int(max_bp),
-                    src[2].to_signed_int(max_bp),
-                );
-                *r = ycocg.0;
-                *g = ycocg.1;
-                *b = ycocg.2;
+                *r = src[0].to_signed_int(max_bp);
+                *g = src[1].to_signed_int(max_bp);
+                *b = src[2].to_signed_int(max_bp);
             }
+        }
+    }
+
+    if config.near_lossless > 0 {
+        let max_value = ((1u32 << max_bp) - 1) as i32;
+        crate::lossless::quantize_planes(&mut image3s, max_value, i32::from(config.near_lossless));
+    }
+    for y in 0..height {
+        let [r_row, g_row, b_row] = image3s.all_plane_rows_mut(y);
+        for ((r, g), b) in r_row.iter_mut().zip(g_row.iter_mut()).zip(b_row.iter_mut()) {
+            (*r, *g, *b) = forward_ycocg(*r, *g, *b);
         }
     }
 
@@ -3146,6 +3168,7 @@ fn encode_lossless_planes(
         num_color,
         config.speed,
         config.decoding_speed,
+        config.near_lossless > 0,
         config.num_threads,
         &mut w,
     );

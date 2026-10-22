@@ -341,6 +341,7 @@ pub(crate) fn encode_gain_map(base: &EncodeConfig) -> Result<Option<EncodedGainM
         arbiter: base.arbiter,
         decoding_speed: base.decoding_speed,
         near_lossless: 0,
+        upsampling: false,
         lossy_modular: base.lossy_modular,
         ink_layer: false,
         vector_layers: false,

@@ -414,6 +414,14 @@ pub struct EncodeConfig {
     /// per channel, in input code values. `0` (default) keeps every sample
     /// exact. Alpha always stays exact. Ignored for lossy.
     pub near_lossless: u16,
+    /// Code integer-upscaled content at its cell grid and let the decoder
+    /// scale it back with a nearest-neighbor kernel: a `lossless` image whose
+    /// 2x2, 4x4 or 8x8 cells are all one color (pixel art, a 2x asset) is
+    /// coded at a half, quarter or eighth of its size, and such a region
+    /// inside an image becomes a layer blended over the rest, which then gains
+    /// an opaque alpha channel. Exact. The search costs about 30 ms per
+    /// megapixel. Defaults to false. Ignored for lossy and progressive encodes.
+    pub upsampling: bool,
     /// Lossy encoding arm selection (see [`LossyModular`]). Default `Off`.
     pub lossy_modular: LossyModular,
     /// Experimental: lift line/text colors into one palette frame with
@@ -550,6 +558,8 @@ pub(crate) struct EncodeConfigImpl {
     pub(crate) decoding_speed: DecodingSpeed,
     /// Near-lossless error bound (see `EncodeConfig::near_lossless`).
     pub(crate) near_lossless: u16,
+    /// Nearest-neighbor upsampling of cell content (see `EncodeConfig::upsampling`).
+    pub(crate) upsampling: bool,
     /// Pre-encoded `jhgm` gain map bundle (see `EncodeConfig::gain_map`).
     pub(crate) gain_map: Option<EncodedGainMap>,
     /// Decoder-side grain synthesis (see `EncodeConfig::grain`).
@@ -571,6 +581,7 @@ impl Default for EncodeConfig {
             alpha_distance: None,
             progressive: false,
             patches: false,
+            upsampling: false,
             #[cfg(feature = "splines")]
             splines: false,
             #[cfg(feature = "splines")]
@@ -619,6 +630,7 @@ impl Default for EncodeConfigImpl {
             fill_invisible: true,
             progressive: false,
             patches: false,
+            upsampling: false,
             #[cfg(feature = "splines")]
             splines: false,
             #[cfg(feature = "splines")]
@@ -776,6 +788,11 @@ impl EncodeConfigImpl {
 
     pub(crate) fn with_near_lossless(mut self, max_error: u16) -> Self {
         self.near_lossless = max_error;
+        self
+    }
+
+    pub(crate) fn with_upsampling(mut self, upsampling: bool) -> Self {
+        self.upsampling = upsampling;
         self
     }
 
@@ -1023,6 +1040,13 @@ impl EncodeConfig {
         self
     }
 
+    /// Decoder-side nearest-neighbor upsampling of integer-upscaled content
+    /// (see [`EncodeConfig::upsampling`]).
+    pub fn with_upsampling(mut self, upsampling: bool) -> Self {
+        self.upsampling = upsampling;
+        self
+    }
+
     /// Select the metric the lossy encoder tunes for (see [`Arbiter`]).
     pub fn with_arbiter(mut self, arbiter: Arbiter) -> Self {
         self.arbiter = arbiter;
@@ -1265,6 +1289,7 @@ pub fn encode_image(
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
                 .with_near_lossless(config.near_lossless)
+                .with_upsampling(config.upsampling)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -1554,6 +1579,7 @@ impl InkStack {
                 orientation: config.orientation,
                 lossy_modular_16: false,
                 extra_16: false,
+                upsampling_kernel: None,
             },
             scratch,
             &mut w,
@@ -1635,6 +1661,25 @@ fn encode_ink_base(
     Ok((ctx, frame))
 }
 
+/// A colour on the XYB lattice of the VarDCT base, as the YCoCg triple the
+/// signaled RCT restores exactly: Y, X and B-Y on the default LF dequant
+/// steps.
+fn xyb_lattice_ycocg(
+    ctx: &EncodingContext,
+    transform: &ColorTransform<crate::color::TransferLut>,
+    rgb: [u8; 3],
+) -> (i32, i32, i32) {
+    let (mut r, mut g, mut b) = ([0.0], [0.0], [0.0]);
+    transform.transform_block(&[rgb], [&mut r, &mut g, &mut b]);
+    let (x, y, b) = crate::xyb::rgb_to_xyb_pixel_f32(&ctx.xyb, r[0], g[0], b[0]);
+    let y = (y * crate::quant_weights::INV_DC_QUANT[1]).round() as i32;
+    forward_ycocg(
+        y,
+        (x * crate::quant_weights::INV_DC_QUANT[0]).round() as i32,
+        (b * crate::quant_weights::INV_DC_QUANT[2]).round() as i32 - y,
+    )
+}
+
 /// The palette of inks on the base frame's XYB lattice, with exact coverage.
 #[allow(clippy::too_many_arguments)]
 fn encode_ink_frame(
@@ -1649,18 +1694,7 @@ fn encode_ink_frame(
 ) -> Result<BitWriter, EncodeError> {
     let palette: Vec<_> = colors
         .iter()
-        .map(|&(ink, alpha)| {
-            let (mut r, mut g, mut b) = ([0.0], [0.0], [0.0]);
-            transform.transform_block(&[ink], [&mut r, &mut g, &mut b]);
-            let (x, y, b) = crate::xyb::rgb_to_xyb_pixel_f32(&ctx.xyb, r[0], g[0], b[0]);
-            let y = (y * crate::quant_weights::INV_DC_QUANT[1]).round() as i32;
-            let ycocg = forward_ycocg(
-                y,
-                (x * crate::quant_weights::INV_DC_QUANT[0]).round() as i32,
-                (b * crate::quant_weights::INV_DC_QUANT[2]).round() as i32 - y,
-            );
-            (ycocg, alpha)
-        })
+        .map(|&(ink, alpha)| (xyb_lattice_ycocg(ctx, transform, ink), alpha))
         .collect();
     let mut image = Image3Si::new(width, height);
     let mut alpha = vec![0u8; width * height];
@@ -1766,6 +1800,7 @@ fn encode_vector_layers(
             orientation: config.orientation,
             lossy_modular_16: false,
             extra_16: false,
+            upsampling_kernel: None,
         },
         &mut scratch,
         &mut w,
@@ -1876,6 +1911,7 @@ pub fn encode_image_with_alpha(
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
                 .with_near_lossless(config.near_lossless)
+                .with_upsampling(config.upsampling)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -2087,6 +2123,7 @@ fn encode_gray_impl(
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
                 .with_near_lossless(config.near_lossless)
+                .with_upsampling(config.upsampling)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -2314,6 +2351,7 @@ fn encode_gray_high_depth_impl(
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
                 .with_near_lossless(config.near_lossless)
+                .with_upsampling(config.upsampling)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -2404,6 +2442,7 @@ fn encode_high_depth_rgba(
                 .with_speed(config.speed)
                 .with_decoding_speed(config.decoding_speed)
                 .with_near_lossless(config.near_lossless)
+                .with_upsampling(config.upsampling)
                 .with_num_threads(config.num_threads),
         );
     }
@@ -2578,6 +2617,7 @@ fn encode_f32_lossless_rgba(
                 orientation: config.orientation,
                 lossy_modular_16: false,
                 extra_16: false,
+                upsampling_kernel: None,
             },
             &mut metadata_scratch,
             &mut w,
@@ -2977,6 +3017,7 @@ pub(crate) fn encode_with_coded_planes(
             orientation: config.orientation,
             lossy_modular_16,
             extra_16: lossy_modular_16 && ctx.extra_squeeze_distance > 0.0,
+            upsampling_kernel: None,
         },
         scratch,
         &mut w,
@@ -3134,13 +3175,28 @@ fn encode_lossless_planes(
     w.write(8, 0xFF);
     w.write(8, CODESTREAM_MARKER as u64);
     write_size_header(width, height, &mut w);
-    {
+    // An integer-upscaled source (pixel art, a 2x asset) is coded at its
+    // cell grid and scaled back by the decoder's nearest-neighbor kernel,
+    // exactly. Progressive frames keep their own headers at full size.
+    let upsampling = if config.upsampling && !config.progressive {
+        crate::upsampling::constant_cell_factor(image3s, alpha_plane.as_ref())
+    } else {
+        1
+    };
+    let downsampled = (upsampling > 1)
+        .then(|| crate::upsampling::downsample(image3s, alpha_plane.as_ref(), upsampling));
+    let kernel = (upsampling > 1).then(|| crate::upsampling::nearest_weights(upsampling));
+    let (image3s, alpha_plane) = match &downsampled {
+        Some((base, base_alpha)) => (base, base_alpha),
+        None => (image3s, alpha_plane),
+    };
+    let write_metadata = |alpha: Option<&AlphaPlane>, kernel: Option<&[f32]>, w: &mut BitWriter| {
         let mut metadata_scratch = Box::new(CoderScratch::lossless());
         write_image_metadata(
             &ImageMetadataParams {
                 tone_mapping: config.tone_mapping(),
                 color_encoding: &config.color_encoding,
-                alpha: alpha_plane.as_ref(),
+                alpha,
                 black: config.black,
                 icc_profile: config.icc_profile.as_deref(),
                 bps: config.bits_per_sample,
@@ -3151,11 +3207,13 @@ fn encode_lossless_planes(
                 orientation: config.orientation,
                 lossy_modular_16: false,
                 extra_16: false,
+                upsampling_kernel: kernel,
             },
             &mut metadata_scratch,
-            &mut w,
+            w,
         );
-    }
+    };
+    write_metadata(alpha_plane.as_ref(), kernel.as_deref(), &mut w);
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     let eff_bits = (max_bp as u32).max(alpha_bits);
     let num_color = if config.grayscale { 1 } else { 3 };
@@ -3168,10 +3226,74 @@ fn encode_lossless_planes(
         num_color,
         config.speed,
         config.decoding_speed,
+        upsampling,
         config.near_lossless > 0,
         config.num_threads,
         &mut w,
     );
+    // The integer-upscaled part of a mixed image as a cell layer (see
+    // `cell_layer`): the base with the covered cells filled, saved to slot
+    // 0, then the cells coded at their grid and blended over it with their
+    // coverage as alpha; the output gains an opaque alpha channel, so an
+    // input whose alpha is solid opaque qualifies as well. The complete
+    // stream competes with the plain encode on size.
+    let opaque =
+        |alpha: &AlphaPlane| matches!(alpha, AlphaPlane::U8(a) if a.iter().all(|&v| v == 255));
+    let cell_plan = (config.upsampling
+        && upsampling == 1
+        && alpha_plane.as_ref().is_none_or(opaque)
+        && max_bp == 8
+        && !config.grayscale
+        && !config.progressive)
+        .then(|| crate::cell_layer::plan(image3s))
+        .flatten();
+    if let Some(plan) = cell_plan {
+        let (base, base_alpha) = crate::cell_layer::base(image3s, &plan);
+        let (layer, layer_alpha) = crate::cell_layer::layer(image3s, &plan);
+        let layer_kernel = crate::upsampling::nearest_weights(plan.factor as u32);
+        let mut layered = BitWriter::new();
+        layered.write(8, 0xFF);
+        layered.write(8, CODESTREAM_MARKER as u64);
+        write_size_header(width, height, &mut layered);
+        write_metadata(Some(&base_alpha), Some(&layer_kernel), &mut layered);
+        let pool = crate::thread_pool::ThreadPool::new_lossless(config.num_threads);
+        let mut scratch = Box::new(CoderScratch::lossless());
+        crate::lossless::encode_frame_lossless_base(
+            &base,
+            &base_alpha,
+            config.patches,
+            config.speed,
+            config.decoding_speed,
+            config.near_lossless > 0,
+            &pool,
+            &mut scratch,
+            &mut layered,
+        );
+        crate::lossless::encode_frame_lossless_core(
+            &layer,
+            Some(&layer_alpha),
+            8,
+            false,
+            3,
+            config.speed,
+            config.decoding_speed,
+            plan.factor as u32,
+            config.near_lossless > 0,
+            &pool,
+            &mut scratch,
+            crate::patches::ModularFrameKind::RgbBlendCrop {
+                x0: plan.x0,
+                y0: plan.y0,
+                width: plan.width,
+                height: plan.height,
+            },
+            true,
+            &mut layered,
+        );
+        if layered.bits_written() < w.bits_written() {
+            w = layered;
+        }
+    }
     let codestream = w.into_bytes();
     let alpha_bits = alpha_plane.as_ref().map(|a| a.bits() as u32).unwrap_or(0);
     finalize_container(
@@ -3383,6 +3505,9 @@ struct ImageMetadataParams<'a> {
     lossy_modular_16: bool,
     /// The extra channel (K, or lossy alpha) sits on that lattice too.
     extra_16: bool,
+    /// Frames are coded at the image size over 2, 4 or 8 and scaled back
+    /// with this kernel (15, 55 or 210 weights), signaled here.
+    upsampling_kernel: Option<&'a [f32]>,
 }
 
 fn write_image_metadata(
@@ -3404,6 +3529,7 @@ fn write_image_metadata(
         orientation,
         lossy_modular_16,
         extra_16,
+        upsampling_kernel,
     } = *params;
     let bps = if lossy_modular_16 {
         BitsPerSample::Sixteen
@@ -3497,33 +3623,53 @@ fn write_image_metadata(
     w.write(2, 0); // extensions: U64 selector = 0 (no extensions)
     // End of ImageMetadata. Now CustomTransformData (part of FileHeader, but kept here for
     // backward-compatible bit alignment with the no-ICC path).
-    if !xyb_encoded || xyb.is_decoder_default() {
+    let explicit_opsin = xyb_encoded && !xyb.is_decoder_default();
+    let upsampling = upsampling_kernel.map_or(1, |kernel| match kernel.len() {
+        15 => 2,
+        55 => 4,
+        _ => 8,
+    });
+    if !explicit_opsin && upsampling == 1 {
         w.write(1, 1); // CustomTransformData.all_default = 1
     } else {
         // A non-spec forward opsin matrix needs its matching inverse in the
-        // codestream, so the bundle is explicit. Layout: all_default,
-        // [xyb_encoded] OpsinInverseMatrix, custom_weights_mask.
+        // codestream, and an upsampled frame its kernel, so the bundle is
+        // explicit. Layout: all_default, [xyb_encoded] OpsinInverseMatrix,
+        // custom_weights_mask, then the weights of each set mask bit.
         w.write(1, 0); // CustomTransformData.all_default = 0
-        w.write(1, 0); // OpsinInverseMatrix.all_default = 0
-        for &v in &xyb.inv {
-            w.write(16, crate::util::f32_to_f16_bits(v) as u64);
+        if xyb_encoded && !explicit_opsin {
+            w.write(1, 1); // OpsinInverseMatrix.all_default = 1
+        } else if xyb_encoded {
+            w.write(1, 0); // OpsinInverseMatrix.all_default = 0
+            for &v in &xyb.inv {
+                w.write(16, crate::util::f32_to_f16_bits(v) as u64);
+            }
+            for _ in 0..3 {
+                // Opsin biases (defaults; the forward bias is unchanged).
+                w.write(16, crate::util::f32_to_f16_bits(-0.003_793_073_4) as u64);
+            }
+            // Per-channel quant biases + numerator. X/Y keep the libjxl defaults;
+            // B's ±1 reconstruction is raised to a full step: the explicit bundle
+            // is only written for the chroma-gated content classes, where the
+            // dying ±1 B residuals are exactly the desaturating ones. Measured
+            // free (+0.03..0.05 SS2 at byte-identical streams) on every class
+            // probed — fractal, blue-rotated victim, smooth-yellow photos;
+            // overshoot past 1.0 was noise. The encoder's dequantization model
+            // follows via `DequantBias::channels`.
+            for v in crate::group::EXPLICIT_QUANT_BIASES {
+                w.write(16, crate::util::f32_to_f16_bits(v) as u64);
+            }
         }
-        for _ in 0..3 {
-            // Opsin biases (defaults; the forward bias is unchanged).
-            w.write(16, crate::util::f32_to_f16_bits(-0.003_793_073_4) as u64);
+        if upsampling == 1 {
+            w.write(3, 0); // custom_weights_mask = 0 (default upsampling kernels)
+        } else {
+            // Bit 0, 1, 2 of the mask select the 2x, 4x and 8x kernel; the
+            // frame header's `upsampling` picks which one the decoder runs.
+            w.write(3, (upsampling >> 1) as u64);
+            for &weight in upsampling_kernel.unwrap_or_default() {
+                w.write(16, crate::util::f32_to_f16_bits(weight) as u64);
+            }
         }
-        // Per-channel quant biases + numerator. X/Y keep the libjxl defaults;
-        // B's ±1 reconstruction is raised to a full step: the explicit bundle
-        // is only written for the chroma-gated content classes, where the
-        // dying ±1 B residuals are exactly the desaturating ones. Measured
-        // free (+0.03..0.05 SS2 at byte-identical streams) on every class
-        // probed — fractal, blue-rotated victim, smooth-yellow photos;
-        // overshoot past 1.0 was noise. The encoder's dequantization model
-        // follows via `DequantBias::channels`.
-        for v in crate::group::EXPLICIT_QUANT_BIASES {
-            w.write(16, crate::util::f32_to_f16_bits(v) as u64);
-        }
-        w.write(3, 0); // custom_weights_mask = 0 (default upsampling kernels)
     }
     // ICC stream goes AFTER FileHeader, before the zero-pad to byte boundary.
     if let Some(icc) = icc_profile {

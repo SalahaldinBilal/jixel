@@ -43,7 +43,7 @@ pub(super) use local::{
 };
 
 use super::GroupLayout;
-use super::header::{write_frame_header_modular, write_toc_entry};
+use super::header::{write_frame_header_modular_kind, write_toc_entry};
 use super::lz77::{
     RunLzWriter, build_lz_pixel_code, lz77_compress_for_speed, write_local_tree_lz77,
     write_lz_section,
@@ -54,6 +54,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
+use crate::patches::ModularFrameKind;
 use global::ColorMap;
 
 /// Serialize a single Palette transform (mirrors `Transform::VisitFields` for
@@ -192,6 +193,8 @@ pub(super) fn try_encode_palette_single_group(
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
     use_wp: bool,
+    frame_kind: ModularFrameKind<'_>,
+    layout: GroupLayout,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
 ) -> bool {
@@ -268,7 +271,7 @@ pub(super) fn try_encode_palette_single_group(
         };
 
         // 6) Frame header + single section (mirrors the RGB single-group layout).
-        write_frame_header_modular(alpha.is_some(), GroupLayout::DEFAULT, writer);
+        write_frame_header_modular_kind(alpha.is_some(), frame_kind, layout, writer);
 
         let mut section = BitWriter::new();
         section.write(1, 1); // dc_quant all_default = 1

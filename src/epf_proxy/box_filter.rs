@@ -262,7 +262,7 @@ macro_rules! moments {
     ($feature:literal, $lanes:literal, $load:ident, $store:ident, $splat:ident,
      $add:ident, $sub:ident, $mul:ident, $div:ident, $horizontal:path) => {
         #[target_feature(enable = $feature)]
-        unsafe fn accumulate<const CROSS: bool>(src: [&[f32]; 2], sums: [&mut [f32]; 3]) {
+        fn accumulate<const CROSS: bool>(src: [&[f32]; 2], sums: [&mut [f32]; 3]) {
             let n = sums[0].len();
             let end = n / $lanes * $lanes;
             unsafe {
@@ -289,7 +289,7 @@ macro_rules! moments {
         }
 
         #[target_feature(enable = $feature)]
-        unsafe fn step<const CROSS: bool, const UPDATE: bool>(
+        fn step<const CROSS: bool, const UPDATE: bool>(
             enter: [&[f32]; 2],
             leave: [&[f32]; 2],
             sums: [&mut [f32]; 3],
@@ -372,7 +372,7 @@ macro_rules! moments {
 macro_rules! horizontal {
     ($feature:literal, $load:ident, $store:ident, $splat:ident, $add:ident, $sub:ident, $div:ident) => {
         #[target_feature(enable = $feature)]
-        pub(super) unsafe fn horizontal(src: &[f32], w: usize, dst: &mut [f32]) {
+        pub(super) fn horizontal(src: &[f32], w: usize, dst: &mut [f32]) {
             unsafe {
                 let column =
                     |x| $load([src[x], src[w + x], src[2 * w + x], src[3 * w + x]].as_ptr());

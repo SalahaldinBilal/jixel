@@ -9,8 +9,8 @@ use std::thread::available_parallelism;
 fn main() {
     let output = "encoded_lossy_b.jxl";
     // let display_p3 = fs::read("./assets/Display P3.icc").unwrap();
-    let image = image::open(Path::new("./assets/aoe2sm.png")).unwrap();
-    let rgb_img = image.to_rgba8();
+    let image = image::open(Path::new("/Users/radzivon/Downloads/cerys_fix/cerys_d3_diff_crops.png")).unwrap();
+    let rgb_img = image.to_rgb8();
     // let rgba_img = image.to_rgba8();
     // let gray_img = image.to_luma8();
     // let src_rgb = rgb_img.as_raw();
@@ -18,11 +18,12 @@ fn main() {
     let width = image.width() as usize;
     let height = image.height() as usize;
     let cfg = EncodeConfig::default()
-        .with_lossless(false)
+        .with_lossless(true)
         .with_distance(distance)
-        .with_speed(Speed::ExtraSlow)
+        .with_speed(Speed::MediumSlow)
         .with_progressive(false)
         .with_decoding_speed(DecodingSpeed::Slow)
+        .with_upsampling(false)
         .with_patches(true)
         .with_color_encoding(ColorEncoding::srgb())
         .with_coding_transform(CodingTransform::Xyb)
@@ -35,7 +36,7 @@ fn main() {
         .with_vector_layers(true)
         .with_splines(true)
         .with_dots(false);
-    let bytes = jixel::encode_image_with_alpha(&rgb_img, width, height, &cfg).unwrap();
+    let bytes = jixel::encode_image(&rgb_img, width, height, &cfg).unwrap();
     std::fs::write(output, &bytes).expect("failed to write output");
     // let width = 2000;
     // let height = 1000;

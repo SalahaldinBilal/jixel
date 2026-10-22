@@ -94,7 +94,7 @@ pub(super) fn learned_tree_is_decisive(estimated_savings: f64) -> bool {
     estimated_savings >= MA_DECISIVE_MIN_SAVINGS
 }
 
-pub(super) fn encode_frame_lossless_core(
+pub(crate) fn encode_frame_lossless_core(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     max_bits: u32,
@@ -102,6 +102,7 @@ pub(super) fn encode_frame_lossless_core(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    upsampling: u32,
     near_lossless: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
@@ -117,6 +118,7 @@ pub(super) fn encode_frame_lossless_core(
         num_color,
         speed,
         decoding_speed,
+        upsampling,
         near_lossless,
         pool,
         scratch,
@@ -136,6 +138,7 @@ pub(super) fn encode_frame_lossless_core_impl(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    upsampling: u32,
     near_lossless: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
@@ -192,6 +195,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             grad_pack_fn,
             speed,
             use_wp,
+            frame_kind,
+            GroupLayout::DEFAULT.with_upsampling(upsampling),
             scratch,
             &mut palette_writer,
         ) {
@@ -205,6 +210,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                     num_color,
                     speed,
                     decoding_speed,
+                    upsampling,
                     near_lossless,
                     pool,
                     scratch,
@@ -242,6 +248,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             grad_pack_fn,
             speed,
             use_wp,
+            frame_kind,
+            GroupLayout::DEFAULT.with_upsampling(upsampling),
             pool,
             scratch,
             &mut palette_writer,
@@ -256,6 +264,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                     num_color,
                     speed,
                     decoding_speed,
+                    upsampling,
                     near_lossless,
                     pool,
                     scratch,
@@ -287,6 +296,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             grad_pack_fn,
             speed,
             use_wp,
+            frame_kind,
+            GroupLayout::DEFAULT.with_upsampling(upsampling),
             pool,
             scratch,
             writer,
@@ -316,6 +327,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             grad_pack_fn,
             speed,
             use_wp,
+            frame_kind,
+            GroupLayout::DEFAULT.with_upsampling(upsampling),
             pool,
             scratch,
             writer,
@@ -418,18 +431,22 @@ pub(super) fn encode_frame_lossless_core_impl(
             // An image inside one 256-px group learns the same thing under
             // both layouts.
             && (xsize > GroupLayout::DEFAULT.dim() || ysize > GroupLayout::DEFAULT.dim());
-        let layouts: &[GroupLayout] = if slow_layouts {
-            &[GroupLayout::LARGE, GroupLayout::DEFAULT]
+        let layouts: Vec<GroupLayout> = if slow_layouts {
+            vec![GroupLayout::LARGE, GroupLayout::DEFAULT]
         } else {
-            &[GroupLayout::DEFAULT]
-        };
+            vec![GroupLayout::DEFAULT]
+        }
+        .into_iter()
+        .map(|layout| layout.with_upsampling(upsampling))
+        .collect();
+        let layouts: &[GroupLayout] = &layouts;
         // RGB sources of more than a megapixel-channel learn the 1024-px
         // layout only: the 256 layout's first stage costs a sampling pass and
         // its full learn doubles the frame's learning time.
         let rgb_layouts: &[GroupLayout] = if slow_layouts
             && source_values_of(xsize, ysize, coded_chans) > RGB_SINGLE_LAYOUT_MIN_VALUES
         {
-            &[GroupLayout::LARGE]
+            &layouts[..1]
         } else {
             layouts
         };
@@ -795,7 +812,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                         &mixed,
                         xsize,
                         ysize,
-                        GroupLayout::DEFAULT,
+                        GroupLayout::DEFAULT.with_upsampling(upsampling),
                         min_symbol,
                         wp_params,
                         use_wp,
@@ -831,7 +848,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                             frame_kind,
                             xsize,
                             ysize,
-                            GroupLayout::DEFAULT,
+                            GroupLayout::DEFAULT.with_upsampling(upsampling),
                             min_symbol,
                             pool,
                             scratch,
@@ -908,6 +925,7 @@ pub(super) fn encode_frame_lossless_core_impl(
             | ModularFrameKind::RgbSavedFirst
             | ModularFrameKind::RgbBlendLast
             | ModularFrameKind::RgbCrop { .. }
+            | ModularFrameKind::RgbBlendCrop { .. }
     );
     let wp_tree = (effort.flat_wp_contexts && use_wp && displayed)
         .then(|| {

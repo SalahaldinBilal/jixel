@@ -92,6 +92,12 @@ pub(super) fn write_frame_header_modular_kind(
             height,
             last,
         } => write_frame_header_modular_crop(has_alpha, [x0, y0, width, height], layout, last, w),
+        ModularFrameKind::RgbBlendCrop {
+            x0,
+            y0,
+            width,
+            height,
+        } => write_frame_header_modular_blend_crop([x0, y0, width, height], layout, w),
         ModularFrameKind::XybReferenceOnly {
             width,
             height,
@@ -225,10 +231,7 @@ fn write_frame_header_modular_layer(
     w.write(1, 1); // encoding = Modular
     write_u64(0, w); // flags
     w.write(1, 0); // do_ycbcr = false
-    w.write(2, 0b00); // upsampling = 1
-    if has_alpha {
-        w.write(2, 0b00); // ec_upsampling[0] = 1
-    }
+    write_upsampling(has_alpha, layout, w);
     w.write(2, layout.shift as u64);
     w.write(2, 0b00); // num_passes = 1
     w.write(1, 0); // have_crop = false
@@ -257,6 +260,16 @@ fn write_frame_header_modular_layer(
     w.write(2, 0b00); // no FH extensions
 }
 
+/// The frame's `upsampling` and, with alpha, the matching `ec_upsampling`
+/// (the extra channel is coded on the same grid, which the codestream
+/// requires to be no finer than the colour one).
+fn write_upsampling(has_alpha: bool, layout: GroupLayout, w: &mut BitWriter) {
+    w.write(2, layout.upsampling_selector()); // upsampling: U32(1, 2, 4, 8)
+    if has_alpha {
+        w.write(2, layout.upsampling_selector()); // ec_upsampling[0]
+    }
+}
+
 pub(super) fn write_frame_header_modular(has_alpha: bool, layout: GroupLayout, w: &mut BitWriter) {
     write_frame_header_modular_flags(has_alpha, 0, false, layout, w);
 }
@@ -277,10 +290,10 @@ fn write_frame_header_modular_crop(
     w.write(1, 1); // encoding = Modular
     write_u64(0, w); // flags
     w.write(1, 0); // do_ycbcr = false
-    w.write(2, 0b00); // upsampling = 1
-    if has_alpha {
-        w.write(2, 0b00); // ec_upsampling[0] = 1
-    }
+    // The crop's origin and size are in image coordinates whatever the
+    // frame's upsampling: the decoder codes the frame at the size over the
+    // factor and scales it back onto the rectangle.
+    write_upsampling(has_alpha, layout, w);
     w.write(2, layout.shift as u64);
     w.write(2, 0b00); // num_passes = 1
     w.write(1, 1); // have_crop
@@ -306,6 +319,39 @@ fn write_frame_header_modular_crop(
     w.write(2, 0b00); // no FH extensions
 }
 
+/// Frame header of a cell layer: the last frame, a crop at `rect` (x0, y0,
+/// width, height) in image pixels coded at that size over the layout's
+/// upsampling, kBlend over reference slot 0 with extra channel 0 (the
+/// coverage, coded on the same grid) as its alpha.
+fn write_frame_header_modular_blend_crop(rect: [usize; 4], layout: GroupLayout, w: &mut BitWriter) {
+    w.write(1, 0); // all_default = false
+    w.write(2, 0b00); // regular frame
+    w.write(1, 1); // encoding = Modular
+    write_u64(0, w); // flags
+    w.write(1, 0); // do_ycbcr = false
+    write_upsampling(true, layout, w);
+    w.write(2, layout.shift as u64);
+    w.write(2, 0b00); // num_passes = 1
+    w.write(1, 1); // have_crop
+    write_frame_dimension(2 * rect[0], w); // PackSigned(x0)
+    write_frame_dimension(2 * rect[1], w);
+    write_frame_dimension(rect[2], w);
+    write_frame_dimension(rect[3], w);
+    for _ in 0..2 {
+        w.write(2, 2); // mode = kBlend
+        w.write(2, 0); // alpha_channel = 0
+        w.write(1, 0); // clamp = false
+        w.write(2, 0); // source = 0
+    }
+    w.write(1, 1); // is_last
+    w.write(2, 0b00); // name length = 0
+    w.write(1, 0); // loop_filter NOT all_default
+    w.write(1, 0); // no gaborish
+    w.write(2, 0); // 0 EPF iters
+    w.write(2, 0b00); // no LF extensions
+    w.write(2, 0b00); // no FH extensions
+}
+
 fn write_frame_header_modular_flags(
     has_alpha: bool,
     flags: u64,
@@ -318,10 +364,7 @@ fn write_frame_header_modular_flags(
     w.write(1, 1); // encoding = Modular
     write_u64(flags, w);
     w.write(1, 0); // do_ycbcr = false   (xyb_encoded=0 so this is serialized)
-    w.write(2, 0b00); // upsampling = 1
-    if has_alpha {
-        w.write(2, 0b00);
-    }
+    write_upsampling(has_alpha, layout, w);
     w.write(2, layout.shift as u64);
     w.write(2, 0b00); // num_passes = 1
     w.write(1, 0); // have_crop = false

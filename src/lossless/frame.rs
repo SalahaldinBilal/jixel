@@ -72,6 +72,8 @@ pub(crate) fn encode_frame_lossless(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    upsampling: u32,
+    near_lossless: bool,
     num_threads: usize,
     writer: &mut BitWriter,
 ) {
@@ -86,6 +88,8 @@ pub(crate) fn encode_frame_lossless(
         num_color,
         speed,
         decoding_speed,
+        upsampling,
+        near_lossless,
         &pool,
         &mut scratch,
         writer,
@@ -106,6 +110,8 @@ fn encode_frame_lossless_with_pool(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    upsampling: u32,
+    near_lossless: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
@@ -113,6 +119,7 @@ fn encode_frame_lossless_with_pool(
     // The whole frame's glyph plan, shared with its encode below.
     let mut whole_glyphs: Option<Option<LosslessPatches>> = None;
     if speed.effort().region_frames
+        && upsampling == 1
         && !progressive
         && num_color == 3
         && max_bits == 8
@@ -176,6 +183,8 @@ fn encode_frame_lossless_with_pool(
                 num_color,
                 speed,
                 decoding_speed,
+                upsampling,
+                near_lossless,
                 pool,
                 scratch,
                 true,
@@ -191,6 +200,8 @@ fn encode_frame_lossless_with_pool(
                     num_color,
                     speed,
                     decoding_speed,
+                    upsampling,
+                    near_lossless,
                     pool,
                     scratch,
                     ModularFrameKind::RgbCrop {
@@ -217,6 +228,8 @@ fn encode_frame_lossless_with_pool(
                 num_color,
                 speed,
                 decoding_speed,
+                upsampling,
+                near_lossless,
                 pool,
                 scratch,
                 false,
@@ -240,6 +253,8 @@ fn encode_frame_lossless_with_pool(
         num_color,
         speed,
         decoding_speed,
+        upsampling,
+        near_lossless,
         pool,
         scratch,
         false,
@@ -261,6 +276,39 @@ const REGION_GLYPH_SAVING: f64 = 0.1;
 /// one of 0.6% lost 3.7%.
 const REGION_SPLIT_MARGIN: f64 = 0.99;
 
+/// The base of a cell layer (see `cell_layer`): the 8-bit RGB image with
+/// its opaque alpha, coded with the displayed frame's patches and saved to
+/// reference slot 0 for the layer blended over it.
+pub(crate) fn encode_frame_lossless_base(
+    linear: &Image3Si,
+    alpha: &AlphaPlane,
+    patches: bool,
+    speed: crate::Speed,
+    decoding_speed: crate::DecodingSpeed,
+    near_lossless: bool,
+    pool: &ThreadPool,
+    scratch: &mut CoderScratch,
+    writer: &mut BitWriter,
+) {
+    encode_displayed_frame(
+        linear,
+        Some(alpha),
+        8,
+        false,
+        patches,
+        3,
+        speed,
+        decoding_speed,
+        1,
+        near_lossless,
+        pool,
+        scratch,
+        true,
+        None,
+        writer,
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn encode_displayed_frame(
     linear: &Image3Si,
@@ -271,6 +319,8 @@ fn encode_displayed_frame(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    upsampling: u32,
+    near_lossless: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     saved_first: bool,
@@ -314,6 +364,8 @@ fn encode_displayed_frame(
                 num_color,
                 speed,
                 decoding_speed,
+                upsampling,
+                near_lossless,
                 pool,
                 scratch,
                 regular,
@@ -343,6 +395,8 @@ fn encode_displayed_frame(
             num_color,
             speed,
             decoding_speed,
+            upsampling,
+            near_lossless,
             pool,
             scratch,
             ModularFrameKind::ReferenceOnly {
@@ -361,6 +415,8 @@ fn encode_displayed_frame(
             num_color,
             speed,
             decoding_speed,
+            upsampling,
+            near_lossless,
             pool,
             scratch,
             ModularFrameKind::Patched {
@@ -403,6 +459,8 @@ fn encode_displayed_frame(
                     num_color,
                     speed,
                     decoding_speed,
+                    upsampling,
+                    near_lossless,
                     pool,
                     scratch,
                     regular,
@@ -429,6 +487,8 @@ fn encode_displayed_frame(
         num_color,
         speed,
         decoding_speed,
+        upsampling,
+        near_lossless,
         pool,
         scratch,
         regular,

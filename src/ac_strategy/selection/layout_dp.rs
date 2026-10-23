@@ -27,15 +27,19 @@
  * // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-//! Exact frontier DP on an 8-pixel grid inside a 64x64 region.
+//! Frontier DP on an 8-pixel grid inside a 64x64 region.
 //!
 //! Every 8/16/32-family piece is a direct candidate at every legal 8-pixel
 //! origin; the 64-family blocks of the incumbent layout compete only as
 //! placed. Retained fine transforms compete with DCT8 at each leaf. A sparse
 //! frontier memo covers slicing and nonslicing tilings.
 //! Guillotine plans provide feasible upper bounds; independent row/column
-//! relaxations provide admissible lower bounds. Pruning changes the work,
-//! not the candidate set or the optimum of the additive reconstruction model.
+//! relaxations provide admissible lower bounds. Two cuts are not admissible:
+//! a larger piece is dropped once its luma-and-rate bound exceeds
+//! `BOUND_SLACK` of the best tiling of its rectangle by smaller pieces, and a
+//! tile that exhausts `VISIT_BUDGET` settles its remaining states for their
+//! guillotine plans. Both are measured choices, not approximations to remove:
+//! slack 1.0 loses quality and an unbounded budget changes almost nothing.
 
 use super::*;
 use std::collections::HashMap;
@@ -1617,16 +1621,16 @@ mod tests {
     fn search_runs_at_slow_and_under_the_extraslow_loop_only_once() {
         let gate = |speed: crate::Speed| {
             let effort = speed.effort();
-            effort.layout_retile && !effort.layout_loop
+            effort.layout_retile && !effort.layout_loop()
         };
         assert!(gate(crate::Speed::MediumSlow));
         assert!(gate(crate::Speed::Slow));
+        assert_eq!(gate(crate::Speed::ExtraSlow), !cfg!(feature = "extraslow"));
         for speed in [
             crate::Speed::UltraFast,
             crate::Speed::Fastest,
             crate::Speed::Fast,
             crate::Speed::Medium,
-            crate::Speed::ExtraSlow,
         ] {
             assert!(!gate(speed));
         }

@@ -916,6 +916,16 @@ pub(crate) enum ModularFrameKind<'a> {
         height: usize,
         last: bool,
     },
+    /// The last frame of a cell-layer codestream (see `cell_layer`): a crop
+    /// at (`x0`, `y0`) of `width` x `height` image pixels, coded at that
+    /// size over the frame's upsampling factor, alpha-blended (kBlend with
+    /// extra channel 0) over reference slot 0.
+    RgbBlendCrop {
+        x0: usize,
+        y0: usize,
+        width: usize,
+        height: usize,
+    },
     Patched {
         references: &'a [PatchReference],
         /// The frame is the base of region frames: saved to reference slot
@@ -928,7 +938,11 @@ impl ModularFrameKind<'_> {
     pub(crate) fn is_regular(self) -> bool {
         matches!(
             self,
-            Self::Regular | Self::RgbSavedFirst | Self::RgbBlendLast | Self::RgbCrop { .. }
+            Self::Regular
+                | Self::RgbSavedFirst
+                | Self::RgbBlendLast
+                | Self::RgbCrop { .. }
+                | Self::RgbBlendCrop { .. }
         )
     }
 

@@ -89,7 +89,7 @@ pub(super) fn priced_tree_streams<T: lz77::LiteralToken>(
                     tokens[k],
                     &prices,
                     match_prices,
-                    if speed.effort().lz_priced_search {
+                    if speed.effort().lz_priced_search() {
                         64
                     } else {
                         lz77::PRICED_MAX_PROBES
@@ -123,7 +123,7 @@ pub(super) fn priced_tree_streams<T: lz77::LiteralToken>(
     };
     let first = complete(first);
     let first_bits = estimate(&first, scratch);
-    let max_ratio = if speed.effort().lz_priced_search {
+    let max_ratio = if speed.effort().lz_priced_search() {
         0.99
     } else {
         PRICED_LZ_MAX_RATIO
@@ -157,7 +157,7 @@ pub(super) fn choose_tree_streams<T: lz77::LiteralToken>(
 ) -> Vec<TreeStreams<T>> {
     // Preserve the standard candidates. The broader parse competes using the
     // final entropy tables and serialized section size in the variant writer.
-    let extra = if speed.effort().lz_priced_search {
+    let extra = if speed.effort().lz_priced_search() {
         let slices: Vec<&[T]> = tokens.iter().map(Vec::as_slice).collect();
         let (e_lit, _) =
             estimate_literal_and_run_bits(&slices, num_contexts, min_symbol, pool, scratch);

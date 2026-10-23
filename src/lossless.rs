@@ -33,6 +33,7 @@
 //! candidates. The `ma_*` modules handle learned-tree sources, sampling,
 //! learning, and encoding. Palette, predictor, LZ77, and Squeeze implementations
 //! live in their own module trees; `header` and `tree` serialize shared syntax.
+//! `near_lossless` is the bounded-error pre-pass applied before the exact coder.
 
 #[cfg(test)]
 #[path = "lossless/tests/constant_channel_tests.rs"]
@@ -42,6 +43,7 @@ mod context;
 #[path = "lossless/tests/context_tree_tests.rs"]
 mod context_tree_tests;
 mod encoder;
+pub(crate) use encoder::encode_frame_lossless_core;
 mod entropy;
 mod float;
 mod frame;
@@ -61,6 +63,8 @@ mod ma_sampling;
 mod ma_sampling_tests;
 mod ma_source;
 mod ma_streams;
+mod near_lossless;
+pub(crate) use near_lossless::quantize_planes;
 mod palette;
 mod predictor;
 #[cfg(test)]
@@ -75,7 +79,7 @@ mod xyb;
 pub(crate) use context::PickThresholdScratch;
 pub(crate) use entropy::{EntropyOfHistFn, selected_entropy_of_hist_fn};
 pub(crate) use float::encode_frame_lossless_float;
-pub(crate) use frame::encode_frame_lossless;
+pub(crate) use frame::{encode_frame_lossless, encode_frame_lossless_base};
 pub(crate) use groups::write_single_channel_lz77_section;
 pub(crate) use header::write_patch_dictionary;
 pub(crate) use lz77::LzToken;
@@ -105,15 +109,34 @@ use lz77::LZ77_MIN_SYMBOL;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GroupLayout {
     shift: u32,
+    /// The frame header's `upsampling` (1, 2, 4 or 8): the frame is coded
+    /// at the image size over this factor and the decoder scales it back
+    /// with the kernel signaled in the image metadata.
+    upsampling: u32,
 }
 
 impl GroupLayout {
     /// 256-pixel groups: the codestream default and libjxl's lossless choice.
-    pub(crate) const DEFAULT: Self = Self { shift: 1 };
+    pub(crate) const DEFAULT: Self = Self {
+        shift: 1,
+        upsampling: 1,
+    };
     /// 1024-pixel groups. Every group edge costs its first row and column
     /// their north/west context and restarts the WP state, so Slow lossless
     /// prefers the largest groups whenever the learner's estimate agrees.
-    pub(crate) const LARGE: Self = Self { shift: 3 };
+    pub(crate) const LARGE: Self = Self {
+        shift: 3,
+        upsampling: 1,
+    };
+
+    pub(crate) const fn with_upsampling(self, upsampling: u32) -> Self {
+        Self { upsampling, ..self }
+    }
+
+    /// The frame header's U32(1, 2, 4, 8) selector of `upsampling`.
+    pub(crate) const fn upsampling_selector(self) -> u64 {
+        (self.upsampling.trailing_zeros()) as u64
+    }
 
     pub(crate) const fn dim(self) -> usize {
         128 << self.shift

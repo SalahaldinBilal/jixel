@@ -127,7 +127,7 @@ pub(super) fn scalar() -> Kernels {
 macro_rules! backend {
     ($feature:literal,$lanes:literal,$load:ident,$store:ident,$splat:ident,$add:ident,$sub:ident,$mul:ident,$div:ident,$abs:ident,$max:ident,$nonzero:ident) => {
         #[target_feature(enable=$feature)]
-        unsafe fn half<const BIAS: bool>(src: [&[f32]; 2], out: &mut [f32]) {
+        fn half<const BIAS: bool>(src: [&[f32]; 2], out: &mut [f32]) {
             let end = out.len() / $lanes * $lanes;
             unsafe {
                 for x in (0..end).step_by($lanes) {
@@ -152,7 +152,7 @@ macro_rules! backend {
             super::half::<BIAS>(src.map(|s| &s[2 * end..]), &mut out[end..]);
         }
         #[target_feature(enable=$feature)]
-        unsafe fn half_in_place(values: &mut [f32], w: usize, h: usize) {
+        fn half_in_place(values: &mut [f32], w: usize, h: usize) {
             let ow = w / 2;
             let end = ow / $lanes * $lanes;
             for y in 0..h / 2 {
@@ -261,6 +261,9 @@ macro_rules! backend {
             }
             super::gradients(src.map(|s| &s[end..]), sum)
         }
+        // A target feature enabled for the whole build (wasm simd128) makes
+        // these calls safe; the other backends still need the blocks.
+        #[allow(unused_unsafe)]
         pub(super) fn kernels() -> super::Kernels {
             // The selector checks CPU features. The proxy supplies complete
             // source pairs for reduction and equal-length spans for scoring.

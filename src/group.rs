@@ -1536,6 +1536,7 @@ impl AcBlockCache {
         }
     }
 
+    #[cfg(feature = "extraslow")]
     /// Forget the blocks of a group-local block region (its transform layout
     /// changed, which the keys do not carry).
     pub(crate) fn invalidate(&mut self, x: usize, y: usize, w: usize, h: usize) {
@@ -1546,6 +1547,7 @@ impl AcBlockCache {
         }
     }
 
+    #[cfg(feature = "extraslow")]
     /// Reclaim superseded token versions between trials, when no snapshot
     /// holds arena offsets. Keep every referenced span, including cells hidden
     /// by a larger transform: restoring a layout can make those cells live again.
@@ -1572,6 +1574,7 @@ impl AcBlockCache {
         }
     }
 
+    #[cfg(feature = "extraslow")]
     /// Everything the memo holds for the cells of a group-local block region,
     /// so a trial layout there can be undone without re-encoding. Between the
     /// snapshot and its restore/discard, arenas must stay append-only.
@@ -1617,6 +1620,7 @@ impl AcBlockCache {
         snap
     }
 
+    #[cfg(feature = "extraslow")]
     /// Undo everything since `snapshot` for its region (the spans layout must
     /// not have changed in between).
     pub(crate) fn restore(&mut self, snap: &MemoSnapshot) {
@@ -1675,6 +1679,7 @@ impl AcBlockCache {
         &mut self.recon
     }
 
+    #[cfg(feature = "extraslow")]
     /// Copy into `dst` (offset `x0`, `y0`) the cells recomputed after
     /// evaluation `synced` whose pixels differ from it; returns their pixel
     /// bounding box in `dst` coordinates. Cells recomputed to the values
@@ -1723,6 +1728,7 @@ impl AcBlockCache {
     }
 }
 
+#[cfg(feature = "extraslow")]
 /// See [`AcBlockCache::snapshot`].
 #[derive(Default)]
 pub(crate) struct MemoSnapshot {
@@ -3069,6 +3075,7 @@ fn write_token_into(t: Token, out: &mut Vec<Token>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "extraslow")]
     #[test]
     fn block_memo_compaction_preserves_all_streams_and_snapshot_rollback() {
         use super::AcBlockCache;

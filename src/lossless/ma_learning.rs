@@ -384,7 +384,7 @@ pub(super) fn finish_ma_learn(
     }
     // Palette index sources keep the narrow side search: like extra split
     // candidates, it overfits their near-deterministic contexts.
-    if coarse.leaf_offsets && speed.effort().tree_wide_side_preds {
+    if coarse.leaf_offsets && speed.effort().tree_wide_side_preds() {
         params.side_preds = MA_WIDE_SIDE_PREDS;
     }
     let leaf_price = ma_leaf_price(&params, coarse.stride as f64);

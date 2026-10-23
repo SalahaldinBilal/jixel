@@ -487,7 +487,7 @@ fn write_learned_single_variant<T: lz77::LzTokenSource>(
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
     let code = build_lz_pixel_code_tails(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         &[stream],
         &[tail],
         num_ctx as usize,
@@ -553,7 +553,7 @@ fn write_learned_grouped_variant<T: lz77::LzTokenSource>(
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let slices: Vec<&[T]> = streams.iter().map(Vec::as_slice).collect();
     let code = build_lz_pixel_code_tails(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         &slices,
         tails,
         num_ctx as usize,

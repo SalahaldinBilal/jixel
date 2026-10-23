@@ -158,6 +158,8 @@ fn encode_core(image: &Image3Si, allow_palettes: bool) -> BitWriter {
         3,
         crate::Speed::Slow,
         crate::DecodingSpeed::Slow,
+        1,
+        false,
         &pool,
         &mut scratch,
         ModularFrameKind::Regular,

@@ -94,7 +94,7 @@ pub(super) fn learned_tree_is_decisive(estimated_savings: f64) -> bool {
     estimated_savings >= MA_DECISIVE_MIN_SAVINGS
 }
 
-pub(super) fn encode_frame_lossless_core(
+pub(crate) fn encode_frame_lossless_core(
     linear: &Image3Si,
     alpha: Option<&AlphaPlane>,
     max_bits: u32,
@@ -102,6 +102,8 @@ pub(super) fn encode_frame_lossless_core(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    upsampling: u32,
+    near_lossless: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
@@ -116,6 +118,8 @@ pub(super) fn encode_frame_lossless_core(
         num_color,
         speed,
         decoding_speed,
+        upsampling,
+        near_lossless,
         pool,
         scratch,
         frame_kind,
@@ -134,6 +138,8 @@ pub(super) fn encode_frame_lossless_core_impl(
     num_color: usize,
     speed: crate::Speed,
     decoding_speed: crate::DecodingSpeed,
+    upsampling: u32,
+    near_lossless: bool,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     frame_kind: ModularFrameKind<'_>,
@@ -141,7 +147,11 @@ pub(super) fn encode_frame_lossless_core_impl(
     local_trees: bool,
     writer: &mut BitWriter,
 ) -> bool {
-    let use_wp = decoding_speed.use_weighted_predictor();
+    let effort = speed.effort();
+    // Near-lossless samples share a `2k+1` grid. The Weighted predictor's
+    // averaging leaves it, so the tiers without a learned tree keep their
+    // fixed predictor on the grid with Gradient instead.
+    let use_wp = decoding_speed.use_weighted_predictor() && (effort.learned_tree || !near_lossless);
     // The hybrid-uint token of a modular residual can reach ~4*B+11 for B-bit
     // input. For B<=13 this stays below 64, so keep the tight default; for higher
     // bit depths raise LZ77_MIN_SYMBOL above the max literal token so the decoder
@@ -185,6 +195,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             grad_pack_fn,
             speed,
             use_wp,
+            frame_kind,
+            GroupLayout::DEFAULT.with_upsampling(upsampling),
             scratch,
             &mut palette_writer,
         ) {
@@ -198,6 +210,8 @@ pub(super) fn encode_frame_lossless_core_impl(
                     num_color,
                     speed,
                     decoding_speed,
+                    upsampling,
+                    near_lossless,
                     pool,
                     scratch,
                     frame_kind,
@@ -234,6 +248,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             grad_pack_fn,
             speed,
             use_wp,
+            frame_kind,
+            GroupLayout::DEFAULT.with_upsampling(upsampling),
             pool,
             scratch,
             &mut palette_writer,
@@ -248,6 +264,8 @@ pub(super) fn encode_frame_lossless_core_impl(
                     num_color,
                     speed,
                     decoding_speed,
+                    upsampling,
+                    near_lossless,
                     pool,
                     scratch,
                     frame_kind,
@@ -278,6 +296,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             grad_pack_fn,
             speed,
             use_wp,
+            frame_kind,
+            GroupLayout::DEFAULT.with_upsampling(upsampling),
             pool,
             scratch,
             writer,
@@ -307,6 +327,8 @@ pub(super) fn encode_frame_lossless_core_impl(
             grad_pack_fn,
             speed,
             use_wp,
+            frame_kind,
+            GroupLayout::DEFAULT.with_upsampling(upsampling),
             pool,
             scratch,
             writer,
@@ -318,27 +340,30 @@ pub(super) fn encode_frame_lossless_core_impl(
     // Fast uses fixed Weighted prediction and skips all adaptive analysis. Slow
     // searches the supported Slow predictor set per channel by estimated cost
     // (one global choice, used for the tree and every group).
-    let effort = speed.effort();
 
     // RCT re-selection (Slow, regular RGB frames): estimated over the same
     // fixed-context gradient cost libjxl uses. When a non-YCoCg transform
     // wins, the color planes are rebuilt and the frame headers signal it.
-    // A single gray plane has no RCT.
+    // A single gray plane has no RCT. Near-lossless planes rank at every
+    // tier: their values share a `2k+1` grid that only the subtract-type
+    // transforms preserve, and YCoCg's shifts would scatter it.
     let mut rct_type = if num_color == 3 { 6u32 } else { 0 };
     let mut rct_planes: Option<Image3Si> = None;
-    let rct_ranked: Vec<(u32, f32)> =
-        if frame_kind.allows_learned_tree() && effort.rct_search && num_color == 3 {
-            let row_step = if effort.rct_every_row {
-                1
-            } else if effort.rct_dense_rows {
-                RCT_DENSE_ROW_STEP
-            } else {
-                RCT_SPARSE_ROW_STEP
-            };
-            rank_rcts(linear, xsize, ysize, row_step, pool, scratch)
+    let rct_ranked: Vec<(u32, f32)> = if frame_kind.allows_learned_tree()
+        && (effort.rct_search || near_lossless)
+        && num_color == 3
+    {
+        let row_step = if effort.rct_every_row {
+            1
+        } else if effort.rct_dense_rows {
+            RCT_DENSE_ROW_STEP
         } else {
-            Vec::new()
+            RCT_SPARSE_ROW_STEP
         };
+        rank_rcts(linear, xsize, ysize, row_step, pool, scratch)
+    } else {
+        Vec::new()
+    };
     if let Some(&(t, _)) = rct_ranked.first()
         && t != 6
     {
@@ -406,18 +431,22 @@ pub(super) fn encode_frame_lossless_core_impl(
             // An image inside one 256-px group learns the same thing under
             // both layouts.
             && (xsize > GroupLayout::DEFAULT.dim() || ysize > GroupLayout::DEFAULT.dim());
-        let layouts: &[GroupLayout] = if slow_layouts {
-            &[GroupLayout::LARGE, GroupLayout::DEFAULT]
+        let layouts: Vec<GroupLayout> = if slow_layouts {
+            vec![GroupLayout::LARGE, GroupLayout::DEFAULT]
         } else {
-            &[GroupLayout::DEFAULT]
-        };
+            vec![GroupLayout::DEFAULT]
+        }
+        .into_iter()
+        .map(|layout| layout.with_upsampling(upsampling))
+        .collect();
+        let layouts: &[GroupLayout] = &layouts;
         // RGB sources of more than a megapixel-channel learn the 1024-px
         // layout only: the 256 layout's first stage costs a sampling pass and
         // its full learn doubles the frame's learning time.
         let rgb_layouts: &[GroupLayout] = if slow_layouts
             && source_values_of(xsize, ysize, coded_chans) > RGB_SINGLE_LAYOUT_MIN_VALUES
         {
-            &[GroupLayout::LARGE]
+            &layouts[..1]
         } else {
             layouts
         };
@@ -507,7 +536,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                         rgb_stage.take(),
                         wp_params,
                         &header_bits,
-                        effort.tree_rank_deep,
+                        effort.tree_rank_deep(),
                         rank_layout,
                         rank_sampling,
                         keep_stages,
@@ -563,7 +592,7 @@ pub(super) fn encode_frame_lossless_core_impl(
             }
             if rank_pal
                 && rank_more
-                && effort.tree_rank_deep
+                && effort.tree_rank_deep()
                 && let Some(p) = &palette
             {
                 let source = p.source(xsize, ysize);
@@ -783,7 +812,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                         &mixed,
                         xsize,
                         ysize,
-                        GroupLayout::DEFAULT,
+                        GroupLayout::DEFAULT.with_upsampling(upsampling),
                         min_symbol,
                         wp_params,
                         use_wp,
@@ -819,7 +848,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                             frame_kind,
                             xsize,
                             ysize,
-                            GroupLayout::DEFAULT,
+                            GroupLayout::DEFAULT.with_upsampling(upsampling),
                             min_symbol,
                             pool,
                             scratch,
@@ -896,6 +925,7 @@ pub(super) fn encode_frame_lossless_core_impl(
             | ModularFrameKind::RgbSavedFirst
             | ModularFrameKind::RgbBlendLast
             | ModularFrameKind::RgbCrop { .. }
+            | ModularFrameKind::RgbBlendCrop { .. }
     );
     let wp_tree = (effort.flat_wp_contexts && use_wp && displayed)
         .then(|| {
@@ -1037,7 +1067,7 @@ pub(super) fn encode_frame_lossless_core_impl(
 
             // Per-cluster prefix codes (nb_chans + 1 contexts), balanced N-leaf tree.
             let code = build_lz_pixel_code_tails(
-                speed.effort().lz_exhaustive_entropy,
+                speed.effort().lz_exhaustive_entropy(),
                 &[lz_tokens.as_slice()],
                 &[tail],
                 flat_contexts,
@@ -1167,7 +1197,7 @@ pub(super) fn encode_frame_lossless_core_impl(
             }
             let group_slices: Vec<&[LzToken]> = group_lz_tokens.iter().map(Vec::as_slice).collect();
             let code = build_lz_pixel_code_tails(
-                speed.effort().lz_exhaustive_entropy,
+                speed.effort().lz_exhaustive_entropy(),
                 &group_slices,
                 &group_tails,
                 flat_contexts,

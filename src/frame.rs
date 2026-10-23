@@ -30,12 +30,15 @@
 mod dc_rdo;
 mod dc_smoothing;
 mod extra_tree;
+#[cfg(feature = "extraslow")]
 mod loop_arbiter;
+#[cfg(feature = "extraslow")]
 mod loop_group_map;
 use dc_smoothing::{
     choose_chroma_dc_coding, compensate_b_dc, flatten_chroma_dc, skip_dc_smoothing,
 };
 
+#[cfg(feature = "extraslow")]
 use crate::Arbiter;
 use crate::bit_writer::BitWriter;
 use crate::coder_scratch::{CoderScratch, DcPredictorScratch};
@@ -45,9 +48,11 @@ use crate::dct::fmla;
 use crate::encode_image::AlphaPlane;
 use crate::encoding_context::EncodingContext;
 use crate::encoding_context::FrameRole;
+#[cfg(feature = "extraslow")]
+use crate::entropy::TokenSlice;
 use crate::entropy::{
-    AcTokens, EntropyCode, Token, TokenSlice, f_log2, optimize_entropy_code, pack_signed,
-    write_entropy_code, write_token,
+    AcTokens, EntropyCode, Token, f_log2, optimize_entropy_code, pack_signed, write_entropy_code,
+    write_token,
 };
 use crate::group::write_ac_group;
 use crate::image::{Image3B, Image3F, Image3S, Rect};
@@ -57,7 +62,9 @@ use crate::static_entropy_codes::{
     K_CONTEXT_TREE_TOKENS, K_GRADIENT_CONTEXT_LUT, K_NUM_DC_CONTEXTS,
 };
 use crate::util::EncodeError;
+#[cfg(feature = "extraslow")]
 use loop_arbiter::LoopArbiter;
+#[cfg(feature = "extraslow")]
 use loop_group_map::LoopGroupMap;
 
 const K_BLOCK_DIM: usize = 8;
@@ -3975,7 +3982,7 @@ fn encode_frame_core(
         });
         // Keep the incumbent RDOQ scan: the final race changes coding only,
         // so all arms transmit exactly the same quantized coefficients.
-        if ctx.speed.effort().coeff_order_entropy_race && num_passes == 1 {
+        if ctx.speed.effort().coeff_order_entropy_race() && num_passes == 1 {
             if let Some(stats) = &order_stats {
                 let mut proposed = crate::coeff_order::CoeffOrders::natural();
                 crate::coeff_order::propose_orders(stats, &mut proposed);
@@ -3990,7 +3997,7 @@ fn encode_frame_core(
         drop(order_stats);
         ytob_dc = if use_dc_frame {
             0
-        } else if ctx.speed.effort().dc_cfl_weighted {
+        } else if ctx.speed.effort().dc_cfl_weighted() {
             crate::color_correlation::choose_ytob_dc_weighted(
                 &dc_datas,
                 ctx,
@@ -4043,7 +4050,7 @@ fn encode_frame_core(
         // orders move most of the walk, they no longer describe what the
         // contexts of the refine pass will see, and the quantizer would price
         // its choices on them: tokenize again on the orders it codes with.
-        if ctx.speed.effort().rdoq_fresh_prices || scan_moved >= RDOQ_FRESH_PRICES_MIN_SCAN_MOVE {
+        if ctx.speed.effort().rdoq_fresh_prices() || scan_moved >= RDOQ_FRESH_PRICES_MIN_SCAN_MOVE {
             // These streams will be replaced; release their token buffers
             // before allocating the reordered streams for the whole frame.
             all_pending.clear();
@@ -4097,8 +4104,9 @@ fn encode_frame_core(
         // itself (same RDOQ, prices and orders), so when it runs its final
         // groups replace the refined pass.
         all_pending.clear();
+        #[cfg(feature = "extraslow")]
         let loop_groups =
-            if ctx.speed.effort().aq_closed_loop && ctx.coding.is_xyb() && num_passes == 1 {
+            if ctx.speed.effort().aq_closed_loop() && ctx.coding.is_xyb() && num_passes == 1 {
                 run_quant_field_loop(
                     ctx,
                     scratch,
@@ -4119,6 +4127,8 @@ fn encode_frame_core(
             } else {
                 None
             };
+        #[cfg(not(feature = "extraslow"))]
+        let loop_groups: Option<(Vec<RefinedAcGroup>, DistanceParams)> = None;
         let loop_groups = loop_groups.map(|(groups, chosen)| {
             distp = chosen;
             groups
@@ -4633,7 +4643,7 @@ fn encode_frame_core(
             &ctx.thread_pool,
             scratch,
         );
-    } else if dc_code_refined && ctx.speed.effort().ans_exhaustive {
+    } else if dc_code_refined && ctx.speed.effort().ans_exhaustive() {
         crate::entropy::refine_ans_entropy_exhaustive(
             &mut dc_code_owned,
             dc_tokens_per_group
@@ -5311,6 +5321,7 @@ pub(crate) struct PendingAcGroup {
 /// the marginal deficit and bit change of each direction. Tiles whose
 /// marginal return beats the global rate move; the joint move is verified and
 /// kept only if `-(1 - MS-SSIM) - slope * log rate` improves.
+#[cfg(feature = "extraslow")]
 #[allow(clippy::too_many_arguments)]
 fn run_quant_field_loop(
     ctx: &EncodingContext,
@@ -6113,7 +6124,7 @@ fn run_quant_field_loop(
     // square) on top of the current frame, re-encoded exactly (block memo,
     // frozen prices) and arbitrated by the incremental SSIMULACRA2 state at the
     // loop's exchange rate. One site per AC group is encoded per parallel round.
-    if ctx.speed.effort().dct128_loop && cached_slope > 0.0 {
+    if ctx.speed.effort().dct128_loop() && cached_slope > 0.0 {
         use crate::dc_group_data::{
             AcStrategyImage, STRATEGY_DCT64X128, STRATEGY_DCT128X64, STRATEGY_DCT128X128,
         };
@@ -6513,7 +6524,7 @@ fn run_quant_field_loop(
     // incremental SSIMULACRA2 state at the loop's exchange rate. One site per
     // AC group per parallel round; the best variant is re-encoded in full and
     // kept if it still improves.
-    if ctx.speed.effort().layout_loop && cached_slope > 0.0 {
+    if ctx.speed.effort().layout_loop() && cached_slope > 0.0 {
         use crate::dc_group_data::{
             AcStrategyImage, NUM_STRATEGIES, STRATEGY_DCT8X16, STRATEGY_DCT16X8, STRATEGY_DCT16X16,
         };
@@ -6525,12 +6536,25 @@ fn run_quant_field_loop(
         let mut cand = trial_eval(&cur);
         let mut j_cur = -cur_d - slope * rate_term(cur_bits);
         // Only layouts whose classes the frame already uses (matrices, orders).
-        let mut present = [false; NUM_STRATEGIES];
+        let class = |st: usize| {
+            (
+                crate::quant_weights::quant_table_slot_of(st as u8),
+                crate::ac_context::K_STRATEGY_ORDER
+                    [crate::dc_group_data::STRATEGY_CODE_LUT[st] as usize],
+            )
+        };
+        let mut used = [false; NUM_STRATEGIES];
         for d in dc_datas.iter() {
             for (_, _, st) in d.ac_strategy.iter_first_blocks() {
-                present[st as usize] = true;
+                used[st as usize] = true;
             }
         }
+        // A transpose shares both classes with the transform the frame uses.
+        let present: [bool; NUM_STRATEGIES] = std::array::from_fn(|st| {
+            used[st]
+                || class(st).0.is_some()
+                    && (0..NUM_STRATEGIES).any(|o| used[o] && class(o) == class(st))
+        });
         let mut variants: Vec<Parts> = vec![vec![
             (STRATEGY_DCT, 0, 0),
             (STRATEGY_DCT, 1, 0),

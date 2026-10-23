@@ -32,7 +32,9 @@
 use super::super::groups::{
     DeepLzScratchPool, SLOW_DEEP_LZ_MAX_THREADS, group_lz_threads, write_lz_groups_with_header,
 };
-use super::super::header::{write_frame_header_modular, write_modular_transforms, write_toc_entry};
+use super::super::header::{
+    write_frame_header_modular_kind, write_modular_transforms, write_toc_entry,
+};
 use super::super::lz77::{
     LzToken, RunLzWriter, build_lz_pixel_code, lz77_compress_channels_for_speed_with_depth,
     lz77_compress_for_speed_with_depth, write_local_tree_lz77, write_lz_section,
@@ -49,6 +51,7 @@ use crate::bit_writer::BitWriter;
 use crate::coder_scratch::CoderScratch;
 use crate::encode_image::AlphaPlane;
 use crate::image::Image3Si;
+use crate::patches::ModularFrameKind;
 use crate::thread_pool::ThreadPool;
 use crate::weighted_predictor::WpParams;
 
@@ -150,7 +153,7 @@ fn estimated_local_lz_stream_bits(
     scratch: &mut CoderScratch,
 ) -> usize {
     let code = build_lz_pixel_code(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         std::iter::once(lz),
         num_contexts,
         min_symbol,
@@ -395,6 +398,8 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
     grad_pack_fn: GradPackInteriorFn,
     speed: crate::Speed,
     use_wp: bool,
+    frame_kind: ModularFrameKind<'_>,
+    layout: GroupLayout,
     pool: &ThreadPool,
     scratch: &mut CoderScratch,
     writer: &mut BitWriter,
@@ -676,7 +681,7 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
         .collect();
 
     let code = build_lz_pixel_code(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         group_lz_tokens.iter().map(Vec::as_slice),
         nb_chans,
         min_symbol,
@@ -685,7 +690,7 @@ pub(in crate::lossless) fn try_encode_local_palette_multi_group(
         &mut scratch.huffman_pool,
     );
 
-    write_frame_header_modular(alpha.is_some(), GroupLayout::DEFAULT, writer);
+    write_frame_header_modular_kind(alpha.is_some(), frame_kind, layout, writer);
     let num_sections = 1 + num_dc_groups + 1 + num_ac_groups;
     let mut sections: Vec<BitWriter> = (0..num_sections).map(|_| BitWriter::new()).collect();
 

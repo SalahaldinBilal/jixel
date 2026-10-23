@@ -282,7 +282,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     let distance_ctx = nb_chans as u32;
     let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
     let code = build_lz_pixel_code(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         std::iter::once(lz_tokens.as_slice()),
         nb_chans,
         min_symbol,
@@ -329,6 +329,8 @@ pub(crate) fn encode_frame_lossless_xyb_ink(
         3,
         speed,
         decoding_speed,
+        1,
+        false,
         pool,
         scratch,
         ModularFrameKind::XybBlend { last: true },
@@ -357,6 +359,8 @@ pub(crate) fn encode_frame_lossless_layer(
         3,
         speed,
         decoding_speed,
+        1,
+        false,
         pool,
         scratch,
         kind,
@@ -428,6 +432,8 @@ pub(crate) fn encode_modular_xyb_atlas_tree_slot(
         3,
         speed,
         crate::DecodingSpeed::Slow,
+        1,
+        false,
         pool,
         scratch,
         ModularFrameKind::XybReferenceOnly {

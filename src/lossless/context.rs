@@ -466,7 +466,7 @@ pub(super) fn try_encode_context_tree_single_group(
     let distance_ctx = num_pixel_ctx as u32;
     let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
     let code = build_lz_pixel_code(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         std::iter::once(lz_tokens.as_slice()),
         num_pixel_ctx,
         min_symbol,
@@ -632,7 +632,7 @@ pub(super) fn try_encode_context_tree_multi_group(
         _ => None,
     };
     let code = build_lz_pixel_code(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         group_lz_tokens.iter().map(Vec::as_slice),
         num_pixel_ctx,
         min_symbol,

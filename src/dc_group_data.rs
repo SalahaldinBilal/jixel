@@ -242,6 +242,7 @@ impl AcStrategyImage {
         }
     }
 
+    #[cfg(feature = "extraslow")]
     /// Raw cells of a `w`x`h` region, for an exact restore.
     pub(crate) fn save_region(&self, x: usize, y: usize, w: usize, h: usize) -> Vec<u8> {
         (y..y + h)
@@ -253,6 +254,7 @@ impl AcStrategyImage {
             .collect()
     }
 
+    #[cfg(feature = "extraslow")]
     pub(crate) fn restore_region(&mut self, x: usize, y: usize, w: usize, saved: &[u8]) {
         for (i, row) in saved.chunks_exact(w).enumerate() {
             let start = (y + i) * self.xsize + x;
@@ -286,6 +288,7 @@ impl AcStrategyImage {
     }
 }
 
+#[cfg_attr(not(feature = "extraslow"), allow(dead_code))]
 /// A re-tiling proposal: the pieces (strategy, dx, dy) tiling one closed
 /// rectangle of blocks that the proposal lays out differently.
 #[derive(Clone, Debug)]

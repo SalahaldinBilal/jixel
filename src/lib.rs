@@ -42,6 +42,7 @@ mod arbiter;
 #[cfg(all(target_arch = "x86_64", feature = "avx"))]
 mod avx;
 mod bit_writer;
+mod cell_layer;
 mod clip_continuation;
 mod cmyk;
 mod coder_scratch;
@@ -50,6 +51,7 @@ mod coeff_order;
 mod color;
 mod color_correlation;
 mod color_encoding;
+#[cfg(feature = "extraslow")]
 mod cvvdp_arbiter;
 mod dc_group_data;
 mod dc_ops;
@@ -94,9 +96,11 @@ mod splines;
 mod squeeze;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
 mod sse;
+#[cfg(feature = "extraslow")]
 mod ssimulacra2;
 mod static_entropy_codes;
 mod thread_pool;
+mod upsampling;
 mod util;
 mod vector_layers;
 #[cfg(all(target_arch = "wasm32", feature = "wasm", target_feature = "simd128"))]

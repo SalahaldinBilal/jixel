@@ -261,6 +261,9 @@ macro_rules! backend {
             }
             super::gradients(src.map(|s| &s[end..]), sum)
         }
+        // A target feature enabled for the whole build (wasm simd128) makes
+        // these calls safe; the other backends still need the blocks.
+        #[allow(unused_unsafe)]
         pub(super) fn kernels() -> super::Kernels {
             // The selector checks CPU features. The proxy supplies complete
             // source pairs for reduction and equal-length spans for scoring.

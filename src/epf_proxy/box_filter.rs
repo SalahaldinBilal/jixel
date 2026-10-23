@@ -345,6 +345,9 @@ macro_rules! moments {
             );
         }
 
+        // A target feature enabled for the whole build (wasm simd128) makes
+        // these calls safe; the other backends still need the blocks.
+        #[allow(unused_unsafe)]
         pub(super) fn kernels() -> super::Kernels {
             // The selector checks CPU support before publishing these safe
             // wrappers. Scratch::run validates the inputs and sizes every

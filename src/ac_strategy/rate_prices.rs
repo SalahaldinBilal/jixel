@@ -340,7 +340,8 @@ fn fixed_model_bits(block: &[i32], cx: usize, cy: usize) -> f32 {
     crate::inflated_cost::model_bits(nzeros, mag_bits, max_scan, cx, cy)
 }
 
-/// Forward transform of all three channels with chroma-from-luma applied.
+/// Forward transform of all three channels with chroma-from-luma applied
+/// against the luma as quantized at `qac`.
 fn transform_block(
     ctx: &EncodingContext,
     scratch: &mut CoderScratch,
@@ -349,13 +350,30 @@ fn transform_block(
     px: usize,
     py: usize,
     cmap: [f32; 3],
+    qac: f32,
+    distance: f32,
 ) -> (usize, usize, usize) {
     let CoderScratch {
         strategy_coeffs: coeffs,
         transform_gather,
+        recon,
         ..
     } = scratch;
-    prepare_strategy_coeffs(ctx, coeffs, transform_gather, strategy, opsin, px, py, cmap)
+    let (cx, cy, size) =
+        prepare_strategy_coeffs(ctx, coeffs, transform_gather, strategy, opsin, px, py, cmap);
+    // Chroma is coded against the dequantized luma.
+    super::rebase_cfl_coefficients(
+        ctx,
+        coeffs,
+        &mut recon[0],
+        strategy,
+        qac,
+        distance,
+        cx,
+        cy,
+        cmap,
+    );
+    (cx, cy, size)
 }
 
 /// The transforms the selector can place at this speed and distance.
@@ -698,6 +716,8 @@ impl RatePrices {
                 origin.0 + bx * 8,
                 origin.1 + by * 8,
                 cmap_factors(ctx.cfl_frame(), cfl.0, cfl.1, bx, by),
+                scale * quant as f32,
+                distance,
             );
             for (c, block) in block.chunks_exact_mut(size).enumerate() {
                 quantize_channel(

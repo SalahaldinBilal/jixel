@@ -584,11 +584,25 @@ fn strategy_cost64(
     let CoderScratch {
         strategy_coeffs: coeffs,
         transform_gather: input,
+        recon,
         rate_prices,
         ..
     } = scratch;
     let (cx, cy, size) =
         prepare_strategy_coeffs(ctx, coeffs, input, strategy, opsin, px, py, cmap_factor);
+    if coefficient_rebase(rate_prices.as_deref(), strategy) {
+        rebase_cfl_coefficients(
+            ctx,
+            coeffs,
+            &mut recon[0],
+            strategy,
+            qac,
+            distance,
+            cx,
+            cy,
+            cmap_factor,
+        );
+    }
     let visible = Footprint::of_strategy(opsin, px, py, strategy).visible_fraction();
 
     if let Some((distortion, rate)) = rate_prices.as_deref().and_then(|prices| {
@@ -854,12 +868,34 @@ fn reconstruction_strategy_cost_bounded(
         let bits = table.map(|prices| {
             // Summed in channel order.
             let mut bits = 0f32;
-            bits += learned_channel_bits(
-                ctx, prices, strategy, &coeffs[0], 0, qac, qm_mult_x, distance, cx, cy,
+            bits += chroma_bits(
+                ctx,
+                prices,
+                strategy,
+                coeffs,
+                recon,
+                0,
+                qac,
+                qm_mult_x,
+                distance,
+                cx,
+                cy,
+                cmap_factor,
             );
             bits += y_bits.expect("priced luma");
-            bits += learned_channel_bits(
-                ctx, prices, strategy, &coeffs[2], 2, qac, qm_mult_x, distance, cx, cy,
+            bits += chroma_bits(
+                ctx,
+                prices,
+                strategy,
+                coeffs,
+                recon,
+                2,
+                qac,
+                qm_mult_x,
+                distance,
+                cx,
+                cy,
+                cmap_factor,
             );
             bits
         });
@@ -983,6 +1019,90 @@ fn apply_cfl(ctx: &EncodingContext, coeffs: CflXyb<'_>, size: usize, cmap_factor
     let CflXyb { x, y, b } = coeffs;
     assert!(size <= x.len() && size <= y.len() && size <= b.len());
     (ctx.apply_cfl)(&mut x[..size], &y[..size], &mut b[..size], cmap_factor);
+}
+
+/// The luma coefficient error (source minus dequantized) the reconstruction
+/// kernel's luma phase leaves in its first scratch slot, LLF positions zero.
+#[allow(clippy::too_many_arguments)]
+fn luma_coefficient_error(
+    ctx: &EncodingContext,
+    strategy: u8,
+    y: &[f32],
+    qac: f32,
+    distance: f32,
+    cx: usize,
+    cy: usize,
+    error: &mut [f32],
+) {
+    let width = cx * 8;
+    crate::inflated_cost::recon_quantize_scalar::<true, false>(
+        y,
+        inverse_matrix_for(ctx, strategy, 1),
+        qac,
+        ctx.dequant_bias(1),
+        &crate::group::quantize_ac_thresholds(1, cx, cy, distance),
+        width,
+        cy * 8,
+        width / 2,
+        cx,
+        cy,
+        error,
+        ctx.rate_log2_lut,
+        &[],
+    );
+}
+
+/// Moves chroma residuals taken against the source luma onto the dequantized
+/// luma the writer subtracts: `C - a*Y + a*(Y - Yq) = C - a*Yq`.
+fn rebase_cfl(
+    ctx: &EncodingContext,
+    x: &mut [f32],
+    luma_error: &[f32],
+    b: &mut [f32],
+    cmap_factor: [f32; 3],
+) {
+    (ctx.apply_cfl)(x, luma_error, b, [-cmap_factor[0], 0.0, -cmap_factor[2]]);
+}
+
+/// `rebase_cfl` for the coefficient model: quantizes the luma of `coeffs`
+/// (chroma already residual against the source luma) into `error` first.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rebase_cfl_coefficients(
+    ctx: &EncodingContext,
+    coeffs: &mut [[f32; 4096]; 3],
+    error: &mut [f32],
+    strategy: u8,
+    qac: f32,
+    distance: f32,
+    cx: usize,
+    cy: usize,
+    cmap_factor: [f32; 3],
+) {
+    let size = cx * cy * 64;
+    luma_coefficient_error(
+        ctx,
+        strategy,
+        &coeffs[1][..size],
+        qac,
+        distance,
+        cx,
+        cy,
+        &mut error[..size],
+    );
+    let [x, _, b] = coeffs;
+    rebase_cfl(
+        ctx,
+        &mut x[..size],
+        &error[..size],
+        &mut b[..size],
+        cmap_factor,
+    );
+}
+
+/// Whether the coefficient model prices chroma against the decoded luma:
+/// learned tables are trained on the residual the writer codes.
+fn coefficient_rebase(prices: Option<&RatePrices>, strategy: u8) -> bool {
+    prices.is_some_and(|prices| prices.has_table(strategy))
 }
 
 #[inline]
@@ -1109,19 +1229,34 @@ fn strategy_cost_impl(
             prices,
         )
         .dist_and_rate(),
-        DistortionModel::Coefficient => coefficient_dist_and_rate(
-            ctx,
-            strategy,
-            coeffs,
-            size,
-            qac,
-            qm_mult_x,
-            distance,
-            cx,
-            cy,
-            prices,
-            Footprint::of_strategy(opsin, px, py, strategy).visible_fraction(),
-        ),
+        DistortionModel::Coefficient => {
+            if coefficient_rebase(prices, strategy) {
+                rebase_cfl_coefficients(
+                    ctx,
+                    coeffs,
+                    &mut recon[0],
+                    strategy,
+                    qac,
+                    distance,
+                    cx,
+                    cy,
+                    cmap_factor,
+                );
+            }
+            coefficient_dist_and_rate(
+                ctx,
+                strategy,
+                coeffs,
+                size,
+                qac,
+                qm_mult_x,
+                distance,
+                cx,
+                cy,
+                prices,
+                Footprint::of_strategy(opsin, px, py, strategy).visible_fraction(),
+            )
+        }
     };
     rd_cost(distortion_model, distance, meta_r, d_total, r_total)
 }
@@ -1237,6 +1372,45 @@ fn learned_channel_bits(
         .expect("priced table")
 }
 
+/// Learned bits of chroma channel `c` once the luma phase has left the luma
+/// coefficient error in `recon[1]`: against the dequantized luma, as written.
+#[allow(clippy::too_many_arguments)]
+fn chroma_bits(
+    ctx: &EncodingContext,
+    prices: &RatePrices,
+    strategy: u8,
+    coeffs: &[[f32; 4096]; 3],
+    recon: &mut [[f32; 4096]; 8],
+    c: usize,
+    qac: f32,
+    qm_mult_x: f32,
+    distance: f32,
+    cx: usize,
+    cy: usize,
+    cmap_factor: [f32; 3],
+) -> f32 {
+    let size = cx * cy * 64;
+    let [_, luma_error, _, _, _, rebased, ..] = recon;
+    (ctx.recon_error_kernels.combine)(
+        &coeffs[c][..size],
+        &luma_error[..size],
+        cmap_factor[c],
+        &mut rebased[..size],
+    );
+    learned_channel_bits(
+        ctx,
+        prices,
+        strategy,
+        &rebased[..size],
+        c,
+        qac,
+        qm_mult_x,
+        distance,
+        cx,
+        cy,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reconstruction_dist_and_rate(
     ctx: &EncodingContext,
@@ -1276,19 +1450,45 @@ fn reconstruction_dist_and_rate(
         keep_spatial_errors,
         table.is_none(),
     );
-    let mut cost = (ctx.recon_dist_and_rate)(recon, &input, &ctx.recon_error_kernels);
-    // The reconstruction kernel quantizes chroma against the reconstructed
-    // luma, so its counts say nothing about the residual priced here.
-    if let Some(prices) = table {
-        // Summed in channel order.
-        let mut bits = 0f32;
-        for (c, coeffs) in coeffs.iter().enumerate() {
-            bits += learned_channel_bits(
-                ctx, prices, strategy, coeffs, c, qac, qm_mult_x, distance, cx, cy,
-            );
-        }
-        cost.rate = prices.scaled_rate(strategy, distance, bits);
-    }
+    let Some(prices) = table else {
+        return (ctx.recon_dist_and_rate)(recon, &input, &ctx.recon_error_kernels);
+    };
+    let luma = (ctx.recon_luma_phase)(recon, &input, &ctx.recon_error_kernels);
+    // Summed in channel order.
+    let mut bits = 0f32;
+    bits += chroma_bits(
+        ctx,
+        prices,
+        strategy,
+        coeffs,
+        recon,
+        0,
+        qac,
+        qm_mult_x,
+        distance,
+        cx,
+        cy,
+        cmap_factor,
+    );
+    bits += learned_channel_bits(
+        ctx, prices, strategy, &coeffs[1], 1, qac, qm_mult_x, distance, cx, cy,
+    );
+    bits += chroma_bits(
+        ctx,
+        prices,
+        strategy,
+        coeffs,
+        recon,
+        2,
+        qac,
+        qm_mult_x,
+        distance,
+        cx,
+        cy,
+        cmap_factor,
+    );
+    let mut cost = (ctx.recon_chroma_phase)(recon, &input, &ctx.recon_error_kernels, luma);
+    cost.rate = prices.scaled_rate(strategy, distance, bits);
     cost
 }
 
@@ -1474,8 +1674,24 @@ fn sub8_strategy_costs(
         for c in 0..3 {
             forward_sub8_transform(ctx, strategy, &pixels[c], &mut coeffs[c]);
         }
-        let [x, y, b] = &mut ***coeffs;
-        apply_cfl(ctx, CflXyb { x, y, b }, 64, cmap_factor);
+        {
+            let [x, y, b] = &mut ***coeffs;
+            apply_cfl(ctx, CflXyb { x, y, b }, 64, cmap_factor);
+        }
+        if coefficient_rebase(prices, strategy) {
+            let mut error = [0.0f32; 64];
+            rebase_cfl_coefficients(
+                ctx,
+                coeffs,
+                &mut error,
+                strategy,
+                qac,
+                distance,
+                1,
+                1,
+                cmap_factor,
+            );
+        }
         let (distortion, rate) = coefficient_dist_and_rate(
             ctx, strategy, coeffs, 64, qac, qm_mult_x, distance, 1, 1, prices, visible,
         );

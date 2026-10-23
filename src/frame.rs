@@ -6536,12 +6536,25 @@ fn run_quant_field_loop(
         let mut cand = trial_eval(&cur);
         let mut j_cur = -cur_d - slope * rate_term(cur_bits);
         // Only layouts whose classes the frame already uses (matrices, orders).
-        let mut present = [false; NUM_STRATEGIES];
+        let class = |st: usize| {
+            (
+                crate::quant_weights::quant_table_slot_of(st as u8),
+                crate::ac_context::K_STRATEGY_ORDER
+                    [crate::dc_group_data::STRATEGY_CODE_LUT[st] as usize],
+            )
+        };
+        let mut used = [false; NUM_STRATEGIES];
         for d in dc_datas.iter() {
             for (_, _, st) in d.ac_strategy.iter_first_blocks() {
-                present[st as usize] = true;
+                used[st as usize] = true;
             }
         }
+        // A transpose shares both classes with the transform the frame uses.
+        let present: [bool; NUM_STRATEGIES] = std::array::from_fn(|st| {
+            used[st]
+                || class(st).0.is_some()
+                    && (0..NUM_STRATEGIES).any(|o| used[o] && class(o) == class(st))
+        });
         let mut variants: Vec<Parts> = vec![vec![
             (STRATEGY_DCT, 0, 0),
             (STRATEGY_DCT, 1, 0),

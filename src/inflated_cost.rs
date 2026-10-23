@@ -2066,7 +2066,7 @@ fn prepare_reconstruction_scalar(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool>(
+pub(crate) fn recon_quantize_scalar<const BIASED: bool, const COMPUTE_RATE: bool>(
     coeff: &[f32],
     inv: &[f32],
     quant_scale: f32,

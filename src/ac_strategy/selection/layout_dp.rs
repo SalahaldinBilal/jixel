@@ -1617,16 +1617,16 @@ mod tests {
     fn search_runs_at_slow_and_under_the_extraslow_loop_only_once() {
         let gate = |speed: crate::Speed| {
             let effort = speed.effort();
-            effort.layout_retile && !effort.layout_loop
+            effort.layout_retile && !effort.layout_loop()
         };
         assert!(gate(crate::Speed::MediumSlow));
         assert!(gate(crate::Speed::Slow));
+        assert_eq!(gate(crate::Speed::ExtraSlow), !cfg!(feature = "extraslow"));
         for speed in [
             crate::Speed::UltraFast,
             crate::Speed::Fastest,
             crate::Speed::Fast,
             crate::Speed::Medium,
-            crate::Speed::ExtraSlow,
         ] {
             assert!(!gate(speed));
         }

@@ -304,7 +304,7 @@ pub(super) fn try_encode_palette_single_group(
         (preds, section, lz_tokens)
     };
     let code = build_lz_pixel_code(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         std::iter::once(lz_tokens.as_slice()),
         nb_chans,
         min_symbol,

@@ -424,7 +424,7 @@ fn write_local_tree_group<T: lz77::LiteralToken>(
             );
         }
     }
-    if speed.effort().lz_priced_search {
+    if speed.effort().lz_priced_search() {
         let (e_lit, _) =
             estimate_literal_and_run_bits_single(tokens, num_ctx as usize + 1, min_symbol);
         if let Some(streams) = priced_tree_streams(
@@ -466,7 +466,7 @@ fn write_local_tree_variant<T: lz77::LzTokenSource>(
     let num_ctx = cand.num_ctx;
     let distance_ctx = num_ctx;
     let code = build_lz_pixel_code_tails(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         &[stream],
         &[tail],
         num_ctx as usize,

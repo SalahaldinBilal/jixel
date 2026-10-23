@@ -328,6 +328,7 @@ impl EncodingContext {
             .fetch_max(scale.clamp(2, 7), std::sync::atomic::Ordering::Relaxed);
     }
 
+    #[cfg(feature = "extraslow")]
     /// Frame-level race result: replaces the gate-raised scale.
     pub(crate) fn set_b_qm_scale(&self, scale: u32) {
         self.b_qm_scale
@@ -388,7 +389,7 @@ impl EncodingContext {
                 self.arbiter,
                 self.coding,
                 self.coding.plane_scale(coded),
-                effort.layout_retile && !effort.layout_loop,
+                effort.layout_retile && !effort.layout_loop(),
             )
         });
     }
@@ -482,7 +483,7 @@ impl EncodingContext {
         let dc_from_dct = dct::selected_dc_from_dct_methods();
         let afv = afv::selected_afv_methods();
         let effort = speed.effort();
-        let retile = effort.layout_retile && !effort.layout_loop;
+        let retile = effort.layout_retile && !effort.layout_loop();
         let base_matrices = if effort.rectangles {
             DequantMatrices::new(distance, arbiter, retile)
         } else {

@@ -47,7 +47,7 @@ impl CandidateSearch {
             medium_upgrades: substitute,
             // This search improves CVVDP, with a small SSIMULACRA2 tradeoff.
             merge32_upgrades: effort.full_rerank
-                && !effort.layout_loop
+                && !effort.layout_loop()
                 && arbiter == crate::Arbiter::Cvvdp,
         }
     }

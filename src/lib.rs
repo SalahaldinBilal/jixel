@@ -51,6 +51,7 @@ mod coeff_order;
 mod color;
 mod color_correlation;
 mod color_encoding;
+#[cfg(feature = "extraslow")]
 mod cvvdp_arbiter;
 mod dc_group_data;
 mod dc_ops;
@@ -95,6 +96,7 @@ mod splines;
 mod squeeze;
 #[cfg(all(any(target_arch = "x86_64", target_arch = "x86"), feature = "sse"))]
 mod sse;
+#[cfg(feature = "extraslow")]
 mod ssimulacra2;
 mod static_entropy_codes;
 mod thread_pool;

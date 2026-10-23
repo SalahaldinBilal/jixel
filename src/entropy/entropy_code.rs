@@ -154,6 +154,7 @@ impl FrozenTokenPrices {
         self.symbol_bits[cluster][symbol as usize] + extra_bits as f32
     }
 
+    #[cfg_attr(not(feature = "extraslow"), allow(dead_code))]
     /// Shannon bits of `streams` under this code's clustering and hybrid-uint
     /// configs with the symbol histograms rebuilt from the streams themselves:
     /// the cost of an adapted code, without its header.

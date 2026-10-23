@@ -2190,7 +2190,7 @@ fn select_transforms(
     // pieces at any 8-pixel origin, on the rerank's reconstruction costs.
     if reranked
         && ctx.speed.effort().layout_retile
-        && !ctx.speed.effort().layout_loop
+        && !ctx.speed.effort().layout_loop()
         && ctx.coding.is_xyb()
     {
         let rerank = RerankContext {
@@ -2220,7 +2220,7 @@ fn select_transforms(
     // loop's exact arbiter decides every changed region.
     if reranked
         && ctx.speed.effort().layout_retile
-        && ctx.speed.effort().layout_loop
+        && ctx.speed.effort().layout_loop()
         && ctx.coding.is_xyb()
     {
         let rerank = RerankContext {
@@ -3586,19 +3586,25 @@ fn rerank_large_transforms(
 mod tests {
     #[test]
     fn candidate_search_respects_speed_and_arbiter() {
+        let mut plain = vec![
+            crate::Speed::UltraFast,
+            crate::Speed::Fastest,
+            crate::Speed::Fast,
+        ];
+        let mut slow_like = vec![crate::Speed::MediumSlow, crate::Speed::Slow];
+        if cfg!(feature = "extraslow") {
+            plain.push(crate::Speed::ExtraSlow);
+        } else {
+            slow_like.push(crate::Speed::ExtraSlow);
+        }
         for arbiter in [crate::Arbiter::Ssimulacra2, crate::Arbiter::Cvvdp] {
-            for speed in [
-                crate::Speed::UltraFast,
-                crate::Speed::Fastest,
-                crate::Speed::Fast,
-                crate::Speed::ExtraSlow,
-            ] {
+            for &speed in &plain {
                 let p = super::CandidateSearch::for_speed(speed, arbiter);
                 assert!(!p.fine_runner_up && !p.medium_upgrades && !p.merge32_upgrades);
             }
             let medium = super::CandidateSearch::for_speed(crate::Speed::Medium, arbiter);
             assert!(medium.fine_runner_up && medium.medium_upgrades && !medium.merge32_upgrades);
-            for speed in [crate::Speed::MediumSlow, crate::Speed::Slow] {
+            for &speed in &slow_like {
                 let slow = super::CandidateSearch::for_speed(speed, arbiter);
                 assert!(!slow.fine_runner_up && !slow.medium_upgrades);
                 assert_eq!(slow.merge32_upgrades, arbiter == crate::Arbiter::Cvvdp);

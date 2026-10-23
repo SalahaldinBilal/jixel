@@ -536,7 +536,7 @@ pub(super) fn encode_frame_lossless_core_impl(
                         rgb_stage.take(),
                         wp_params,
                         &header_bits,
-                        effort.tree_rank_deep,
+                        effort.tree_rank_deep(),
                         rank_layout,
                         rank_sampling,
                         keep_stages,
@@ -592,7 +592,7 @@ pub(super) fn encode_frame_lossless_core_impl(
             }
             if rank_pal
                 && rank_more
-                && effort.tree_rank_deep
+                && effort.tree_rank_deep()
                 && let Some(p) = &palette
             {
                 let source = p.source(xsize, ysize);
@@ -1067,7 +1067,7 @@ pub(super) fn encode_frame_lossless_core_impl(
 
             // Per-cluster prefix codes (nb_chans + 1 contexts), balanced N-leaf tree.
             let code = build_lz_pixel_code_tails(
-                speed.effort().lz_exhaustive_entropy,
+                speed.effort().lz_exhaustive_entropy(),
                 &[lz_tokens.as_slice()],
                 &[tail],
                 flat_contexts,
@@ -1197,7 +1197,7 @@ pub(super) fn encode_frame_lossless_core_impl(
             }
             let group_slices: Vec<&[LzToken]> = group_lz_tokens.iter().map(Vec::as_slice).collect();
             let code = build_lz_pixel_code_tails(
-                speed.effort().lz_exhaustive_entropy,
+                speed.effort().lz_exhaustive_entropy(),
                 &group_slices,
                 &group_tails,
                 flat_contexts,

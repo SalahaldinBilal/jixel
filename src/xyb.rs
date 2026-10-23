@@ -246,6 +246,7 @@ fn selected_to_linear_rows_fn() -> ToLinearRowsFn {
     })
 }
 
+#[cfg_attr(not(feature = "extraslow"), allow(dead_code))]
 /// Planar XYB → linear RGB, with runtime SIMD dispatch and scalar tails.
 /// Input and output rows may be cropped and unaligned, but must have equal lengths.
 pub(crate) fn xyb_to_rgb_rows(m: &XybMatrix, input: [&[f32]; 3], output: [&mut [f32]; 3]) {

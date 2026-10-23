@@ -1693,7 +1693,7 @@ pub(crate) enum AnsRefinement {
 
 impl AnsRefinement {
     pub(crate) fn slow_for_speed(speed: crate::Speed) -> Self {
-        if speed.effort().ans_exhaustive {
+        if speed.effort().ans_exhaustive() {
             Self::ExtraSlow
         } else {
             Self::Slow

@@ -269,7 +269,8 @@ pub enum Speed {
     Slow,
     /// All `Slow` tools with stronger final ANS entropy search for lossy and
     /// lossless encoding, additional lossless LZ77 candidates, and wider
-    /// large-transform quantization search at distance >= 3.
+    /// large-transform quantization search at distance >= 3. Without the
+    /// `extraslow` cargo feature it encodes exactly as `Slow`.
     ExtraSlow,
 }
 
@@ -1808,7 +1809,7 @@ fn encode_vector_layers(
     // The frames hold flat regions and a thin band: the Medium lossless
     // effort codes them within 12% of Slow at a third of the time; the
     // fastest tiers have no palette or learned tree and triple the size.
-    let speed = if config.speed >= Speed::ExtraSlow {
+    let speed = if cfg!(feature = "extraslow") && config.speed >= Speed::ExtraSlow {
         Speed::Slow
     } else {
         Speed::Medium

@@ -34,19 +34,32 @@
 use crate::Speed;
 
 macro_rules! effort_gates {
-    ($($(#[$doc:meta])* $name:ident),* $(,)?) => {
+    (
+        $($(#[$doc:meta])* $name:ident,)* ;
+        $($(#[$xdoc:meta])* $xname:ident,)*
+    ) => {
         #[derive(Clone, Copy, Debug, PartialEq, Eq)]
         pub(crate) struct Effort {
             $($(#[$doc])* pub(crate) $name: bool,)*
+            $($xname: bool,)*
         }
 
         impl Effort {
-            const NONE: Self = Self { $($name: false,)* };
-            const ALL: Self = Self { $($name: true,)* };
+            const NONE: Self = Self { $($name: false,)* $($xname: false,)* };
+            const ALL: Self = Self { $($name: true,)* $($xname: true,)* };
+
+            $(
+                $(#[$xdoc])*
+                #[cfg_attr(not(feature = "extraslow"), allow(dead_code))]
+                #[inline(always)]
+                pub(crate) const fn $xname(&self) -> bool {
+                    cfg!(feature = "extraslow") && self.$xname
+                }
+            )*
 
             #[cfg(test)]
             fn gates(&self) -> Vec<(&'static str, bool)> {
-                vec![$((stringify!($name), self.$name),)*]
+                vec![$((stringify!($name), self.$name),)* $((stringify!($xname), self.$xname),)*]
             }
         }
     };
@@ -97,13 +110,6 @@ effort_gates! {
     /// Chroma content analysis and every policy it drives: saturated/pair-B/x-heavy
     /// tables, point chroma, chroma HF protection, pixel-chromacity B steps.
     chroma_policy,
-    /// Closed-loop quant-field refinement on the reconstructed luma (MS-SSIM).
-    aq_closed_loop,
-    /// 128-family transforms placed by the closed loop's exact SSIMULACRA2 arbiter.
-    dct128_loop,
-    /// 16x16 transform layouts (DCT8 quad, DCT16, rectangle pairs) re-chosen by
-    /// the closed loop's exact SSIMULACRA2 arbiter.
-    layout_loop,
     /// Exact DP re-tiling of closed 64x64 tiles over 8/16/32-family pieces at
     /// any 8-pixel origin; skipped where `layout_loop` re-chooses layouts exactly.
     layout_retile,
@@ -116,12 +122,6 @@ effort_gates! {
     epf_fit,
     yellow_opsin,
     coeff_orders,
-    /// Race frequency-derived coefficient orders against natural scans using
-    /// serialized permutation headers and final entropy-coded AC streams.
-    coeff_order_entropy_race,
-    /// Re-tokenize on the custom orders before pricing RDOQ however little
-    /// the scans moved (otherwise only past `RDOQ_FRESH_PRICES_MIN_SCAN_MOVE`).
-    rdoq_fresh_prices,
     ac_ctx_plan,
     ma_dc_tree,
     /// Luma-error-compensated B DC targets and, per chroma channel, a 2x finer
@@ -130,11 +130,7 @@ effort_gates! {
     /// Frame-level X DC chroma-from-luma search on the unrounded source,
     /// under the final luma levels and DC quantization steps.
     dc_x_cfl,
-    /// Rank B DC CfL slopes with weighted prediction in pooled WP-error contexts.
-    dc_cfl_weighted,
     ans_refine,
-    /// Broader final hybrid-uint and ANS-table search.
-    ans_exhaustive,
     /// Below `ans_refine`: recluster at every distance (otherwise from d=3).
     ans_recluster,
     lossy_modular_auto,
@@ -156,10 +152,6 @@ effort_gates! {
     lz_deep,
     /// ANS, per-cluster hybrid-uint selection and refined clustering for LZ streams.
     lz_refined_entropy,
-    /// Price every hybrid-uint candidate under its fully searched ANS table.
-    lz_exhaustive_entropy,
-    /// Broader cost-aware LZ77 parses alongside the normal stream candidates.
-    lz_priced_search,
     predictor_search,
     rct_search,
     /// RCT ranking scores every row (otherwise one row in `RCT_DENSE_ROW_STEP`).
@@ -181,16 +173,12 @@ effort_gates! {
     learned_tree,
     /// Coarse-learn comparison of the palette and RGB sources and the RCT runner-up.
     tree_rank,
-    /// Ranking learns of every WP preset.
-    tree_rank_deep,
     /// 8M/16M-sample final tree learn.
     tree_dense_sampling,
     /// 2M-sample tree learn (otherwise 512K).
     tree_full_sampling,
     /// Learn under both the 1024 px and the 256 px group layouts.
     tree_dual_layout,
-    /// Final RCT tree learns score more predictors on each side of a split.
-    tree_wide_side_preds,
     /// Final learns of sub-sampled sources keep the full leaf budget and split
     /// candidates (otherwise `MA_LITE_MAX_LEAVES` and `MA_LITE_CANDIDATES`).
     tree_deep_final,
@@ -203,6 +191,33 @@ effort_gates! {
     /// Gradient and photo-like rectangles of a screenshot as cropped frames
     /// of their own (`region_frames`).
     region_frames,
+    ;
+    // --- ExtraSlow only: always off without the `extraslow` feature ---
+    /// Closed-loop quant-field refinement on the reconstructed luma (MS-SSIM).
+    aq_closed_loop,
+    /// 128-family transforms placed by the closed loop's exact SSIMULACRA2 arbiter.
+    dct128_loop,
+    /// 16x16 transform layouts (DCT8 quad, DCT16, rectangle pairs) re-chosen by
+    /// the closed loop's exact SSIMULACRA2 arbiter.
+    layout_loop,
+    /// Race frequency-derived coefficient orders against natural scans using
+    /// serialized permutation headers and final entropy-coded AC streams.
+    coeff_order_entropy_race,
+    /// Rank B DC CfL slopes with weighted prediction in pooled WP-error contexts.
+    dc_cfl_weighted,
+    /// Re-tokenize on the custom orders before pricing RDOQ however little
+    /// the scans moved (otherwise only past `RDOQ_FRESH_PRICES_MIN_SCAN_MOVE`).
+    rdoq_fresh_prices,
+    /// Broader final hybrid-uint and ANS-table search.
+    ans_exhaustive,
+    /// Price every hybrid-uint candidate under its fully searched ANS table.
+    lz_exhaustive_entropy,
+    /// Broader cost-aware LZ77 parses alongside the normal stream candidates.
+    lz_priced_search,
+    /// Ranking learns of every WP preset.
+    tree_rank_deep,
+    /// Final RCT tree learns score more predictors on each side of a split.
+    tree_wide_side_preds,
 }
 
 const ULTRAFAST: Effort = Effort::NONE;
@@ -277,6 +292,7 @@ const SLOW: Effort = Effort {
     ..Effort::ALL
 };
 
+#[cfg(feature = "extraslow")]
 const EXTRASLOW: Effort = Effort::ALL;
 
 impl Speed {
@@ -288,7 +304,10 @@ impl Speed {
             Speed::Medium => &MEDIUM,
             Speed::MediumSlow => &MEDIUM_SLOW,
             Speed::Slow => &SLOW,
+            #[cfg(feature = "extraslow")]
             Speed::ExtraSlow => &EXTRASLOW,
+            #[cfg(not(feature = "extraslow"))]
+            Speed::ExtraSlow => &SLOW,
         }
     }
 }

@@ -282,7 +282,7 @@ pub(crate) fn encode_modular_xyb_atlas_ints(
     let distance_ctx = nb_chans as u32;
     let lz_tokens = lz77_compress_for_speed(&tokens, distance_ctx, speed, scratch);
     let code = build_lz_pixel_code(
-        speed.effort().lz_exhaustive_entropy,
+        speed.effort().lz_exhaustive_entropy(),
         std::iter::once(lz_tokens.as_slice()),
         nb_chans,
         min_symbol,

@@ -2685,7 +2685,13 @@ fn find_rerank_downgrades(
             params.scale,
             params.distance,
         );
-        let with_fine_mosaic = ctx.speed.effort().fine_mosaic
+        // Where the layout DP installs its tilings it also covers every pair
+        // (each cell competes as DCT8 or its retained fine leaf), while a
+        // mosaic's rollback region would exclude its whole 64x64 tile from
+        // the DP. The DP's layout is worth more than the mosaic there.
+        let effort = ctx.speed.effort();
+        let with_fine_mosaic = effort.fine_mosaic
+            && !(effort.layout_retile && !effort.layout_loop())
             && (params.distance <= FINE_MOSAIC_MAX_DISTANCE || coarse_chromatic)
             && matches!(strat, STRATEGY_DCT16X8 | STRATEGY_DCT8X16);
         debug_assert!(!with_fine_mosaic || cxb * cyb <= FINE_MOSAIC_MAX_CHILDREN);

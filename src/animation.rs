@@ -85,7 +85,7 @@ thread_local! {
     static HEADERS: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Clears the scope when an animation encode ends, also on error or panic.
+/// Clears the scope when a frame's encode ends, also on error or panic.
 struct ScopeGuard;
 
 impl Drop for ScopeGuard {
@@ -199,41 +199,115 @@ pub fn encode_animation_with_alpha(
     timing: AnimationTiming,
     config: &EncodeConfig,
 ) -> Result<Vec<u8>, EncodeError> {
-    if frames.is_empty() {
-        return Err(EncodeError::EmptyImage);
+    let mut encoder = AnimationEncoder::new(width, height, timing, config)?;
+    for frame in frames {
+        encoder.add_frame(frame.rgba, frame.duration)?;
     }
-    if config.exif.is_some() || config.xmp.is_some() || config.gain_map.is_some() {
-        return Err(EncodeError::Unsupported(
-            "animations cannot carry EXIF, XMP or a gain map",
-        ));
-    }
-    if timing.tps_numerator == 0 || timing.tps_denominator == 0 {
-        return Err(EncodeError::Unsupported(
-            "animation tick rate must not be zero",
-        ));
-    }
-    let too_fast = |duration: u32| {
-        duration > 0
-            && u128::from(duration) * u128::from(timing.tps_denominator) * 120
-                < u128::from(timing.tps_numerator)
-    };
-    if frames.iter().any(|frame| too_fast(frame.duration)) {
-        return Err(EncodeError::Unsupported(
-            "a frame is shorter than 1/120 s, faster than Level 5 decoders accept",
-        ));
-    }
-    let _guard = ScopeGuard;
-    let mut out: Vec<u8> = Vec::new();
-    let mut header_len = 0;
-    for (index, frame) in frames.iter().enumerate() {
-        SCOPE.set(Some(FrameScope {
+    encoder.finish()
+}
+
+/// Encodes an animation one frame at a time, like
+/// [`encode_animation_with_alpha`], without holding every frame in memory.
+///
+/// A frame is encoded when the next one is added or on [`Self::finish`],
+/// since only then is it known whether it is the last, so one frame's pixels
+/// are kept until then.
+pub struct AnimationEncoder {
+    width: usize,
+    height: usize,
+    timing: AnimationTiming,
+    config: EncodeConfig,
+    pending: Option<(Vec<u8>, u32)>,
+    yellow: Option<YellowSelection>,
+    header_len: usize,
+    out: Vec<u8>,
+}
+
+impl AnimationEncoder {
+    pub fn new(
+        width: usize,
+        height: usize,
+        timing: AnimationTiming,
+        config: &EncodeConfig,
+    ) -> Result<Self, EncodeError> {
+        if width == 0 || height == 0 {
+            return Err(EncodeError::EmptyImage);
+        }
+        if config.exif.is_some() || config.xmp.is_some() || config.gain_map.is_some() {
+            return Err(EncodeError::Unsupported(
+                "animations cannot carry EXIF, XMP or a gain map",
+            ));
+        }
+        if timing.tps_numerator == 0 || timing.tps_denominator == 0 {
+            return Err(EncodeError::Unsupported(
+                "animation tick rate must not be zero",
+            ));
+        }
+        Ok(Self {
+            width,
+            height,
             timing,
-            duration: frame.duration,
-            last: index + 1 == frames.len(),
+            config: config.clone(),
+            pending: None,
+            yellow: None,
+            header_len: 0,
+            out: Vec::new(),
+        })
+    }
+
+    /// Adds a frame of interleaved 8-bit RGBA shown for `duration` ticks. See
+    /// [`AnimationFrame::duration`].
+    pub fn add_frame(&mut self, rgba: &[u8], duration: u32) -> Result<(), EncodeError> {
+        let expected = self.width * self.height * 4;
+        if rgba.len() != expected {
+            return Err(EncodeError::InputSizeMismatch {
+                expected,
+                actual: rgba.len(),
+            });
+        }
+        let ticks_per_second = u128::from(self.timing.tps_numerator);
+        if duration > 0
+            && u128::from(duration) * u128::from(self.timing.tps_denominator) * 120
+                < ticks_per_second
+        {
+            return Err(EncodeError::Unsupported(
+                "a frame is shorter than 1/120 s, faster than Level 5 decoders accept",
+            ));
+        }
+        let mut pixels = match self.pending.take() {
+            Some((previous, previous_duration)) => {
+                self.encode(&previous, previous_duration, false)?;
+                previous
+            }
+            None => Vec::with_capacity(expected),
+        };
+        pixels.clear();
+        pixels.extend_from_slice(rgba);
+        self.pending = Some((pixels, duration));
+        Ok(())
+    }
+
+    /// Encodes the last frame and returns the file.
+    pub fn finish(mut self) -> Result<Vec<u8>, EncodeError> {
+        let Some((pixels, duration)) = self.pending.take() else {
+            return Err(EncodeError::EmptyImage);
+        };
+        self.encode(&pixels, duration, true)?;
+        Ok(self.out)
+    }
+
+    fn encode(&mut self, rgba: &[u8], duration: u32, last: bool) -> Result<(), EncodeError> {
+        let _guard = ScopeGuard;
+        SCOPE.set(Some(FrameScope {
+            timing: self.timing,
+            duration,
+            last,
         }));
+        YELLOW.set(self.yellow);
         HEADERS.with_borrow_mut(Vec::clear);
-        let encoded = encode_image_with_alpha(frame.rgba, width, height, config)?;
-        let header = if index == 0 {
+        let encoded = encode_image_with_alpha(rgba, self.width, self.height, &self.config)?;
+        self.yellow = YELLOW.get();
+        let header = if self.out.is_empty() {
             HEADERS.with_borrow(|headers| {
                 headers
                     .iter()
@@ -242,10 +316,10 @@ pub fn encode_animation_with_alpha(
                     .map(Vec::len)
             })
         } else {
-            let first = &out[..header_len];
+            let first = &self.out[..self.header_len];
             HEADERS
                 .with_borrow(|headers| headers.iter().any(|h| h == first))
-                .then_some(header_len)
+                .then_some(self.header_len)
                 .filter(|_| encoded.starts_with(first))
         };
         let Some(header) = header else {
@@ -253,14 +327,14 @@ pub fn encode_animation_with_alpha(
                 "animation frames were coded with different image headers",
             ));
         };
-        if index == 0 {
-            header_len = header;
-            out.extend_from_slice(&encoded);
+        if self.out.is_empty() {
+            self.header_len = header;
+            self.out = encoded;
         } else {
-            out.extend_from_slice(&encoded[header..]);
+            self.out.extend_from_slice(&encoded[header..]);
         }
+        Ok(())
     }
-    Ok(out)
 }
 
 #[cfg(test)]
@@ -575,6 +649,11 @@ mod tests {
             encode_animation_with_alpha(&[], 16, 16, timing, &EncodeConfig::default()),
             Err(EncodeError::EmptyImage)
         );
+        let mut encoder = AnimationEncoder::new(16, 16, timing, &EncodeConfig::default()).unwrap();
+        assert!(matches!(
+            encoder.add_frame(&rgba[4..], 10),
+            Err(EncodeError::InputSizeMismatch { .. })
+        ));
         let too_fast = [AnimationFrame {
             rgba: &rgba,
             duration: 8,

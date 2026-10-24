@@ -161,14 +161,9 @@ fn write_frame_header_modular_xyb_blend(
         w.write(1, 0); // clamp = false
         w.write(2, 0); // source = 0
     }
-    if last {
-        w.write(1, 1); // is_last
-    } else {
-        w.write(1, 0); // not the last frame
-        // The blended canvas replaces reference slot 0 for the next ink
-        // frame; kBlend does not reset the canvas, so no save_before_ct bit.
-        w.write(2, 0); // save_as_reference = 0
-    }
+    // When not last, the blended canvas replaces reference slot 0 for the
+    // next ink frame; kBlend does not reset the canvas, so no save_before_ct.
+    crate::animation::write_frame_end(w, last, false);
     w.write(2, 0b00); // name length = 0
     w.write(1, 0); // loop_filter NOT all_default
     w.write(1, 0); // no gaborish
@@ -242,15 +237,13 @@ fn write_frame_header_modular_layer(
             w.write(1, 0); // clamp = false
             w.write(2, 0); // source = 0
         }
-        w.write(1, 1); // is_last
+        crate::animation::write_frame_end(w, true, false);
     } else {
         w.write(2, 0b00); // blending = Replace
         if has_alpha {
             w.write(2, 0b00); // ec blending = Replace
         }
-        w.write(1, 0); // not the last frame
-        w.write(2, 0); // save_as_reference = 0
-        w.write(1, 0); // save_before_color_transform = false
+        crate::animation::write_frame_end(w, false, true);
     }
     w.write(2, 0b00); // name length = 0
     w.write(1, 0); // loop_filter NOT all_default
@@ -305,12 +298,7 @@ fn write_frame_header_modular_crop(
         w.write(2, 0b00); // blending = Replace
         w.write(2, 0); // source = 0
     }
-    if last {
-        w.write(1, 1); // is_last
-    } else {
-        w.write(1, 0); // not the last frame
-        w.write(2, 0); // save_as_reference = 0
-    }
+    crate::animation::write_frame_end(w, last, false);
     w.write(2, 0b00); // name length = 0
     w.write(1, 0); // loop_filter NOT all_default
     w.write(1, 0); // no gaborish
@@ -343,7 +331,7 @@ fn write_frame_header_modular_blend_crop(rect: [usize; 4], layout: GroupLayout, 
         w.write(1, 0); // clamp = false
         w.write(2, 0); // source = 0
     }
-    w.write(1, 1); // is_last
+    crate::animation::write_frame_end(w, true, false);
     w.write(2, 0b00); // name length = 0
     w.write(1, 0); // loop_filter NOT all_default
     w.write(1, 0); // no gaborish
@@ -372,13 +360,7 @@ fn write_frame_header_modular_flags(
     if has_alpha {
         w.write(2, 0b00);
     }
-    if saved_first {
-        w.write(1, 0); // not the last frame
-        w.write(2, 0); // save_as_reference = 0
-        w.write(1, 0); // save_before_color_transform = false
-    } else {
-        w.write(1, 1); // is_last
-    }
+    crate::animation::write_frame_end(w, !saved_first, true);
     w.write(2, 0b00); // name length = 0
     w.write(1, 0); // loop_filter NOT all_default
     w.write(1, 0); // no gaborish

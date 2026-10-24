@@ -29,6 +29,9 @@ extraslow = ["dep:cvvdp-lite", "dep:ssimu2-lite"]
 cvvdp-lite = { version = "0.1.1", optional = true }
 ssimu2-lite = { version = "0.1.1", optional = true }
 
+[dev-dependencies]
+jxl = "0.8.0"
+
 [profile.profiling]
 inherits = "release"
 debug = "full"

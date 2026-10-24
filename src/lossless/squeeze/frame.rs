@@ -72,7 +72,7 @@ pub(super) fn write_frame_header_modular_xyb_regular(epf: (u32, f32), w: &mut Bi
     w.write(2, 0b00); // num_passes = 1
     w.write(1, 0); // have_crop = false
     w.write(2, 0b00); // blending = Replace
-    w.write(1, 1); // is_last
+    crate::animation::write_frame_end(w, true, true);
     w.write(2, 0b00); // name length = 0
     write_lm_loop_filter(epf, w);
     w.write(2, 0b00); // no FH extensions
@@ -149,7 +149,7 @@ pub(super) fn write_frame_header_modular_plain(
     for _ in 0..extra {
         w.write(2, 0b00); // extra-channel blending = Replace
     }
-    w.write(1, 1); // is_last
+    crate::animation::write_frame_end(w, true, true);
     w.write(2, 0b00); // name length = 0
     write_lm_loop_filter(epf, w);
     w.write(2, 0b00); // no FH extensions

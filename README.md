@@ -19,6 +19,22 @@ fn main() {
 }
 ```
 
+### Animation
+
+```rust
+let frames: Vec<AnimationFrame> = rgba_frames
+    .iter()
+    .map(|rgba| AnimationFrame { rgba, duration: 100 }) // milliseconds
+    .collect();
+let bytes = jixel::encode_animation_with_alpha(
+    &frames,
+    width,
+    height,
+    AnimationTiming::default(), // 1000 ticks per second, loops forever
+    &EncodeConfig::default().with_quality(90.),
+)?;
+```
+
 ## License
 
 This project is licensed under either of

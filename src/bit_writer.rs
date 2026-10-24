@@ -173,6 +173,13 @@ impl BitWriter {
         }
     }
 
+    /// Every byte written so far. Self must be byte-aligned and flushed, as
+    /// after `zero_pad_to_byte`.
+    pub(crate) fn aligned_bytes(&self) -> &[u8] {
+        debug_assert_eq!(self.accumulator_bits, 0);
+        &self.storage
+    }
+
     /// Consume self and return the byte buffer. Self must be byte-aligned.
     pub(crate) fn into_bytes(mut self) -> Vec<u8> {
         debug_assert_eq!(self.bits_written % 8, 0);

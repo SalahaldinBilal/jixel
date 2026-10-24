@@ -1241,14 +1241,7 @@ fn write_frame_header(
         w.write(2, 0); // ec_blending_info[0].mode = Replace
     }
 
-    match role {
-        FrameRole::Last => w.write(1, 1), // last frame
-        FrameRole::SavedFirst => {
-            w.write(1, 0); // not the last frame
-            w.write(2, 0); // save_as_reference = 0
-            w.write(1, 0); // save_before_color_transform = false
-        }
-    }
+    crate::animation::write_frame_end(w, role == FrameRole::Last, true);
     w.write(2, 0); // no name
     write_loop_filter(
         epf_iters,

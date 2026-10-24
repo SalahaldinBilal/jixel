@@ -643,6 +643,7 @@ fn choose_b_bias(linear: &Image3F, distance: f32) -> f32 {
     choose_b_bias_and_tier(linear, distance).0
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct YellowSelection {
     /// `None` = keep the spec matrix (nothing signaled), `Some` = use and
     /// signal the biased matrix.

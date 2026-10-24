@@ -1099,7 +1099,8 @@ fn apply_yellow_opsin(ctx: &mut EncodingContext, linear: &Image3F, distance: f32
     if !ctx.speed.effort().yellow_opsin || !ctx.coding.is_xyb() {
         return;
     }
-    let selection = crate::yellow_opsin::select_yellow(linear, distance);
+    let selection =
+        crate::animation::pinned_yellow(|| crate::yellow_opsin::select_yellow(linear, distance));
     if let Some(m) = selection.matrix {
         ctx.set_xyb_matrix(m, distance, selection.default_channel_weights);
     }
@@ -3539,14 +3540,19 @@ fn write_image_metadata(
     };
     w.write(1, 0); // all_default = false
     // tone_mapping (HDR luminance) is gated by extra_fields; a non-identity
-    // orientation also lives in the extra_fields block, so either forces it on.
-    let extra_fields = !tm.is_default() || orientation != Orientation::Normal;
+    // orientation and the animation header also live in the extra_fields
+    // block, so any of them forces it on.
+    let animated = crate::animation::is_animated();
+    let extra_fields = !tm.is_default() || orientation != Orientation::Normal || animated;
     w.write(1, if extra_fields { 1 } else { 0 }); // extra_fields
     if extra_fields {
         w.write(3, orientation.to_u3()); // orientation: 1 + u(3)
         w.write(1, 0); // have_intrinsic_size = false
         w.write(1, 0); // have_preview = false
-        w.write(1, 0); // have_animation = false
+        w.write(1, u64::from(animated)); // have_animation
+        if animated {
+            crate::animation::write_animation_header(w);
+        }
     }
     if bps.is_float() {
         write_float_bit_depth(bps.bits(), bps.exp_bits(), w);
@@ -3677,6 +3683,7 @@ fn write_image_metadata(
         crate::icc_codec::write_icc_stream(icc, &mut scratch.huffman_pool, w);
     }
     w.zero_pad_to_byte();
+    crate::animation::record_header(w);
 }
 
 #[cfg(test)]

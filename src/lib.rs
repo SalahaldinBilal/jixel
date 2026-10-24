@@ -35,6 +35,7 @@
 )]
 #![deny(unreachable_pub)]
 mod ac_context;
+mod animation;
 mod ac_strategy;
 mod adaptive_quant;
 mod afv;
@@ -109,6 +110,7 @@ mod weighted_predictor;
 mod xyb;
 mod yellow_opsin;
 
+pub use animation::{AnimationFrame, AnimationTiming, encode_animation_with_alpha};
 pub use cmyk::{InkConvention, encode_image_cmyk, encode_image_cmyk_16bit};
 pub use coding::CodingTransform;
 pub use color_encoding::{
